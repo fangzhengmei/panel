@@ -118,6 +118,8 @@ Wings 收到请求后：
 用户 → Panel API → BackupController::restore() → DaemonBackupRepository → Wings
                                                                  ↓
 Wings 回调 → BackupStatusController::restore() → Panel DB 更新
+                                                                 ↓
+                          （Wings 未回调时）Wings 重启 → /servers/reset → 状态强制重置
 ```
 
 ### 2.2 还原判定条件精确分析
@@ -183,8 +185,8 @@ Wings 收到请求后：
 5. 恢复文件权限
 6. 回调 Panel 报告结果（无论成败）
 
-#### 阶段 4：回调更新状态
-**文件**：`app/Http/Controllers/Api/Remote/Backups/BackupStatusController.php:93-111`
+#### 阶段 4：回调更新状态（正常路径）
+**文件**：`app/Http/Controllers/Api/Remote/Backups\BackupStatusController.php:93-111`
 
 **职责**：
 - Wings 认证与归属校验
@@ -195,7 +197,18 @@ Wings 收到请求后：
 | 结果 | 事件名 | 备注 |
 |------|--------|------|
 | 成功 | `server:backup.restore-complete` | 正常 |
-| 失败 | `server.backup.restore-failed` | ⚠️ **BUG**：使用了 `.` 而非 `:`，与其他事件命名不一致 |
+| 失败 | `server.backup.restore-failed` | ⚠️ **BUG 1**：使用了 `.` 而非 `:`，与其他事件命名不一致 |
+
+#### 阶段 5：强制重置状态（异常恢复路径）
+**文件**：`app/Http/Controllers/Api/Remote/Servers/ServerDetailsController.php:89-134`
+
+**触发时机**：Wings 重启时自动调用 `/api/remote/servers/reset`
+
+**职责**：
+1. 查找节点上所有 `status = restoring_backup` 的服务器
+2. 尝试查找这些服务器最近的 `server:backup.restore-started` 审计事件
+3. 如果找到且关联了备份主体，记录 `server:backup.restore-failed` 事件
+4. 批量重置所有 `installing` 和 `restoring_backup` 状态为 `null`
 
 > **关键设计决策**：还原失败不将服务器置于异常状态，用户可重试或使用重装功能。
 > 参考 `BackupStatusController.php:84-89` 注释。
@@ -204,7 +217,7 @@ Wings 收到请求后：
 
 ## 三、还原链路状态机与审计完整追踪
 
-### 3.1 状态变更时序
+### 3.1 状态变更时序（完整闭环）
 
 ```
 用户请求还原
@@ -213,9 +226,15 @@ server.status = null → STATUS_RESTORING_BACKUP  ✅ 事务内
     ↓
 Wings 收到请求，开始还原
     ↓
-Wings 回调（成功/失败）
-    ↓
-server.status = STATUS_RESTORING_BACKUP → null  ✅ 无条件重置
+    ├─ 正常路径：Wings 回调（成功/失败）
+    │       ↓
+    │   server.status = STATUS_RESTORING_BACKUP → null  ✅ 无条件重置
+    │
+    └─ 异常路径：Wings 崩溃/网络分区，未回调
+            ↓
+        Wings 重启 → POST /api/remote/servers/reset
+            ↓
+        server.status = STATUS_RESTORING_BACKUP → null  ✅ 强制重置
 ```
 
 ### 3.2 状态阻塞影响
@@ -227,11 +246,12 @@ server.status = STATUS_RESTORING_BACKUP → null  ✅ 无条件重置
 
 ### 3.3 审计事件完整清单
 
-| 时机 | 事件名 | 触发位置 |
-|------|--------|----------|
-| 用户发起还原 | `server:backup.restore` | `BackupController.php:210` |
-| Wings 回调成功 | `server:backup.restore-complete` | `BackupStatusController.php:105` |
-| Wings 回调失败 | `server.backup.restore-failed` | `BackupStatusController.php:105` ⚠️ BUG |
+| 时机 | 事件名 | 触发位置 | 备注 |
+|------|--------|----------|------|
+| 用户发起还原 | `server:backup.restore` | `BackupController.php:210` | 事务内记录 |
+| Wings 回调成功 | `server:backup.restore-complete` | `BackupStatusController.php:105` | 正常路径 |
+| Wings 回调失败 | `server.backup.restore-failed` | `BackupStatusController.php:105` | ⚠️ BUG 1：点号分隔 |
+| Wings 重启重置（找到备份） | `server:backup.restore-failed` | `ServerDetailsController.php:118` | 异常恢复路径 |
 
 ### 3.4 失败分支真实行为
 
@@ -249,15 +269,112 @@ server.status = STATUS_RESTORING_BACKUP → null  ✅ 无条件重置
 - **风险**：服务器文件可能处于「部分还原」的不一致状态
 
 **场景 3：Wings 未回调（进程崩溃、网络分区）**
-- 服务器永久卡在 `STATUS_RESTORING_BACKUP`
+- 服务器卡在 `STATUS_RESTORING_BACKUP`
 - 所有需要 `validateCurrentState()` 的操作被阻塞
-- **无自动恢复机制**，需管理员手动干预数据库
+- **自动恢复**：Wings 重启时自动调用 `/servers/reset` 重置状态
+- **手动恢复**：管理员可直接更新数据库 `servers.status = NULL`
 
 ---
 
-## 四、对象存储集成分析
+## 四、还原失败恢复机制深度分析
 
-### 4.1 BackupManager 适配器模式
+### 4.1 /servers/reset 接口详解
+**文件**：`app/Http/Controllers/Api/Remote/Servers/ServerDetailsController.php:89-134`
+
+**触发条件**：
+- Wings 服务启动时
+- Wings 检测到状态不一致时
+
+**执行步骤**：
+```php
+// 步骤1：查找节点上所有 restoring_backup 状态的服务器
+$servers = Server::query()
+    ->with([
+        'activity' => fn ($builder) => $builder
+            // ⚠️ BUG 2：查找的是 'restore-started'，但实际记录的是 'restore'
+            ->where('activity_logs.event', 'server:backup.restore-started')
+            ->latest('timestamp'),
+    ])
+    ->where('node_id', $node->id)
+    ->where('status', Server::STATUS_RESTORING_BACKUP)
+    ->get();
+
+// 步骤2：为每个服务器补记失败审计
+foreach ($servers as $server) {
+    $activity = $server->activity->first();
+    if (!is_null($activity)) {
+        if ($subject = $activity->subjects->where('subject_type', 'backup')->first()) {
+            Activity::event('server:backup.restore-failed')
+                ->subject($server, $subject->subject)
+                ->property('name', $subject->subject->name)
+                ->log();
+        }
+    }
+}
+
+// 步骤3：批量重置状态
+Server::query()
+    ->where('node_id', $node->id)
+    ->whereIn('status', [Server::STATUS_INSTALLING, Server::STATUS_RESTORING_BACKUP])
+    ->update(['status' => null]);
+```
+
+### 4.2 两条回调路径的关系与边界
+
+| 维度 | BackupStatusController::restore() | ServerDetailsController::resetState() |
+|------|-----------------------------------|----------------------------------------|
+| **触发时机** | Wings 完成还原操作后主动回调 | Wings 重启时的自检恢复 |
+| **针对性** | 针对单个具体备份的还原结果 | 节点级批量重置所有异常状态 |
+| **事件补全** | 基于还原结果直接记录 | 需通过审计日志反向追溯备份 |
+| **状态重置** | 仅重置当前服务器 | 批量重置所有 installing/restoring_backup |
+| **数据一致性** | 完整的成功/失败上下文 | 仅能确认「Wings 已重启，操作已终止」 |
+| **边界** | 正常流程，精确审计 | 异常兜底，尽力审计 |
+
+### 4.3 已知缺陷分析
+
+**BUG 1：事件命名不一致**（`BackupStatusController.php:105`）
+```php
+// 成功：冒号分隔（符合规范）
+'server:backup.restore-complete'
+// 失败：点号分隔（不符合规范）
+'server.backup.restore-failed'
+```
+**影响**：基于事件名的监控、告警、统计逻辑可能漏掉还原失败事件。
+
+**BUG 2：reset 查找的事件名不匹配**（`ServerDetailsController.php:102`）
+```php
+// 代码中记录的事件
+'server:backup.restore'
+// reset 接口查找的事件
+'server:backup.restore-started'
+```
+**影响**：Wings 重启重置时**永远找不到**对应的审计事件，导致：
+- 无法补记 `server:backup.restore-failed` 事件
+- 审计链路断裂，无法追溯哪个备份还原失败
+- 状态仍能重置，但审计信息丢失
+
+### 4.4 失败审计完整闭环（理想 vs 实际）
+
+**理想闭环**：
+```
+server:backup.restore（开始）
+    ↓
+server:backup.restore-complete / server:backup.restore-failed（结束）
+```
+
+**实际闭环**：
+```
+server:backup.restore（开始）
+    ├─ 成功 → server:backup.restore-complete（正常）
+    ├─ 失败回调 → server.backup.restore-failed（⚠️ 命名错误）
+    └─ 未回调 → /servers/reset → 状态重置，但无失败事件（⚠️ 事件名不匹配）
+```
+
+---
+
+## 五、对象存储集成分析
+
+### 5.1 BackupManager 适配器模式
 **文件**：`app/Extensions/Backups/BackupManager.php`
 
 **职责**：
@@ -270,7 +387,7 @@ server.status = STATUS_RESTORING_BACKUP → null  ✅ 无条件重置
 - Panel 持有 S3 密钥（`config/backups.php`）
 - Wings 从不直接持有 S3 密钥，仅通过 Panel 生成的预签名 URL 访问
 
-### 4.2 S3 备份创建数据流
+### 5.2 S3 备份创建数据流
 ```
 1. Panel 创建备份记录，disk = 's3'，upload_id = null
 2. Wings 打包完成，向 Panel 请求分片上传 URL
@@ -282,7 +399,7 @@ server.status = STATUS_RESTORING_BACKUP → null  ✅ 无条件重置
 8. Panel 调用 S3 CompleteMultipartUpload 合并文件
 ```
 
-### 4.3 S3 备份还原数据流
+### 5.3 S3 备份还原数据流
 ```
 1. 用户请求还原
 2. Panel 生成 S3 GetObject 预签名 URL（有效期 5 分钟）
@@ -292,7 +409,7 @@ server.status = STATUS_RESTORING_BACKUP → null  ✅ 无条件重置
 6. Wings 回调 Panel 报告结果
 ```
 
-### 4.4 S3 备份删除数据流
+### 5.4 S3 备份删除数据流
 **文件**：`app/Services/Backups/DeleteBackupService.php:68-82`
 
 **执行顺序**：
@@ -304,9 +421,9 @@ server.status = STATUS_RESTORING_BACKUP → null  ✅ 无条件重置
 
 ---
 
-## 五、权限边界详解
+## 六、权限边界详解
 
-### 5.1 用户权限模型
+### 6.1 用户权限模型
 **文件**：`app/Models/Permission.php:142-151`
 
 | 权限 | 描述 | 风险等级 |
@@ -317,7 +434,7 @@ server.status = STATUS_RESTORING_BACKUP → null  ✅ 无条件重置
 | `backup.download` | 下载备份（可获取所有服务器文件） | 高 |
 | `backup.restore` | 还原备份（可覆盖所有服务器文件） | 高 |
 
-### 5.2 权限判定逻辑
+### 6.2 权限判定逻辑
 **文件**：`app/Policies/ServerPolicy.php:26-33`
 
 权限检查优先级：
@@ -325,7 +442,7 @@ server.status = STATUS_RESTORING_BACKUP → null  ✅ 无条件重置
 2. **Server Owner**：无条件通过
 3. **Subuser**：检查 `subuser.permissions` 数组
 
-### 5.3 Wings 认证体系
+### 6.3 Wings 认证体系
 **文件**：`app/Http/Middleware/Api/Daemon/DaemonAuthenticate.php`
 
 **认证流程**：
@@ -338,7 +455,7 @@ server.status = STATUS_RESTORING_BACKUP → null  ✅ 无条件重置
 - 备份归属校验：确保回调节点 == 备份所属服务器的节点
 - 防止恶意节点修改其他节点的备份状态
 
-### 5.4 下载链接安全
+### 6.4 下载链接安全
 **文件**：`app/Services/Backups/DownloadLinkService.php`
 
 | 存储类型 | URL 类型 | 有效期 | 认证方式 |
@@ -348,9 +465,9 @@ server.status = STATUS_RESTORING_BACKUP → null  ✅ 无条件重置
 
 ---
 
-## 六、失败语义汇总
+## 七、失败语义汇总
 
-### 6.1 备份创建失败场景
+### 7.1 备份创建失败场景
 
 | 失败点 | 处理方式 | 数据状态 |
 |--------|----------|----------|
@@ -361,7 +478,7 @@ server.status = STATUS_RESTORING_BACKUP → null  ✅ 无条件重置
 | S3 上传失败 | Wings 回调，Panel 中止分片 | 记录存在，`is_successful=false` |
 | S3 合并分片失败 | 事务回滚 | 状态不更新 |
 
-### 6.2 备份还原失败场景
+### 7.2 备份还原失败场景
 
 | 失败点 | 处理方式 | 数据状态 | 风险 |
 |--------|----------|----------|------|
@@ -369,9 +486,9 @@ server.status = STATUS_RESTORING_BACKUP → null  ✅ 无条件重置
 | 备份未完成（is_successful=false && completed_at=null） | 立即拒绝 | 无变化 | 无 |
 | Wings 连接失败 | 事务回滚 | 服务器状态恢复 | 无 |
 | Wings 执行失败（文件损坏等） | Wings 回调，状态重置为 null | 服务器状态正常，记录失败日志 | ⚠️ 文件可能部分还原 |
-| Wings 未回调 | 无处理 | 服务器永久卡在 restoring_backup | ⚠️ 需人工干预 |
+| Wings 未回调 | Wings 重启时自动调用 /servers/reset | 状态重置，但审计事件丢失 | ⚠️ BUG：事件名不匹配 |
 
-### 6.3 备份删除失败场景
+### 7.3 备份删除失败场景
 
 | 失败点 | 处理方式 | 数据状态 |
 |--------|----------|----------|
@@ -382,9 +499,9 @@ server.status = STATUS_RESTORING_BACKUP → null  ✅ 无条件重置
 
 ---
 
-## 七、已知问题与风险
+## 八、已知问题与风险
 
-### 7.1 事件命名不一致
+### 8.1 事件命名不一致
 **文件**：`BackupStatusController.php:105`
 
 ```php
@@ -396,24 +513,33 @@ server.status = STATUS_RESTORING_BACKUP → null  ✅ 无条件重置
 
 **影响**：基于事件名的监控、告警、统计逻辑可能漏掉还原失败事件。
 
-### 7.2 失败备份可还原
+### 8.2 reset 接口事件名不匹配
+**文件**：`ServerDetailsController.php:102`
+
+```php
+// 实际记录的事件
+'server:backup.restore'
+// reset 接口查找的事件
+'server:backup.restore-started'
+```
+
+**影响**：Wings 重启重置时无法补记失败审计事件，审计链路断裂。
+
+### 8.3 失败备份可还原
 **文件**：`BackupController.php:206`
 
 **风险**：用户可能还原一个不完整、损坏的备份，导致服务器无法正常运行。
 
-### 7.3 无回调超时机制
-**风险**：Wings 崩溃或网络分区时，服务器永久卡在 `restoring_backup` 状态，所有操作被阻塞。
-
-### 7.4 S3 删除最终一致性
+### 8.4 S3 删除最终一致性
 **文件**：`DeleteBackupService.php:68-82`
 
 **风险**：先删 DB 记录再删 S3 文件，若 S3 删除失败产生孤立文件，占用存储成本。
 
 ---
 
-## 八、关键设计决策
+## 九、关键设计决策
 
-### 8.1 事务边界设计
+### 9.1 事务边界设计
 - **创建备份**：DB 记录 + Wings 调用在同一事务
   - 保证 Wings 收到请求时记录已存在
   - 失败则无残留记录
@@ -422,24 +548,30 @@ server.status = STATUS_RESTORING_BACKUP → null  ✅ 无条件重置
   - 优先保证 Panel 侧状态一致
   - 接受 S3 可能存在孤立文件的风险
 
-### 8.2 锁定机制
+### 9.2 锁定机制
 - 成功备份可锁定，防止自动轮换或误删
 - 失败备份自动解锁，便于清理
 - 锁定操作需要 `backup.delete` 权限
 
-### 8.3 状态机设计
+### 9.3 状态机设计
 - 服务器状态：`null` → `restoring_backup` → `null`
 - 还原失败不设特殊失败状态，降低用户理解成本
 - 还原期间禁止其他操作（通过状态检查实现）
+- Wings 重启时提供兜底重置机制，防止永久卡住
 
-### 8.4 失败备份可还原
+### 9.4 失败备份可还原
 - 设计意图：给用户恢复部分数据的机会
 - 权衡：可用性 > 数据完整性保证
 - 建议：UI 应明确提示「失败备份可能不完整」
 
+### 9.5 双路径恢复设计
+- **正常路径**：Wings 回调，精确审计
+- **异常路径**：Wings 重启重置，尽力审计
+- 设计原则：状态可恢复优先，审计尽力而为
+
 ---
 
-## 九、核心文件索引
+## 十、核心文件索引
 
 | 模块 | 文件路径 |
 |------|----------|
@@ -449,6 +581,7 @@ server.status = STATUS_RESTORING_BACKUP → null  ✅ 无条件重置
 | Wings 通信 | `app/Repositories/Wings/DaemonBackupRepository.php` |
 | 客户端 API | `app/Http/Controllers/Api/Client/Servers/BackupController.php` |
 | 远程回调 API | `app/Http/Controllers/Api/Remote/Backups/BackupStatusController.php` |
+| 状态重置 API | `app/Http/Controllers/Api/Remote/Servers/ServerDetailsController.php:89-134` |
 | S3 分片上传授权 | `app/Http/Controllers/Api/Remote/Backups/BackupRemoteUploadController.php` |
 | 存储适配器 | `app/Extensions/Backups/BackupManager.php` |
 | 权限定义 | `app/Models/Permission.php` |
@@ -456,4 +589,5 @@ server.status = STATUS_RESTORING_BACKUP → null  ✅ 无条件重置
 | Wings 认证 | `app/Http/Middleware/Api/Daemon/DaemonAuthenticate.php` |
 | 备份模型 | `app/Models/Backup.php` |
 | 服务器状态校验 | `app/Models/Server.php:390-418` |
+| 活动日志模型 | `app/Models/ActivityLog.php` |
 | 配置文件 | `config/backups.php` |
