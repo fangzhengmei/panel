@@ -19,9 +19,11 @@
 ### 1.1 流程时序
 
 ```
-用户 → Panel API → InitiateBackupService → DaemonBackupRepository → Wings → S3（可选）
+用户 → Panel API → InitiateBackupService → DaemonBackupRepository → Wings
                                                           ↓
 Wings 回调 → BackupStatusController → Panel DB 更新
+                                                          ↓
+                              （S3 场景）Wings → BackupRemoteUploadController → S3 分片上传
 ```
 
 ### 1.2 各阶段职责切分
@@ -75,12 +77,28 @@ Wings 收到请求后：
    - `wings`：写入 Wings 本地磁盘
    - `s3`：向 Panel 请求分片上传 URL，逐片上传
 
-#### 阶段 5：回调更新状态
+#### 阶段 5：S3 分片上传授权（仅 S3 场景）
+**文件**：`app/Http\Controllers\Api\Remote\Backups\BackupRemoteUploadController.php:34-112`
+
+**职责**：
+- Wings 认证与归属校验
+- 检查备份未完成（`completed_at == null`）
+- 调用 S3 `CreateMultipartUpload` 获取 UploadId
+- 按分片大小生成一批 `UploadPart` 预签名 URL
+- 将 `upload_id` 保存到备份记录
+- 返回分片 URL 列表给 Wings
+
+**失败语义**：
+- 备份已完成：`ConflictHttpException`
+- 非 S3 适配器：`BadRequestHttpException`
+
+#### 阶段 6：回调更新状态
 **文件**：`app/Http/Controllers/Api/Remote/Backups/BackupStatusController.php:32-81`
 
 **职责**：
 - Wings 认证：`DaemonAuthenticate` 中间件校验节点身份
 - 归属校验：确保请求节点 == 服务器所属节点
+- 幂等性检查：已完成备份拒绝重复更新
 - 状态更新：`is_successful`、`checksum`、`bytes`、`completed_at`
 - S3 分片完成：调用 `completeMultipartUpload()` 合并或中止
 - 失败备份自动解锁：便于后续清理
@@ -102,23 +120,48 @@ Wings 收到请求后：
 Wings 回调 → BackupStatusController::restore() → Panel DB 更新
 ```
 
-### 2.2 各阶段职责切分
+### 2.2 还原判定条件精确分析
+**文件**：`app/Http/Controllers/Api/Client/Servers/BackupController.php:200-208`
+
+```php
+// 条件1：服务器状态必须为 null
+if (!is_null($server->status)) {
+    throw new BadRequestHttpException('...');
+}
+
+// 条件2：备份必须不是「未完成」的
+if (!$backup->is_successful && is_null($backup->completed_at)) {
+    throw new BadRequestHttpException('...');
+}
+```
+
+**关键修正**：条件 2 是 `&&` 逻辑，意味着**失败但已完成的备份可以被还原**。
+
+| `is_successful` | `completed_at` | 备份状态 | 是否可还原 |
+|-----------------|----------------|----------|-----------|
+| `false` | `null` | 进行中 / 完全失败未标记 | ❌ 拒绝 |
+| `false` | 非 `null` | 明确失败（已标记完成时间） | ✅ 允许 |
+| `true` | 非 `null` | 成功完成 | ✅ 允许 |
+| `true` | `null` | （逻辑上不存在） | - |
+
+> **设计意图推测**：允许还原失败备份是为了应对「备份创建部分成功但标记为失败」的边缘场景，给用户恢复数据的最后机会。但这也带来了还原不完整备份的风险。
+
+### 2.3 各阶段职责切分
 
 #### 阶段 1：客户端 API 入口
 **文件**：`app/Http/Controllers/Api/Client/Servers/BackupController.php:198-229`
 
 **职责**：
 - 权限校验：`Permission::ACTION_BACKUP_RESTORE`
-- 前置条件检查：
-  - 服务器状态必须为 `null`（正常运行状态）
-  - 备份必须 `is_successful=true` 且 `completed_at != null`
+- 前置条件检查（见 2.2）
 - S3 备份特殊处理：生成下载链接供 Wings 使用
 - 服务器状态标记：设置为 `STATUS_RESTORING_BACKUP`
 - 事务保证：状态更新 + Wings 调用在同一事务
+- 审计事件：`server:backup.restore`
 
 **失败语义**：
 - 服务器状态不符：`BadRequestHttpException`
-- 备份未完成/失败：`BadRequestHttpException`
+- 备份未完成（`is_successful=false && completed_at=null`）：`BadRequestHttpException`
 - Wings 调用失败：事务回滚，服务器状态恢复
 
 #### 阶段 2：Wings 通信
@@ -138,25 +181,83 @@ Wings 收到请求后：
 3. 从本地磁盘读取或从 S3 下载备份
 4. 解压 tar.gz 到服务器目录
 5. 恢复文件权限
-6. 回调 Panel 报告结果
+6. 回调 Panel 报告结果（无论成败）
 
 #### 阶段 4：回调更新状态
 **文件**：`app/Http/Controllers/Api/Remote/Backups/BackupStatusController.php:93-111`
 
 **职责**：
 - Wings 认证与归属校验
-- 重置服务器状态为 `null`（无论成功失败）
-- 记录活动日志：`server:backup.restore-complete` 或 `server:backup.restore-failed`
+- **无条件重置服务器状态为 `null`**（无论成功失败）
+- 记录审计事件
 
-**关键设计决策**：
-> 还原失败不将服务器置于异常状态，用户可重试或使用重装功能。
-> 参考 `BackupStatusController.php:86-89` 注释。
+**审计事件**：
+| 结果 | 事件名 | 备注 |
+|------|--------|------|
+| 成功 | `server:backup.restore-complete` | 正常 |
+| 失败 | `server.backup.restore-failed` | ⚠️ **BUG**：使用了 `.` 而非 `:`，与其他事件命名不一致 |
+
+> **关键设计决策**：还原失败不将服务器置于异常状态，用户可重试或使用重装功能。
+> 参考 `BackupStatusController.php:84-89` 注释。
 
 ---
 
-## 三、对象存储集成分析
+## 三、还原链路状态机与审计完整追踪
 
-### 3.1 BackupManager 适配器模式
+### 3.1 状态变更时序
+
+```
+用户请求还原
+    ↓
+server.status = null → STATUS_RESTORING_BACKUP  ✅ 事务内
+    ↓
+Wings 收到请求，开始还原
+    ↓
+Wings 回调（成功/失败）
+    ↓
+server.status = STATUS_RESTORING_BACKUP → null  ✅ 无条件重置
+```
+
+### 3.2 状态阻塞影响
+**文件**：`app/Models/Server.php:390-418`
+
+`STATUS_RESTORING_BACKUP` 状态会阻塞以下操作：
+- `validateCurrentState()`：阻塞控制台访问、电源操作、SFTP 等
+- `validateTransferState()`：阻塞服务器迁移
+
+### 3.3 审计事件完整清单
+
+| 时机 | 事件名 | 触发位置 |
+|------|--------|----------|
+| 用户发起还原 | `server:backup.restore` | `BackupController.php:210` |
+| Wings 回调成功 | `server:backup.restore-complete` | `BackupStatusController.php:105` |
+| Wings 回调失败 | `server.backup.restore-failed` | `BackupStatusController.php:105` ⚠️ BUG |
+
+### 3.4 失败分支真实行为
+
+**场景 1：Wings 调用失败（网络异常等）**
+- 事务回滚
+- 服务器状态保持 `null`
+- 不产生回调事件
+- 用户可立即重试
+
+**场景 2：Wings 执行失败（文件损坏、磁盘满等）**
+- Wings 回调 `successful=false`
+- 服务器状态重置为 `null`
+- 记录 `server.backup.restore-failed` 事件（⚠️ 命名 bug）
+- 用户可立即重试或使用其他备份
+- **风险**：服务器文件可能处于「部分还原」的不一致状态
+
+**场景 3：Wings 未回调（进程崩溃、网络分区）**
+- 服务器永久卡在 `STATUS_RESTORING_BACKUP`
+- 所有需要 `validateCurrentState()` 的操作被阻塞
+- **无自动恢复机制**，需管理员手动干预数据库
+
+---
+
+## 四、对象存储集成分析
+
+### 4.1 BackupManager 适配器模式
 **文件**：`app/Extensions/Backups/BackupManager.php`
 
 **职责**：
@@ -169,25 +270,29 @@ Wings 收到请求后：
 - Panel 持有 S3 密钥（`config/backups.php`）
 - Wings 从不直接持有 S3 密钥，仅通过 Panel 生成的预签名 URL 访问
 
-### 3.2 S3 备份创建数据流
+### 4.2 S3 备份创建数据流
 ```
-1. Panel 创建备份记录，disk = 's3'
-2. Wings 请求 Panel 获取分片上传 URL
-3. Wings 分片上传到 S3（使用预签名 URL）
-4. Wings 回调 Panel，携带分片 ETag 列表
-5. Panel 调用 S3 CompleteMultipartUpload 合并文件
+1. Panel 创建备份记录，disk = 's3'，upload_id = null
+2. Wings 打包完成，向 Panel 请求分片上传 URL
+3. Panel 调用 S3 CreateMultipartUpload，获取 UploadId
+4. Panel 生成 UploadPart 预签名 URL 列表返回给 Wings
+5. Panel 将 upload_id 写入备份记录
+6. Wings 使用预签名 URL 分片上传
+7. Wings 回调 Panel，携带 ETag 列表
+8. Panel 调用 S3 CompleteMultipartUpload 合并文件
 ```
 
-### 3.3 S3 备份还原数据流
+### 4.3 S3 备份还原数据流
 ```
 1. 用户请求还原
 2. Panel 生成 S3 GetObject 预签名 URL（有效期 5 分钟）
 3. Panel 将 URL 传递给 Wings
 4. Wings 使用 URL 下载备份文件
 5. Wings 解压还原
+6. Wings 回调 Panel 报告结果
 ```
 
-### 3.4 S3 备份删除数据流
+### 4.4 S3 备份删除数据流
 **文件**：`app/Services/Backups/DeleteBackupService.php:68-82`
 
 **执行顺序**：
@@ -199,9 +304,9 @@ Wings 收到请求后：
 
 ---
 
-## 四、权限边界详解
+## 五、权限边界详解
 
-### 4.1 用户权限模型
+### 5.1 用户权限模型
 **文件**：`app/Models/Permission.php:142-151`
 
 | 权限 | 描述 | 风险等级 |
@@ -212,7 +317,7 @@ Wings 收到请求后：
 | `backup.download` | 下载备份（可获取所有服务器文件） | 高 |
 | `backup.restore` | 还原备份（可覆盖所有服务器文件） | 高 |
 
-### 4.2 权限判定逻辑
+### 5.2 权限判定逻辑
 **文件**：`app/Policies/ServerPolicy.php:26-33`
 
 权限检查优先级：
@@ -220,7 +325,7 @@ Wings 收到请求后：
 2. **Server Owner**：无条件通过
 3. **Subuser**：检查 `subuser.permissions` 数组
 
-### 4.3 Wings 认证体系
+### 5.3 Wings 认证体系
 **文件**：`app/Http/Middleware/Api/Daemon/DaemonAuthenticate.php`
 
 **认证流程**：
@@ -233,7 +338,7 @@ Wings 收到请求后：
 - 备份归属校验：确保回调节点 == 备份所属服务器的节点
 - 防止恶意节点修改其他节点的备份状态
 
-### 4.4 下载链接安全
+### 5.4 下载链接安全
 **文件**：`app/Services/Backups/DownloadLinkService.php`
 
 | 存储类型 | URL 类型 | 有效期 | 认证方式 |
@@ -243,9 +348,9 @@ Wings 收到请求后：
 
 ---
 
-## 五、失败语义汇总
+## 六、失败语义汇总
 
-### 5.1 备份创建失败场景
+### 6.1 备份创建失败场景
 
 | 失败点 | 处理方式 | 数据状态 |
 |--------|----------|----------|
@@ -256,16 +361,17 @@ Wings 收到请求后：
 | S3 上传失败 | Wings 回调，Panel 中止分片 | 记录存在，`is_successful=false` |
 | S3 合并分片失败 | 事务回滚 | 状态不更新 |
 
-### 5.2 备份还原失败场景
+### 6.2 备份还原失败场景
 
-| 失败点 | 处理方式 | 数据状态 |
-|--------|----------|----------|
-| 服务器状态不符 | 立即拒绝 | 无变化 |
-| 备份未完成/失败 | 立即拒绝 | 无变化 |
-| Wings 连接失败 | 事务回滚 | 服务器状态恢复 |
-| Wings 解压失败 | Wings 回调 | 服务器状态重置为 `null`，记录失败日志 |
+| 失败点 | 处理方式 | 数据状态 | 风险 |
+|--------|----------|----------|------|
+| 服务器状态不符 | 立即拒绝 | 无变化 | 无 |
+| 备份未完成（is_successful=false && completed_at=null） | 立即拒绝 | 无变化 | 无 |
+| Wings 连接失败 | 事务回滚 | 服务器状态恢复 | 无 |
+| Wings 执行失败（文件损坏等） | Wings 回调，状态重置为 null | 服务器状态正常，记录失败日志 | ⚠️ 文件可能部分还原 |
+| Wings 未回调 | 无处理 | 服务器永久卡在 restoring_backup | ⚠️ 需人工干预 |
 
-### 5.3 备份删除失败场景
+### 6.3 备份删除失败场景
 
 | 失败点 | 处理方式 | 数据状态 |
 |--------|----------|----------|
@@ -276,9 +382,38 @@ Wings 收到请求后：
 
 ---
 
-## 六、关键设计决策
+## 七、已知问题与风险
 
-### 6.1 事务边界设计
+### 7.1 事件命名不一致
+**文件**：`BackupStatusController.php:105`
+
+```php
+// 成功使用冒号分隔
+'server:backup.restore-complete'
+// 失败使用点号分隔（BUG）
+'server.backup.restore-failed'
+```
+
+**影响**：基于事件名的监控、告警、统计逻辑可能漏掉还原失败事件。
+
+### 7.2 失败备份可还原
+**文件**：`BackupController.php:206`
+
+**风险**：用户可能还原一个不完整、损坏的备份，导致服务器无法正常运行。
+
+### 7.3 无回调超时机制
+**风险**：Wings 崩溃或网络分区时，服务器永久卡在 `restoring_backup` 状态，所有操作被阻塞。
+
+### 7.4 S3 删除最终一致性
+**文件**：`DeleteBackupService.php:68-82`
+
+**风险**：先删 DB 记录再删 S3 文件，若 S3 删除失败产生孤立文件，占用存储成本。
+
+---
+
+## 八、关键设计决策
+
+### 8.1 事务边界设计
 - **创建备份**：DB 记录 + Wings 调用在同一事务
   - 保证 Wings 收到请求时记录已存在
   - 失败则无残留记录
@@ -287,19 +422,24 @@ Wings 收到请求后：
   - 优先保证 Panel 侧状态一致
   - 接受 S3 可能存在孤立文件的风险
 
-### 6.2 锁定机制
+### 8.2 锁定机制
 - 成功备份可锁定，防止自动轮换或误删
 - 失败备份自动解锁，便于清理
 - 锁定操作需要 `backup.delete` 权限
 
-### 6.3 状态机设计
+### 8.3 状态机设计
 - 服务器状态：`null` → `restoring_backup` → `null`
 - 还原失败不设特殊失败状态，降低用户理解成本
 - 还原期间禁止其他操作（通过状态检查实现）
 
+### 8.4 失败备份可还原
+- 设计意图：给用户恢复部分数据的机会
+- 权衡：可用性 > 数据完整性保证
+- 建议：UI 应明确提示「失败备份可能不完整」
+
 ---
 
-## 七、核心文件索引
+## 九、核心文件索引
 
 | 模块 | 文件路径 |
 |------|----------|
@@ -309,9 +449,11 @@ Wings 收到请求后：
 | Wings 通信 | `app/Repositories/Wings/DaemonBackupRepository.php` |
 | 客户端 API | `app/Http/Controllers/Api/Client/Servers/BackupController.php` |
 | 远程回调 API | `app/Http/Controllers/Api/Remote/Backups/BackupStatusController.php` |
+| S3 分片上传授权 | `app/Http/Controllers/Api/Remote/Backups/BackupRemoteUploadController.php` |
 | 存储适配器 | `app/Extensions/Backups/BackupManager.php` |
 | 权限定义 | `app/Models/Permission.php` |
 | 权限策略 | `app/Policies/ServerPolicy.php` |
 | Wings 认证 | `app/Http/Middleware/Api/Daemon/DaemonAuthenticate.php` |
 | 备份模型 | `app/Models/Backup.php` |
+| 服务器状态校验 | `app/Models/Server.php:390-418` |
 | 配置文件 | `config/backups.php` |
