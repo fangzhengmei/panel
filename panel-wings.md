@@ -540,6 +540,178 @@ public function transform(array $data): array
 
 ---
 
+## 四（补充）：状态语义深度解析
+
+### 4.5 所有状态更新入口汇总
+
+除了安装回调（`ServerInstallController::store`）之外，还有以下入口会更新服务器状态：
+
+| 状态值 | 更新入口 | 代码位置 | 触发场景 |
+|--------|----------|----------|----------|
+| **`installing`** | `ServerCreationService::handle` | `ServerCreationService.php:147` | 首次创建服务器时设置初始状态 |
+| **`installing`** | `ReinstallServerService::handle` | `ReinstallServerService.php:28` | 管理员触发重装服务器 |
+| **`installing`** | `ServersController::toggleInstall` | `ServersController.php:95` | 管理员在后台手动切换安装状态 |
+| **`install_failed`** | `ServerInstallController::store` | `ServerInstallController.php:64` | Wings 回调上报首次安装失败 |
+| **`reinstall_failed`** | `ServerInstallController::store` | `ServerInstallController.php:67` | Wings 回调上报重装失败 |
+| **`suspended`** | `SuspensionService::toggle` | `SuspensionService.php:47` | 管理员暂停服务器 |
+| **`null`（正常）** | `SuspensionService::toggle` | `SuspensionService.php:47` | 管理员解除暂停 |
+| **`null`（回滚）** | `SuspensionService::toggle` | `SuspensionService.php:56` | Wings 同步失败时回滚暂停操作 |
+| **`restoring_backup`** | `BackupController::restore` | `BackupController.php:223` | 用户/管理员触发备份恢复 |
+| **`null`（恢复完成）** | `BackupStatusController::restore` | `BackupStatusController.php:103` | Wings 回调上报备份恢复完成（无论成败） |
+| **`null`（重置）** | `ServerDetailsController::reset` | `ServerDetailsController.php:130` | Wings 重启时重置卡住的中间状态 |
+
+> **重置逻辑**: `ServerDetailsController.php:129` 中，Wings 重启时只会重置 `installing` 和 `restoring_backup` 两种状态，**不会**重置 `suspended`、`install_failed`、`reinstall_failed`，这些状态需要人工干预。
+
+### 4.6 `reinstall_failed` vs `restoring_backup` 语义差异
+
+#### 4.6.1 `isInstalled()` 判定差异
+
+**文件位置**: `app/Models/Server.php:213`
+
+```php
+public function isInstalled(): bool
+{
+    return $this->status !== self::STATUS_INSTALLING 
+        && $this->status !== self::STATUS_INSTALL_FAILED;
+}
+```
+
+| 状态 | `isInstalled()` 返回值 | 说明 |
+|------|-----------------------|------|
+| `installing` | `false` | 首次安装中 |
+| `install_failed` | `false` | 首次安装失败 |
+| **`reinstall_failed`** | **`true`** | ⚠️ 重装失败仍被视为"已安装" |
+| `restoring_backup` | `true` | 备份恢复中被视为"已安装" |
+| `suspended` | `true` | 暂停被视为"已安装" |
+| `null` | `true` | 正常状态 |
+
+**设计意图**: 重装失败的服务器之前已经完成过首次安装，用户仍可查看配置、修改设置，只是无法正常运行。
+
+#### 4.6.2 可用性判定差异（`validateCurrentState`）
+
+**文件位置**: `app/Models/Server.php:390`
+
+```php
+public function validateCurrentState()
+{
+    if (
+        $this->isSuspended()
+        || $this->node->isUnderMaintenance()
+        || !$this->isInstalled()  // 排除 installing 和 install_failed
+        || $this->status === self::STATUS_RESTORING_BACKUP  // ⚠️  额外排除 restoring_backup
+        || !is_null($this->transfer)
+    ) {
+        throw new ServerStateConflictException($this);
+    }
+}
+```
+
+| 状态 | `validateCurrentState()` | 可访问 API | 可操作 |
+|------|--------------------------|------------|--------|
+| `installing` | ❌ 抛出异常 | ❌ | ❌ |
+| `install_failed` | ❌ 抛出异常 | ❌ | ❌ |
+| **`reinstall_failed`** | **✅ 通过** | ✅ | ✅（可再次重装、修改配置） |
+| **`restoring_backup`** | **❌ 抛出异常** | ❌ | ❌ |
+| `suspended` | ❌ 抛出异常 | ❌ | ❌ |
+
+**调用位置**:
+- `AuthenticateServerAccess.php:50` - 客户端 API 访问校验
+- `SftpAuthenticationController.php:153` - SFTP 登录校验
+
+**异常消息** (`ServerStateConflictException.php:16-27`):
+- `restoring_backup`: "This server is currently restoring from a backup, please try again later."
+- `install_failed`: "This server has not yet completed its installation process, please try again later."
+- `reinstall_failed`: 无特殊消息（因为不会走到这里）
+
+#### 4.6.3 可迁移性判定差异（`validateTransferState`）
+
+**文件位置**: `app/Models/Server.php:409`
+
+```php
+public function validateTransferState()
+{
+    if (
+        !$this->isInstalled()
+        || $this->status === self::STATUS_RESTORING_BACKUP
+        || !is_null($this->transfer)
+    ) {
+        throw new ServerStateConflictException($this);
+    }
+}
+```
+
+- `reinstall_failed`: ✅ 可以迁移（因为 `isInstalled()=true`）
+- `restoring_backup`: ❌ 不能迁移
+
+#### 4.6.4 语义总结表
+
+| 维度 | `reinstall_failed` | `restoring_backup` |
+|------|---------------------|---------------------|
+| **含义** | 重装过程失败 | 备份恢复进行中 |
+| **是否临时状态** | ❌ 终态，需人工干预 | ✅ 临时状态，Wings 会回调重置 |
+| **`isInstalled()`** | `true` | `true` |
+| **客户端 API 访问** | ✅ 允许 | ❌ 禁止 |
+| **SFTP 登录** | ✅ 允许 | ❌ 禁止 |
+| **服务器迁移** | ✅ 允许 | ❌ 禁止 |
+| **Wings 重启时重置** | ❌ 不会重置 | ✅ 会重置为 null |
+| **排障建议** | 查看 Wings 日志，手动重装 | 等待恢复完成，或重启 Wings |
+
+### 4.7 `installed_at` 字段深入解析
+
+#### 4.7.1 写入时机
+
+**文件位置**: `app/Http/Controllers/Api/Remote/Servers/ServerInstallController.php:76`
+
+```php
+// ⚠️  无论成功失败，每次安装回调都会更新 installed_at
+$this->repository->update($server->id, [
+    'status' => $status, 
+    'installed_at' => CarbonImmutable::now()
+], true, true);
+```
+
+| 场景 | `installed_at` 值 | 说明 |
+|------|-------------------|------|
+| 首次安装成功 | 当前时间 | 正确记录首次安装时间 |
+| 首次安装失败 | 当前时间 | ⚠️ 即使失败也写入 |
+| 重装成功 | 当前时间 | 覆盖之前的时间 |
+| 重装失败 | 当前时间 | ⚠️ 即使失败也覆盖 |
+
+#### 4.7.2 对通知分支的影响
+
+**文件位置**: `app/Http/Controllers/Api/Remote/Servers/ServerInstallController.php:80-85`
+
+```php
+// 判断是首次安装还是重装：基于更新前的 installed_at 是否为 null
+$isInitialInstall = is_null($server->installed_at);
+
+if ($isInitialInstall && config('pterodactyl.email.send_install_notification', true)) {
+    $this->eventDispatcher->dispatch(new ServerInstalled($server));
+} elseif (!$isInitialInstall && config('pterodactyl.email.send_reinstall_notification', true)) {
+    $this->eventDispatcher->dispatch(new ServerInstalled($server));
+}
+```
+
+**关键点**:
+1. **更新前读取**: `is_null($server->installed_at)` 判断的是**更新前**的值
+2. **首次安装判定**: 只有第一次安装回调时 `installed_at` 才是 `null`
+3. **失败也会通知**: 无论是成功还是失败回调，都会触发对应通知（只要配置开启）
+4. **重装通知**: 之后的所有回调（包括失败）都会走重装通知分支
+
+#### 4.7.3 排障影响
+
+| 现象 | 含义 | 排障建议 |
+|------|------|----------|
+| `installed_at` 有值但 `status=install_failed` | 首次安装失败 | 检查首次安装日志 |
+| `installed_at` 有值但 `status=reinstall_failed` | 某次重装失败 | 检查 Wings 日志中的重装输出 |
+| `installed_at` 时间很近但服务器是旧版本 | 刚重装过但失败了 | 查看 `installed_at` 附近的 Wings 日志 |
+| `installed_at` 为 null | 从未回调成功过 | 检查 Wings 能否连接 Panel 的 `/api/remote` |
+| 收到重装邮件但状态是失败 | 重装失败通知 | 正常现象，通知不区分成功失败 |
+
+> **排障技巧**: `installed_at` 可以作为"最近一次安装尝试时间"的锚点，用于在日志中定位对应的安装/重装操作。
+
+---
+
 ## 五、完整时序图
 
 ### 5.1 自动启动分支（start_on_completion = true）
