@@ -202,39 +202,222 @@ if (!is_null($allocation->server_id)) {
 
 ---
 
-## 五、三者协作关系
+## 五、三者联动链路完整时序
 
-### 5.1 整体流程
+### 5.1 回收释放：资源何时回到可选集合
+
+**关键机制**：事务可见性 + 外键约束执行时机
+
+```
+时间轴 →
+  │
+  ├─ [T0] 事务开始（ServerDeletionService::handle）
+  │    ├─ 1. 调用 Wings Daemon 删除服务器
+  │    ├─ 2. 删除关联数据库（database.delete）
+  │    └─ 3. 应用层清空 notes: UPDATE allocations SET notes = NULL WHERE server_id = ?
+  │
+  ├─ [T1] 执行 server.delete
+  │    └─ 数据库触发外键约束 ON DELETE SET NULL
+  │       └─ allocations.server_id 自动变为 NULL（仅当前事务可见）
+  │
+  ├─ [T2] 事务 COMMIT
+  │    ├─ 行锁释放
+  │    └─ 变更全局可见 → 此时其他事务的 whereNull('server_id') 才能看到
+  │
+  └─ [T3] 资源正式回归可选集合
+       └─ 可被 AllocationRepository::getRandomAllocation() 查询到
+```
+
+**关键代码溯源**：
+- 外键约束执行：`database/schema/mysql-schema.sql:57` - `ON DELETE SET NULL` 在 DELETE 语句执行时触发
+- 事务提交点：`app/Services/Servers/ServerDeletionService.php:59-85` - `$this->connection->transaction()`
+- 可见性规则：MySQL InnoDB 默认 `REPEATABLE READ` 隔离级别，事务提交前变更对其他事务不可见
+
+**不同回收场景的时序差异**：
+
+| 回收场景 | 触发时机 | 可见性延迟 | 数据清理 |
+|---------|---------|-----------|---------|
+| 服务器删除 | 事务 COMMIT 后 | 事务提交即可见 | 外键自动置空 + 应用层清空 notes |
+| 手动解除分配 | UPDATE 语句执行后 | 事务提交即可见 | 应用层置空 server_id + 清空 notes |
+| 客户端自助解除 | UPDATE 语句执行后 | 事务提交即可见 | 应用层置空 server_id + 清空 notes |
+| 服务器迁移 | UPDATE 语句执行后 | 事务提交即可见 | 仅置空 server_id，不清空 notes |
+
+### 5.2 占用校验：下一次分配时怎样拦截冲突
+
+**五层拦截机制**（按执行顺序）：
+
+```
+分配请求 →
+  │
+  ├─ [第一层] 请求验证层（Request Validation）
+  │    位置：app/Http/Requests/Admin/ServerFormRequest.php:33-55
+  │    逻辑：Rule::exists('allocations', 'id')->whereNull('server_id')
+  │    时机：控制器方法执行前
+  │    失败：返回 422 ValidationException
+  │
+  ├─ [第二层] 查询条件过滤（Application Layer）
+  │    位置：AllocationRepository.php:61, BuildModificationService.php:94
+  │    逻辑：WHERE server_id IS NULL
+  │    时机：筛选候选分配时
+  │    失败：返回空集合，抛出 NoViableAllocationException
+  │
+  ├─ [第三层] 行级锁（Concurrency Control）
+  │    位置：FindAssignableAllocationService.php:42, 106
+  │    逻辑：SELECT ... FOR UPDATE (lockForUpdate)
+  │    时机：选中候选分配后，更新前
+  │    失败：阻塞等待锁释放，超时抛出 PDOException
+  │
+  ├─ [第四层] UPDATE 条件校验（Atomic Update）
+  │    位置：多处 UPDATE 语句
+  │    逻辑：UPDATE allocations SET server_id = ? WHERE id = ? AND server_id IS NULL
+  │    时机：执行分配绑定时
+  │    失败：影响行数为 0，说明并发抢占成功
+  │
+  └─ [第五层] 数据库唯一索引（Last Resort）
+       位置：database/schema/mysql-schema.sql:54
+       逻辑：UNIQUE KEY (node_id, ip, port)
+       时机：INSERT 或 UPDATE 时
+       失败：抛出 PDOException (SQLSTATE[23000]: Duplicate entry)
+```
+
+**典型拦截流程示例**（自动部署场景）：
+
+```
+请求 POST /api/application/servers
+  │
+  ├─ StoreServerRequest::withValidator() 执行
+  │    └─ Rule::exists()->whereNull('server_id') → 第一层拦截
+  │
+  ├─ ServerCreationService::handle()
+  │    ├─ configureDeployment()
+  │    │   ├─ FindViableNodesService → 筛选节点
+  │    │   └─ AllocationSelectionService::handle()
+  │    │       └─ AllocationRepository::getRandomAllocation()
+  │    │           └─ WHERE server_id IS NULL → 第二层拦截
+  │    │
+  │    └─ 事务开始（尝试5次）
+  │        ├─ createModel() → 创建服务器记录
+  │        └─ storeAssignedAllocations()
+  │            └─ UPDATE allocations SET server_id = ?
+  │                WHERE id IN (...) → 第四层隐含校验
+  │
+  └─ 成功返回
+```
+
+### 5.3 并发抢占：失败时重试与回滚如何触发
+
+**并发冲突场景**：两个请求同时分配同一个端口
+
+```
+请求 A (T0)                请求 B (T1)
+   │                          │
+   ├─ 事务开始                ├─ 事务开始
+   ├─ SELECT allocation WHERE server_id IS NULL → 找到端口 25565
+   │                          ├─ SELECT allocation WHERE server_id IS NULL → 也找到端口 25565
+   ├─ lockForUpdate() → 加锁  │
+   ├─ UPDATE server_id = A.id │
+   │                          ├─ lockForUpdate() → 阻塞，等待锁释放
+   ├─ 事务 COMMIT → 锁释放    │
+   │                          ├─ 获得锁，重新读取
+   │                          └─ 发现 server_id 已变为 A.id，WHERE 条件不匹配
+   │                          ├─ UPDATE 影响行数 = 0
+   │                          └─ 事务回滚
+   └─ 成功                    └─ 抛出异常 / 重试
+```
+
+**重试机制**：
+
+1. **事务自动重试**（`ServerCreationService.php:86`）
+   ```php
+   $server = $this->connection->transaction(function () use ($data, $eggVariableData) {
+       // ... 业务逻辑 ...
+   }, 5); // 重试5次
+   ```
+   - Laravel 数据库事务支持 `$attempts` 参数
+   - 捕获 `PDOException` 死锁或锁等待超时自动重试
+   - 每次重试都会重新开始整个事务
+
+2. **死锁异常处理**（`app/Exceptions/Handler.php:137-139`）
+   ```php
+   if ($connections->transactionLevel()) {
+       $connections->rollBack(0); // 强制回滚到最外层
+   }
+   ```
+   - 全局异常处理器检查未完成事务
+   - 强制回滚所有层级，确保资源释放
+
+3. **创建失败补偿回滚**（`ServerCreationService.php:100-104`）
+   ```php
+   try {
+       $this->daemonServerRepository->setServer($server)->create(...);
+   } catch (DaemonConnectionException $exception) {
+       $this->serverDeletionService->withForce()->handle($server);
+       throw $exception;
+   }
+   ```
+   - Wings Daemon 创建失败时，调用 `ServerDeletionService` 回滚
+   - 已创建的服务器记录被删除，外键自动置空分配
+   - 带 `withForce()` 忽略 Daemon 错误，确保数据一致性
+
+4. **并发更新失败检测**
+   - UPDATE 语句执行后检查 `$query->getConnection()->affectingStatement()`
+   - 影响行数为 0 时，说明记录已被其他请求修改
+   - 业务层可选择抛出异常或重试（当前代码未显式处理，依赖上层事务重试）
+
+---
+
+## 六、三者协作关系
+
+### 6.1 整体流程
 
 ```
 候选筛选 → 占用校验 → 分配绑定 → 使用中 → 回收释放
     ↓          ↓          ↓                    ↓
-1. 节点筛选   1. DB唯一键  1. 事务保护        1. 外键自动置空
-2. 分配筛选   2. 应用层检查  2. 行锁防并发      2. 主动置空 server_id
-3. 专用IP检查  3. 行锁      3. 更新 server_id   3. 清空 notes
+1. 节点筛选   1. 请求验证  1. 事务保护        1. 外键自动置空
+2. 分配筛选   2. 查询过滤  2. 行锁防并发      2. 主动置空 server_id
+3. 专用IP检查  3. 行锁      3. UPDATE 校验     3. 清空 notes
+             4. UPDATE 条件  4. 事务提交可见
+             5. 唯一索引
 ```
 
-### 5.2 典型场景协作
+### 6.2 典型场景协作
 
 #### 场景1：自动部署服务器
 
-**流程**：
-1. `ServerCreationService::configureDeployment()` 调用 `FindViableNodesService` 筛选满足资源的节点
-2. 调用 `AllocationSelectionService::handle()` → `AllocationRepository::getRandomAllocation()` 筛选可用分配
-3. 在事务中创建服务器并调用 `storeAssignedAllocations()` 批量更新 `server_id`
-4. 若Daemon创建失败，调用 `ServerDeletionService` 回滚，外键自动置空分配
+**完整时序**：
+```
+T0  请求验证层：Rule::exists()->whereNull('server_id') → 第一层拦截
+T1  FindViableNodesService → 节点筛选（内存/磁盘/位置）
+T2  AllocationSelectionService::handle()
+    └─ AllocationRepository::getRandomAllocation()
+       └─ WHERE server_id IS NULL → 第二层拦截
+T3  事务开始（第1次尝试，最多5次）
+T4    createModel() → INSERT servers
+T5    storeAssignedAllocations()
+      └─ UPDATE allocations SET server_id = ? WHERE id IN (...) → 第四层校验
+T6  事务 COMMIT → 锁释放，变更可见
+T7  调用 Wings Daemon 创建服务器
+    ├─ 成功 → 返回
+    └─ 失败 → ServerDeletionService::withForce()->handle() → 回滚（外键置空分配）
+```
 
 **涉及文件**：
-- `app/Services/Servers/ServerCreationService.php:56-60, 86-94, 116-128`
+- `app/Services/Servers/ServerCreationService.php:56-60, 86-94, 100-104, 116-128`
 
 #### 场景2：客户端自助添加分配
 
-**流程**：
-1. `NetworkAllocationController::store()` 检查分配限额
-2. `FindAssignableAllocationService::handle()`:
-   - 使用 `lockForUpdate()` 锁定查询，防止并发
-   - 找到现有未分配 → 直接更新 `server_id`
-   - 找不到 → 计算可用端口差集 → `insertIgnore` 创建 → 更新 `server_id`
+**完整时序**：
+```
+T0  NetworkAllocationController::store()
+    └─ Activity::event()->transaction()
+T1    lockForUpdate() 计数校验 → 限额检查
+T2    FindAssignableAllocationService::handle()
+        ├─ lockForUpdate() → WHERE server_id IS NULL → 第二+三层拦截
+        ├─ 找到 → UPDATE server_id = ? → 第四层校验
+        └─ 找不到 → 差集计算 → insertIgnore → UPDATE
+T3  事务 COMMIT → 锁释放
+T4  返回
+```
 
 **涉及文件**：
 - `app/Http/Controllers/Api/Client/Servers/NetworkAllocationController.php:95-112`
@@ -242,43 +425,77 @@ if (!is_null($allocation->server_id)) {
 
 #### 场景3：修改服务器构建（增减分配）
 
-**流程**：
-1. `BuildModificationService::processAllocations()` 处理 `add_allocations` 和 `remove_allocations`
-2. 添加分配：查询 `server_id IS NULL` 的分配，更新 `server_id`
-3. 移除分配：检查主分配保护，更新 `server_id = NULL` 并清空 `notes`
-4. 整个过程在事务中执行
+**完整时序**：
+```
+T0  事务开始
+T1    processAllocations()
+      ├─ 添加：WHERE server_id IS NULL → UPDATE server_id = ?
+      ├─ 移除：主分配保护检查 → UPDATE server_id = NULL, notes = NULL
+      └─ 冲突处理：array_diff(remove, add) 避免先删后加
+T2    更新 server.allocation_id（如果主分配变更）
+T3    服务器模型 saveOrFail()
+T4  事务 COMMIT
+T5  同步到 Wings Daemon（失败仅记录日志，不回滚）
+```
 
 **涉及文件**：
 - `app/Services/Servers/BuildModificationService.php:82-130`
 
-### 5.3 关键协作点
+### 6.3 关键协作点
 
 | 机制 | 筛选阶段 | 校验阶段 | 回收阶段 |
 |------|---------|---------|---------|
 | **数据库约束** | - | 唯一索引、外键 | ON DELETE SET NULL |
 | **应用层检查** | whereNull('server_id') | whereNull('server_id') | server_id 非空检查 |
 | **并发控制** | - | lockForUpdate() | - |
-| **事务保护** | - | 创建/修改事务 | 删除事务 |
+| **事务保护** | - | 创建/修改事务（5次重试） | 删除事务 |
 | **数据清理** | - | - | 清空 notes |
+| **可见性规则** | 读已提交快照 | 事务内立即见 | 提交后全局见 |
+| **失败回滚** | - | 事务自动回滚 | 外键自动置空 |
+
+### 6.4 端到端完整链路时序
+
+```
+回收链路                                分配链路
+──────────                              ┌───────────────┐
+│ T0 事务开始                          │ 请求到达      │
+│ T1 清空 notes UPDATE                 │ 层验证        │
+│ T2 删除 server                       │ 节点筛选      │
+│    → 外键 ON DELETE SET NULL         │ 分配筛选      │
+│      (仅当前事务可见)                │ 事务开始      │
+│ T3 事务 COMMIT                       │ 行锁加锁      │
+│    → 锁释放                          │ UPDATE 校验   │
+│    → 变更全局可见                    │ 事务 COMMIT   │
+│ T4 资源回归可选集合 ◄───────────────► 可被查询到     │
+└──────────                              └───────────────┘
+
+并发冲突场景：
+请求 A: SELECT → 加锁 → UPDATE → COMMIT
+请求 B: SELECT → 阻塞 → 获得锁 → 发现已变更 → 回滚 → 重试
+```
 
 ---
 
-## 六、设计亮点与潜在风险
+## 七、设计亮点与潜在风险
 
 ### 设计亮点
 
-1. **多层防御**：数据库唯一索引 + 应用层检查 + 行锁，确保万无一失
-2. **自动回收**：外键 `ON DELETE SET NULL` 确保服务器删除时分配自动释放
-3. **随机分配**：`inRandomOrder()` 避免端口集中在某一区域
+1. **多层防御**：5层拦截（请求验证→查询过滤→行锁→UPDATE条件→唯一索引），确保万无一失
+2. **自动回收**：外键 `ON DELETE SET NULL` + 应用层双保险，确保服务器删除时分配自动释放
+3. **随机分配**：`inRandomOrder()` 避免端口集中在某一区域，减少碎片
 4. **幂等操作**：`insertIgnore` 支持重复调用，适合批量场景
 5. **资源隔离**：专用IP模式确保敏感应用独占IP
+6. **事务重试**：服务器创建支持5次事务重试，应对死锁和并发冲突
+7. **全局回滚**：异常处理器强制回滚未完成事务，防止悬挂锁
 
 ### 潜在风险与注意事项
 
-1. **长事务风险**：`FindAssignableAllocationService` 中的 `lockForUpdate()` 可能导致锁等待
-2. **差集计算性能**：`array_diff(range($start, $end), $ports->toArray())` 在端口范围大时可能有性能问题
-3. **随机分配冲突**：高并发下 `inRandomOrder()` + `first()` 可能导致多次重试
-4. **Notes 泄露**：回收时必须清空 `notes`，否则可能携带前一服务器的敏感信息
+1. **长事务风险**：`FindAssignableAllocationService` 中的 `lockForUpdate()` 可能导致锁等待，高并发下需注意事务长度
+2. **差集计算性能**：`array_diff(range($start, $end), $ports->toArray())` 在端口范围大于10000时可能有性能问题
+3. **随机分配冲突**：高并发下 `inRandomOrder()` + `first()` 可能导致多个请求选中同一分配，触发重试
+4. **Notes 泄露**：回收时必须清空 `notes`，否则可能携带前一服务器的敏感信息（服务器迁移场景未清空）
+5. **事务隔离级别**：MySQL 默认 `REPEATABLE READ` 可能导致幻读，极端并发下需注意
+6. **UPDATE 影响行数**：当前代码未检查 UPDATE 影响行数，并发抢占成功时无法感知，依赖上层重试
 
 ### 关键代码溯源
 
@@ -290,5 +507,10 @@ if (!is_null($allocation->server_id)) {
 | 插入忽略重复 | `EloquentRepository.php` | 251-277 |
 | 构建修改分配 | `BuildModificationService.php` | 82-130 |
 | 服务器删除回收 | `ServerDeletionService.php` | 59-85 |
+| 事务5次重试 | `ServerCreationService.php` | 86 |
+| 创建失败回滚 | `ServerCreationService.php` | 100-104 |
+| 全局异常回滚 | `Handler.php` | 137-139 |
+| 请求验证层 | `ServerFormRequest.php` | 33-55 |
+| 行锁加锁 | `FindAssignableAllocationService.php` | 42, 106 |
 | 数据库唯一键 | `mysql-schema.sql` | 54 |
 | 外键置空约束 | `mysql-schema.sql` | 57 |
