@@ -553,6 +553,264 @@ T5  同步到 Wings Daemon（失败仅记录日志，不回滚）
 
 7. **事务隔离级别**：MySQL 默认 `REPEATABLE READ` 可能导致幻读，极端并发下需注意
 
+8. **⚠️ 新建端口并发覆盖**：自动分配新建端口路径中，查询已有端口时无锁，`insertIgnore` 不报错，后加锁的请求会覆盖先请求的 `server_id`
+   - 位置：`app/Services/Allocations/FindAssignableAllocationService.php:80-83, 99-102, 105-109`
+   - 影响：高并发下用户A的分配可能被用户B偷偷覆盖
+
+9. **⚠️ deploy.port_range 静默退化**：无效端口范围（如格式错误、超出范围）被 `setPorts()` 静默过滤，`$ports` 变为空数组，候选筛选退化为从所有端口中随机选择
+   - 位置：`app/Services/Deployment/AllocationSelectionService.php:59-73`
+   - 影响：用户以为端口被限制在指定范围，实际可能分配到任意端口
+
+10. **⚠️ AssignmentService 回滚依赖全局处理器**：手动 `beginTransaction()` 但无本地 `try-catch`，异常时依赖全局异常处理器 `Handler.php` 回滚，若调用方捕获异常不重新抛出则事务悬挂
+    - 位置：`app/Services/Allocations/AssignmentService.php:61-107`
+    - 影响：数据库连接状态异常，后续操作可能在未提交的事务中执行
+
+---
+
+## 八、关键路径深度分析
+
+### 8.1 自动分配新建端口路径在并发下的覆盖窗口
+
+**场景**：客户端自助添加分配时，现有端口不足，需要动态创建新端口。
+
+**代码路径**：`FindAssignableAllocationService::createNewAllocation()` (`app/Services/Allocations/FindAssignableAllocationService.php:66-112`)
+
+**完整时序与并发覆盖窗口**：
+```
+请求 A (T0)                          请求 B (T1)
+   │                                    │
+   ├─ T68-73: 读取配置 range_start/end  │
+   ├─ T80-83: ❗ 查询已有端口（无锁）   ├─ T68-73: 读取配置
+   │  SELECT port FROM allocations      ├─ T80-83: ❗ 查询已有端口（无锁）
+   │  WHERE ip = ? AND port BETWEEN ?   │  （读到相同的已有端口列表）
+   ├─ T88: 计算差集 array_diff()        ├─ T88: 计算差集 array_diff()
+   │  （得到相同的可用端口集合）         │  （得到相同的可用端口集合）
+   ├─ T97: array_rand 随机选端口 25565 ├─ T97: array_rand 也选到 25565！
+   │                                    │
+   ├─ T99-102: 调用 AssignmentService  ├─ T99-102: 调用 AssignmentService
+   │   beginTransaction                 │   beginTransaction
+   │   insertIgnore (node_id, ip, 25565)│   insertIgnore (node_id, ip, 25565)
+   │   commit                           │   commit
+   │                                    │   （insertIgnore 不报错，因为已存在）
+   │                                    │
+   ├─ T105-109: lockForUpdate 查询      ├─ T105-109: lockForUpdate 查询
+   │   SELECT * FROM allocations        │   （阻塞等待A释放锁）
+   │   WHERE ip = ? AND port = 25565    │
+   │   FOR UPDATE                       │
+   ├─ T50: update server_id = A.id      │
+   ├─ T52: refresh() 返回分配           │
+   └─ 事务提交 → 锁释放                 │
+                                         ├─ 获得锁，查询到同一条记录
+                                         ├─ T50: ❗ update server_id = B.id
+                                         │   （覆盖了 A 的 server_id！）
+                                         └─ B 认为分配成功，A 的分配被偷了
+```
+
+**代码级证据**：
+1. **T80-83 无锁查询**：`FindAssignableAllocationService.php:80-83`
+   ```php
+   $ports = $server->node->allocations()
+       ->where('ip', $server->allocation->ip)
+       ->whereBetween('port', [$start, $end])
+       ->pluck('port');
+   ```
+   - ❗ **没有** `lockForUpdate()` 或 `sharedLock()`
+   - 并发下两个请求读到完全相同的已有端口列表
+
+2. **T99-102 insertIgnore 幂等但不报错**：`EloquentRepository.php:251-277`
+   ```php
+   $statement = "insert ignore into $table ($columns) values $parameters";
+   ```
+   - 重复插入不会抛出异常，仅返回 0 影响行数
+   - 调用方无法感知是新创建还是已存在
+
+3. **T105-109 二次查询**：`FindAssignableAllocationService.php:105-109`
+   ```php
+   $allocation = $server->node->allocations()
+       ->lockForUpdate()  // 这里加锁了，但为时已晚！
+       ->where('ip', $server->allocation->ip)
+       ->where('port', $port)
+       ->firstOrFail();
+   ```
+   - 虽然加了 `lockForUpdate()`，但两个请求选的是同一个端口
+   - 后获得锁的请求会覆盖先获得锁的请求的 `server_id`
+
+**覆盖窗口大小**：
+- T80 查询 → T97 选端口 → T102 insertIgnore 完成 → T109 二次查询加锁
+- 整个窗口约 4-5 个数据库调用，高并发下极易冲突
+- 由于 `insertIgnore` 不报错，冲突完全静默，无任何日志
+
+---
+
+### 8.2 deploy.port_range 无效输入被静默忽略后候选筛选的退化行为
+
+**场景**：通过 API 自动部署服务器时传入 `deploy.port_range` 参数。
+
+**代码路径**：`AllocationSelectionService::setPorts()` (`app/Services/Deployment/AllocationSelectionService.php:56-78`)
+
+**静默忽略逻辑**：
+```php
+public function setPorts(array $ports): self
+{
+    $stored = [];
+    foreach ($ports as $port) {
+        if (is_digit($port)) {
+            $stored[] = $port;  // 数字端口：保留
+        }
+        
+        if (preg_match(AssignmentService::PORT_RANGE_REGEX, $port, $matches)) {
+            $stored[] = [(int)$matches[1], (int)$matches[2]];  // 范围格式：保留
+        }
+        
+        // ❗ 既不是数字也不匹配范围格式 → 直接跳过，不抛异常！
+        // 如："abc", "8080-9090-1010", "1-65536", "0-1023" 等都会被静默丢弃
+    }
+    
+    $this->ports = $stored;  // 可能变成空数组！
+    
+    return $this;
+}
+```
+
+**代码级证据**：
+1. **请求验证层仅检查类型**：`StoreServerRequest.php:61-62`
+   ```php
+   'deploy.port_range' => 'array',
+   'deploy.port_range.*' => 'string',
+   ```
+   - 只验证是数组和字符串，**不验证内容格式**
+
+2. **setPorts 静默过滤**：`AllocationSelectionService.php:59-73`
+   - `is_digit()` (`app/helpers.php:8-10`) 只接受纯数字字符串
+   - `PORT_RANGE_REGEX = '/^(\d{4,5})-(\d{4,5})$/'` 严格匹配 4-5 位数字范围
+   - 不匹配的元素直接被 `unset`，没有任何错误提示
+
+3. **候选筛选退化**：`AllocationRepository.php:67-83`
+   ```php
+   if (!empty($ports)) {
+       // 应用端口过滤（orWhereIn + orWhereBetween）
+   }
+   // ⚠️  如果 $ports 为空，跳过所有端口过滤！
+   ```
+   - 当 `$this->ports` 被过滤为空数组时，`!empty($ports)` 为 `false`
+   - 查询条件中不包含任何端口限制
+   - 从该节点**所有**未分配的端口中随机选择
+
+**退化行为示例**：
+| 用户输入 | 处理后 $stored | 实际筛选行为 |
+|---------|---------------|-------------|
+| `["25565", "25570"]` | `["25565", "25570"]` | ✅ 正常：只在这两个端口中选择 |
+| `["25565-25570"]` | `[[25565, 25570]]` | ✅ 正常：在该范围内选择 |
+| `["abc", "invalid"]` | `[]` | ❌ 退化：从所有端口中随机选 |
+| `["1-65536"]` | `[]` | ❌ 退化：超出 PORT_CEIL=65535 被跳过 |
+| `["0-1023"]` | `[]` | ❌ 退化：低于 PORT_FLOOR=1024 被跳过 |
+| `["25565", "abc"]` | `["25565"]` | ⚠️ 部分有效：只在 25565 中选，"abc" 被忽略 |
+
+**风险**：用户以为端口被限制在指定范围，实际系统从所有可用端口中随机分配，可能分配到用户不期望的端口。
+
+---
+
+### 8.3 AssignmentService 事务在异常时的真实回滚触发链路
+
+**场景**：批量创建分配时某个端口格式错误或超出范围。
+
+**代码路径**：`AssignmentService::handle()` (`app/Services/Allocations/AssignmentService.php:40-108`)
+
+**事务控制的真实实现**：
+```php
+public function handle(Node $node, array $data): void
+{
+    // ... IP 解析（有 try-catch，抛 DisplayException）
+    
+    $this->connection->beginTransaction();  // T61: 手动开启事务
+    foreach ($parsed as $ip) {
+        foreach ($data['allocation_ports'] as $port) {
+            // ❗ 所有验证失败直接 throw，没有 rollBack！
+            if (!is_digit($port) && !preg_match(...)) {
+                throw new InvalidPortMappingException($port);  // T65
+            }
+            
+            if (preg_match(...)) {
+                if (count($block) > self::PORT_RANGE_LIMIT) {
+                    throw new TooManyPortsInRangeException();  // T73
+                }
+                if ((int)$matches[1] <= self::PORT_FLOOR || ...) {
+                    throw new PortOutOfRangeException();  // T77
+                }
+            } else {
+                if ((int)$port <= self::PORT_FLOOR || ...) {
+                    throw new PortOutOfRangeException();  // T91
+                }
+            }
+            
+            $this->repository->insertIgnore($insertData);  // T103
+        }
+    }
+    $this->connection->commit();  // T107
+}
+```
+
+**真实回滚触发链路**：
+```
+异常抛出点（T65/T73/T77/T91）
+        │
+        ▼
+    方法直接退出
+    ❗ 没有调用 $this->connection->rollBack()
+    ❗ 没有 try-catch 包裹事务
+        │
+        ▼
+    异常向上冒泡
+        │
+        ▼
+    全局异常处理器 Handler.php:137-139
+        │
+        ▼
+    检查 transactionLevel > 0
+        │
+        ▼
+    调用 $connections->rollBack(0)
+    （强制回滚到最外层，回滚所有层级）
+        │
+        ▼
+    事务中的 insertIgnore 全部撤销
+    数据库状态恢复到事务开始前
+```
+
+**代码级证据**：
+1. **AssignmentService 无本地回滚**：`AssignmentService.php:61-107`
+   - 手动 `beginTransaction()`，但整个事务逻辑**没有** `try-catch`
+   - 5 处验证失败都是直接 `throw new *Exception()`
+   - 没有任何路径调用 `$this->connection->rollBack()`
+
+2. **全局异常处理器兜底**：`Handler.php:137-139`
+   ```php
+   if ($connections->transactionLevel()) {
+       $connections->rollBack(0);  // 参数 0 表示回滚到最外层
+   }
+   ```
+   - 无论什么异常，只要事务层级 > 0 就强制回滚
+   - 这是 AssignmentService 事务能够回滚的**唯一机制**
+
+3. **调用方无事务保护**：两处典型调用
+   - `FindAssignableAllocationService.php:99-102` - 调用前没有开启事务
+   - 管理员后台创建分配的控制器 - 通常也没有额外事务包裹
+   - 不存在嵌套事务问题，但也意味着调用方无法感知事务状态
+
+**风险点**：
+- 如果调用方捕获了异常但没让异常传递到全局处理器，事务会悬挂
+- 例如：
+  ```php
+  try {
+      $this->assignmentService->handle($node, $data);
+  } catch (\Exception $e) {
+      // ❗ 只记录日志，不重新抛出
+      Log::error($e->getMessage());
+  }
+  // 此时事务未提交也未回滚，连接状态异常
+  ```
+- 依赖全局处理器回滚不是可靠的设计，应该在本地 try-catch 中显式回滚
+
 ### 关键代码溯源
 
 | 功能 | 文件位置 | 行号 |
@@ -560,7 +818,12 @@ T5  同步到 Wings Daemon（失败仅记录日志，不回滚）
 | 节点资源筛选 | `FindViableNodesService.php` | 74-86 |
 | 分配随机获取 | `AllocationRepository.php` | 59-98 |
 | 自动分配逻辑（带行锁） | `FindAssignableAllocationService.php` | 31-112 |
+| 自动分配-查询已有端口（⚠️ 无锁） | `FindAssignableAllocationService.php` | 80-83 |
+| 自动分配-二次查询加锁（⚠️ 为时已晚） | `FindAssignableAllocationService.php` | 105-109 |
 | 插入忽略重复 | `EloquentRepository.php` | 251-277 |
+| 端口范围校验（PORT_RANGE_REGEX） | `AssignmentService.php` | 22, 64, 69 |
+| AssignmentService 事务（无本地回滚） | `AssignmentService.php` | 61, 107 |
+| 分配选择-setPorts（静默忽略无效） | `AllocationSelectionService.php` | 56-78 |
 | 构建修改分配（带WHERE条件，无行数检查） | `BuildModificationService.php` | 82-130 |
 | 服务器删除回收 | `ServerDeletionService.php` | 59-85 |
 | 服务器创建分配（⚠️ 无WHERE条件） | `ServerCreationService.php` | 180-182 |
@@ -568,6 +831,8 @@ T5  同步到 Wings Daemon（失败仅记录日志，不回滚）
 | 创建失败补偿回滚 | `ServerCreationService.php` | 100-104 |
 | 全局异常强制回滚 | `Handler.php` | 137-139 |
 | 请求验证层 | `ServerFormRequest.php` | 33-55 |
+| deploy.port_range 类型验证 | `StoreServerRequest.php` | 61-62 |
 | 行锁加锁 | `FindAssignableAllocationService.php` | 42, 106 |
+| is_digit 辅助函数 | `helpers.php` | 8-10 |
 | 数据库唯一键 | `mysql-schema.sql` | 54 |
 | 外键置空约束 | `mysql-schema.sql` | 57 |
