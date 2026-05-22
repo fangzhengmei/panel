@@ -299,23 +299,41 @@ if (!is_null($allocation->server_id)) {
 请求 POST /api/application/servers
   │
   ├─ StoreServerRequest::withValidator() 执行
-  │    └─ Rule::exists()->whereNull('server_id') → 第一层拦截
+  │    ├─ $validator->sometimes('allocation.default', [...], function ($input) {
+  │    │      return !$input->deploy;  // ❗ 仅当 deploy=false 时才校验 allocation.default
+  │    │  })
+  │    └─ deploy=true 时，跳过 allocation.default 的 required + exists 校验
   │
-  ├─ ServerCreationService::handle()
-  │    ├─ configureDeployment()
-  │    │   ├─ FindViableNodesService → 筛选节点
-  │    │   └─ AllocationSelectionService::handle()
-  │    │       └─ AllocationRepository::getRandomAllocation()
-  │    │           └─ WHERE server_id IS NULL → 第二层拦截
-  │    │
-  │    └─ 事务开始（尝试5次）
-  │        ├─ createModel() → 创建服务器记录
-  │        └─ storeAssignedAllocations()
-  │            └─ UPDATE allocations SET server_id = ?
-  │                WHERE id IN (...) → 第四层隐含校验
+  ├─ deploy=true 分支：自动选择分配
+  │    ├─ FindViableNodesService → 筛选节点
+  │    └─ AllocationSelectionService::handle()
+  │        └─ AllocationRepository::getRandomAllocation()
+  │            └─ WHERE server_id IS NULL → 第一层拦截
   │
-  └─ 成功返回
+  ├─ deploy=false 分支：使用用户指定的 allocation.default
+  │    └─ 请求验证层 Rule::exists()->whereNull('server_id') → 已在请求验证时拦截
+  │
+  └─ 事务开始（尝试5次，仅死锁重试）
+       ├─ createModel() → 创建服务器记录
+       └─ storeAssignedAllocations()
+           └─ UPDATE allocations SET server_id = ?
+               WHERE id IN (...) → 无 server_id IS NULL 条件
 ```
+
+**allocation.default 校验适用边界**：
+- ✅ **deploy = false（手动指定分配）**：`allocation.default` 必须存在且 `server_id IS NULL`
+- ❌ **deploy = true（自动部署）**：`allocation.default` 校验完全跳过，由系统自动选择分配
+- **代码依据**：`StoreServerRequest.php:108-115`
+  ```php
+  $validator->sometimes('allocation.default', [
+      'required', 'integer', 'bail',
+      Rule::exists('allocations', 'id')->where(function ($query) {
+          $query->whereNull('server_id');
+      }),
+  ], function ($input) {
+      return !$input->deploy;  // 仅当 !deploy 时应用此规则
+  });
+  ```
 
 ### 5.3 并发抢占：失败时真实的异常路径、重试机制和回滚触发点
 
@@ -356,10 +374,11 @@ if (!is_null($allocation->server_id)) {
        // ... 业务逻辑 ...
    }, 5); // 重试5次
    ```
-   - ✅ Laravel 事务 `$attempts` 参数只捕获**死锁（错误码 1213）**
-   - ❌ **不捕获**锁等待超时（错误码 1205）或其他 PDOException
+   - ✅ Laravel 事务 `$attempts` 参数**只捕获死锁（错误码 1213 = SQLSTATE[40001]）**
+   - ❌ **绝对不捕获**锁等待超时（错误码 1205 = SQLSTATE[HY000]）或其他任何 PDOException
    - ❌ 不处理 UPDATE 影响行数为 0 的业务逻辑失败
    - 每次重试都会重新开始整个事务，重新筛选分配
+   - **代码依据**：Laravel `ManagesTransactions` trait 中 `runTransaction()` 方法只检查 `$e->getCode() === '40001'`
 
 2. **死锁异常处理**（`app/Exceptions/Handler.php:137-139`）
    ```php
@@ -402,9 +421,9 @@ if (!is_null($allocation->server_id)) {
   无异常抛出    无异常抛出
 
 只有以下情况会抛出异常：
-→ 死锁（错误码1213）→ 触发Laravel事务重试
-→ 锁等待超时（错误码1205）→ 抛出PDOException，不重试
-→ 唯一键冲突（错误码23000）→ 插入重复分配时抛出
+→ 死锁（错误码1213 = SQLSTATE[40001]）→ 触发Laravel事务重试（仅重试此错误码）
+→ 锁等待超时（错误码1205 = SQLSTATE[HY000]）→ 抛出PDOException，❌ 不重试
+→ 唯一键冲突（错误码23000）→ 插入重复分配时抛出，❌ 不重试
 ```
 
 ---
@@ -420,7 +439,8 @@ if (!is_null($allocation->server_id)) {
 2. 分配筛选   2. 查询过滤  2. ⚠️ 仅部分场景加行锁  2. 主动置空 server_id
 3. 专用IP检查  3. ⚠️ 仅部分场景加行锁  3. ⚠️ 三处UPDATE逻辑不一致  3. ⚠️ 部分场景不清空 notes
              4. ⚠️ 仅两处有UPDATE条件  4. 事务提交可见
-             5. 唯一索引    ⚠️ 无影响行数检查
+             5. ⚠️ allocation.default仅!deploy时校验  ⚠️ 无影响行数检查
+             6. 唯一索引    ⚠️ 仅错误码40001重试
 ```
 
 ### 6.2 典型场景协作
@@ -434,7 +454,7 @@ T1  FindViableNodesService → 节点筛选（内存/磁盘/位置）
 T2  AllocationSelectionService::handle()
     └─ AllocationRepository::getRandomAllocation()
        └─ WHERE server_id IS NULL → 第二层拦截
-T3  事务开始（第1次尝试，最多5次死锁重试）
+T3  事务开始（第1次尝试，最多5次死锁重试，仅错误码40001）
 T4    createModel() → INSERT servers
 T5    storeAssignedAllocations()
       └─ UPDATE allocations SET server_id = ? WHERE id IN (...)
@@ -493,10 +513,11 @@ T5  同步到 Wings Daemon（失败仅记录日志，不回滚）
 | **数据库约束** | - | 唯一索引、外键 | ON DELETE SET NULL |
 | **应用层检查** | whereNull('server_id') | whereNull('server_id')<br>⚠️ 三处UPDATE逻辑不一致 | server_id 非空检查 |
 | **并发控制** | - | lockForUpdate()<br>⚠️ 仅自动分配和限额检查使用 | - |
-| **事务保护** | - | 创建/修改事务（仅死锁重试5次）<br>⚠️ 锁等待超时不重试 | 删除事务 |
+| **事务保护** | - | 创建/修改事务（仅死锁重试5次）<br>⚠️ 仅错误码40001重试，锁等待超时不重试 | 删除事务 |
+| **请求验证** | - | allocation.default 校验<br>⚠️ 仅 deploy=false 时生效 | - |
 | **数据清理** | - | - | 清空 notes<br>⚠️ 服务器迁移不清空 |
 | **可见性规则** | 读已提交快照 | 事务内立即可见 | 提交后全局可见 |
-| **失败回滚** | - | 异常时自动回滚<br>⚠️ 静默失败不回滚 | 外键自动置空 |
+| **失败回滚** | - | 异常时自动回滚<br>⚠️ 静默失败不回滚<br>⚠️ 客户端场景外层Activity事务是主要回滚机制 | 外键自动置空 |
 
 ### 6.4 端到端完整链路时序
 
@@ -543,7 +564,7 @@ T5  同步到 Wings Daemon（失败仅记录日志，不回滚）
    - 位置：`app/Services/Servers/BuildModificationService.php:100`
    - 影响：用户以为分配成功了，实际分配被别人抢走了
 
-3. **⚠️ 重试机制不完整**：Laravel 事务重试（`$attempts = 5`）仅捕获死锁（错误码1213），不捕获锁等待超时（错误码1205）或业务逻辑失败
+3. **⚠️ 重试机制不完整**：Laravel 事务重试（`$attempts = 5`）**仅捕获死锁（错误码1213 = SQLSTATE[40001]）**，**绝对不捕获**锁等待超时（错误码1205 = SQLSTATE[HY000]）或业务逻辑失败
 
 4. **长事务风险**：`FindAssignableAllocationService` 中的 `lockForUpdate()` 可能导致锁等待，高并发下需注意事务长度
 
@@ -561,9 +582,11 @@ T5  同步到 Wings Daemon（失败仅记录日志，不回滚）
    - 位置：`app/Services/Deployment/AllocationSelectionService.php:59-73`
    - 影响：用户以为端口被限制在指定范围，实际可能分配到任意端口
 
-10. **⚠️ AssignmentService 回滚依赖全局处理器**：手动 `beginTransaction()` 但无本地 `try-catch`，异常时依赖全局异常处理器 `Handler.php` 回滚，若调用方捕获异常不重新抛出则事务悬挂
+10. **⚠️ AssignmentService 回滚依赖外层事务**：手动 `beginTransaction()` 但无本地 `try-catch`，客户端场景下依赖外层 `ActivityLogService::transaction()` 回滚，若调用方在内层捕获异常不冒泡则内层事务悬挂
     - 位置：`app/Services/Allocations/AssignmentService.php:61-107`
-    - 影响：数据库连接状态异常，后续操作可能在未提交的事务中执行
+    - 主要回滚机制：`ActivityLogService.php:173-182`（外层事务 wrapper）
+    - 兜底机制：`Handler.php:137-139`（全局异常处理器）
+    - 影响：内层捕获异常不冒泡会导致数据库连接状态异常
 
 ---
 
@@ -679,11 +702,12 @@ public function setPorts(array $ports): self
    'deploy.port_range.*' => 'string',
    ```
    - 只验证是数组和字符串，**不验证内容格式**
+   - 注意：`allocation.default` 校验也仅在 `deploy=false` 时触发（`StoreServerRequest.php:108-115`）
 
 2. **setPorts 静默过滤**：`AllocationSelectionService.php:59-73`
    - `is_digit()` (`app/helpers.php:8-10`) 只接受纯数字字符串
    - `PORT_RANGE_REGEX = '/^(\d{4,5})-(\d{4,5})$/'` 严格匹配 4-5 位数字范围
-   - 不匹配的元素直接被 `unset`，没有任何错误提示
+   - 不匹配的元素直接被跳过，没有任何错误提示
 
 3. **候选筛选退化**：`AllocationRepository.php:67-83`
    ```php
@@ -712,7 +736,18 @@ public function setPorts(array $ports): self
 
 ### 8.3 AssignmentService 事务在异常时的真实回滚触发链路
 
-**场景**：批量创建分配时某个端口格式错误或超出范围。
+**场景**：客户端自助添加分配时，动态创建新端口。
+
+**完整调用链路**：
+```
+NetworkAllocationController::store()
+  └─ Activity::event('server:allocation.create')->transaction(function () {
+       ├─ 限额检查：lockForUpdate() + count()
+       └─ FindAssignableAllocationService::handle($server)
+            └─ createNewAllocation($server)
+                 └─ AssignmentService::handle($node, $data)
+                      └─ $this->connection->beginTransaction()  // 嵌套事务
+```
 
 **代码路径**：`AssignmentService::handle()` (`app/Services/Allocations/AssignmentService.php:40-108`)
 
@@ -722,10 +757,10 @@ public function handle(Node $node, array $data): void
 {
     // ... IP 解析（有 try-catch，抛 DisplayException）
     
-    $this->connection->beginTransaction();  // T61: 手动开启事务
+    $this->connection->beginTransaction();  // T61: 手动开启事务（嵌套层）
     foreach ($parsed as $ip) {
         foreach ($data['allocation_ports'] as $port) {
-            // ❗ 所有验证失败直接 throw，没有 rollBack！
+            // ❗ 所有验证失败直接 throw，没有本地 rollBack！
             if (!is_digit($port) && !preg_match(...)) {
                 throw new InvalidPortMappingException($port);  // T65
             }
@@ -750,66 +785,84 @@ public function handle(Node $node, array $data): void
 }
 ```
 
-**真实回滚触发链路**：
+**真实回滚触发链路（客户端场景）**：
 ```
 异常抛出点（T65/T73/T77/T91）
         │
         ▼
-    方法直接退出
+    AssignmentService::handle() 直接退出
     ❗ 没有调用 $this->connection->rollBack()
     ❗ 没有 try-catch 包裹事务
         │
         ▼
-    异常向上冒泡
+    异常向上冒泡 → createNewAllocation() → handle()
+        │
+        ▼
+    ActivityLogService::transaction() 外层事务捕获
+    （ActivityLogService.php:173-182）
+        │
+        ▼
+    $this->connection->transaction() 内部自动回滚
+    （Laravel 事务闭包异常自动回滚）
+        │
+        ▼
+    两层事务（外层 Activity + 内层 Assignment）全部回滚
+    数据库状态恢复到最外层事务开始前
+        │
+        ▼
+    异常继续向上冒泡 → 控制器 → 路由
         │
         ▼
     全局异常处理器 Handler.php:137-139
-        │
-        ▼
-    检查 transactionLevel > 0
-        │
-        ▼
-    调用 $connections->rollBack(0)
-    （强制回滚到最外层，回滚所有层级）
-        │
-        ▼
-    事务中的 insertIgnore 全部撤销
-    数据库状态恢复到事务开始前
+    （兜底检查，通常此时 transactionLevel 已为 0）
 ```
 
 **代码级证据**：
-1. **AssignmentService 无本地回滚**：`AssignmentService.php:61-107`
-   - 手动 `beginTransaction()`，但整个事务逻辑**没有** `try-catch`
+
+1. **外层事务 wrapper**：`ActivityLogService.php:173-182`
+   ```php
+   public function transaction(\Closure $callback)
+   {
+       return $this->connection->transaction(function () use ($callback) {
+           $response = $callback($this);  // 执行回调，包括 AssignmentService 调用
+           $this->save();                 // 回调成功才保存活动日志
+           return $response;
+       });
+   }
+   ```
+   - ✅ 这是**主要**回滚机制，不是全局异常处理器
+   - Laravel 的 `connection->transaction()` 闭包内任何异常都会自动回滚
+
+2. **AssignmentService 无本地回滚**：`AssignmentService.php:61-107`
+   - 手动 `beginTransaction()` 创建嵌套事务，但**没有** `try-catch`
    - 5 处验证失败都是直接 `throw new *Exception()`
    - 没有任何路径调用 `$this->connection->rollBack()`
+   - 依赖外层事务回滚
 
-2. **全局异常处理器兜底**：`Handler.php:137-139`
+3. **全局异常处理器是兜底**：`Handler.php:137-139`
    ```php
    if ($connections->transactionLevel()) {
        $connections->rollBack(0);  // 参数 0 表示回滚到最外层
    }
    ```
-   - 无论什么异常，只要事务层级 > 0 就强制回滚
-   - 这是 AssignmentService 事务能够回滚的**唯一机制**
-
-3. **调用方无事务保护**：两处典型调用
-   - `FindAssignableAllocationService.php:99-102` - 调用前没有开启事务
-   - 管理员后台创建分配的控制器 - 通常也没有额外事务包裹
-   - 不存在嵌套事务问题，但也意味着调用方无法感知事务状态
+   - 仅在外层事务异常回滚失败时才会触发
+   - 正常客户端路径中，外层事务已经回滚完毕，`transactionLevel` 为 0
 
 **风险点**：
-- 如果调用方捕获了异常但没让异常传递到全局处理器，事务会悬挂
+- 如果调用方捕获了异常但没让异常传递到外层事务，内层事务会悬挂
 - 例如：
   ```php
-  try {
-      $this->assignmentService->handle($node, $data);
-  } catch (\Exception $e) {
-      // ❗ 只记录日志，不重新抛出
-      Log::error($e->getMessage());
-  }
-  // 此时事务未提交也未回滚，连接状态异常
+  Activity::event()->transaction(function () use ($server) {
+      try {
+          $this->assignableAllocationService->handle($server);
+      } catch (\Exception $e) {
+          // ❗ 在内层捕获异常，不让它冒泡到外层事务
+          Log::error($e->getMessage());
+          // 此时内层 AssignmentService 事务未提交也未回滚！
+      }
+  });
   ```
-- 依赖全局处理器回滚不是可靠的设计，应该在本地 try-catch 中显式回滚
+- AssignmentService 应该在本地 `try-catch` 中显式调用 `rollBack()`，而不是依赖外层
 
 ### 关键代码溯源
 
@@ -823,11 +876,13 @@ public function handle(Node $node, array $data): void
 | 插入忽略重复 | `EloquentRepository.php` | 251-277 |
 | 端口范围校验（PORT_RANGE_REGEX） | `AssignmentService.php` | 22, 64, 69 |
 | AssignmentService 事务（无本地回滚） | `AssignmentService.php` | 61, 107 |
+| Activity 外层事务 wrapper | `ActivityLogService.php` | 173-182 |
 | 分配选择-setPorts（静默忽略无效） | `AllocationSelectionService.php` | 56-78 |
+| allocation.default 校验（仅!deploy） | `StoreServerRequest.php` | 108-115 |
 | 构建修改分配（带WHERE条件，无行数检查） | `BuildModificationService.php` | 82-130 |
 | 服务器删除回收 | `ServerDeletionService.php` | 59-85 |
 | 服务器创建分配（⚠️ 无WHERE条件） | `ServerCreationService.php` | 180-182 |
-| 死锁重试（仅错误码1213） | `ServerCreationService.php` | 86 |
+| 死锁重试（仅错误码40001） | `ServerCreationService.php` | 86 |
 | 创建失败补偿回滚 | `ServerCreationService.php` | 100-104 |
 | 全局异常强制回滚 | `Handler.php` | 137-139 |
 | 请求验证层 | `ServerFormRequest.php` | 33-55 |
