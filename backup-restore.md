@@ -39,6 +39,8 @@ public function store(StoreBackupRequest $request, Server $server): array
 
 #### 第二层：频率节流校验（Throttles）
 
+> ⚠️ **限流落点说明**：此限流仅作用于**创建备份**，在 `InitiateBackupService` 内部实现，路由层面无中间件。
+
 **配置**：`config/backups.php:29`
 ```php
 'throttles' => [
@@ -57,18 +59,31 @@ if ($previous->count() >= $limit) {
 
 **查询范围**：包含进行中（`completed_at is null`）和已成功（`is_successful = true`）的备份。
 
-#### 第三层：资源限流（ResourceLimit）
+#### 第三层：资源配额校验（backup_limit）
 
-**配置**：`app/Enum/ResourceLimit.php:46`
+**代码位置**：`app/Services/Backups/InitiateBackupService.php:91`
+
 ```php
-self::Backup => Limit::perMinutes(15, 3), // 每 15 分钟最多 3 次，按服务器维度限流
+$successful = $this->repository->getNonFailedBackups($server);
+if (!$server->backup_limit || $successful->count() >= $server->backup_limit) {
+    if (!$override || $server->backup_limit <= 0) {
+        throw new TooManyBackupsException($server->backup_limit);
+    }
+    // 尝试自动清理最旧非锁定备份...
+}
 ```
 
-**中间件**：`ThrottleRequests`，绑定在路由上 `routes/api-client.php:138`
+**⚠️ backup_limit 语义修正**：
+- `backup_limit > 0`：允许创建最多 N 个备份
+- `backup_limit = 0`：**完全禁止创建备份**（不是无限制！）
+  - 证据1：`InitiateBackupService.php:94` 中 `$server->backup_limit <= 0` 直接抛异常
+  - 证据2：`ScheduleTaskController.php:47` 禁止创建 backup_limit=0 的定时备份任务
+  - 证据3：测试用例 `'A backup task cannot be created when the server\'s backup limit is set to 0.'`
+  - 证据4：前端仅在 `backupLimit > 0` 时显示创建按钮
+
+> 注意：与 memory/disk 等资源不同（0 表示无限制），backup_limit=0 是显式禁用。
 
 ### 2.3 配额超限处理
-
-**备份数量限制**：`Server.backup_limit` 字段控制每个服务器的备份配额
 
 **超限策略**：`app/Services/Backups/InitiateBackupService.php:91`
 1. 检查非失败备份数量是否达到上限
@@ -145,21 +160,30 @@ if (hash_equals($this->encrypter->decrypt($node->daemon_token), $parts[1])) {
 }
 ```
 
-### 2.7 S3 分片上传流程
+### 2.7 S3 分片上传完整时序
 
-**触发时机**：Wings 备份完成后，如需上传到 S3，先请求 Panel 获取预签名 URL
+**⚠️ 时序修正**：S3 分片上传发生在 Wings 打包完成后、完成回调之前。
+
+```
+1. Panel 创建备份记录 → 通知 Wings 开始备份
+2. Wings 本地打包文件
+3. Wings → Panel: GET /api/remote/backups/{backup}?size={bytes}
+   └─ 控制器：BackupRemoteUploadController.php:34
+4. Panel 调用 S3 CreateMultipartUpload 初始化
+5. Panel 生成多个 UploadPart 预签名 URL
+6. Panel 保存 upload_id 到备份记录
+7. Panel 返回 { parts: [url1, url2, ...], part_size: 5GB } 给 Wings
+8. Wings 使用预签名 URL 逐个上传分片到 S3
+9. Wings → Panel: POST /api/remote/backups/{backup} (完成回调)
+   └─ 控制器：BackupStatusController.php:32
+10. Panel 更新备份状态 → CompleteMultipartUpload (成功) / AbortMultipartUpload (失败)
+```
 
 **接口**：`GET /api/remote/backups/{backup}?size={bytes}`
 **控制器**：`app/Http/Controllers/Api/Remote/Backups/BackupRemoteUploadController.php:34`
 
-**流程**：
-1. 校验节点归属、备份未完成状态
-2. `CreateMultipartUpload` 初始化分片上传
-3. 按 `max_part_size`（默认 5GB）切分，生成多个 `UploadPart` 预签名 URL
-4. 保存 `upload_id` 到备份记录
-5. 返回预签名 URL 列表和分片大小给 Wings
-
 **预签名 URL 有效期**：`config('backups.presigned_url_lifespan', 60)` 分钟
+**默认分片大小**：`BACKUP_MAX_PART_SIZE = 5GB`（AWS S3 单分片上限）
 
 ### 2.8 备份完成回调
 
@@ -196,6 +220,52 @@ if (hash_equals($this->encrypter->decrypt($node->daemon_token), $parts[1])) {
    - `completed_at = now()`
    - S3 适配器：`AbortMultipartUpload` 中止分片
 
+### 2.9 S3 分片合并异常分支
+
+**代码位置**：`app/Http/Controllers/Api/Remote/Backups/BackupStatusController.php:120`
+
+```php
+protected function completeMultipartUpload(Backup $backup, S3Filesystem $adapter, bool $successful, ?array $parts): void
+{
+    if (empty($backup->upload_id)) {
+        if (!$successful) {
+            return; // ⚠️ 上传开始前就失败，静默返回，不抛错
+        }
+        throw new DisplayException('Cannot complete backup request: no upload_id present on model.');
+    }
+
+    if (!$successful) {
+        $client->execute($client->getCommand('AbortMultipartUpload', $params));
+        return;
+    }
+
+    if (is_null($parts)) {
+        // ⚠️ Wings 未传 parts 时，自动调用 ListParts 查询已上传分片
+        $params['MultipartUpload']['Parts'] = $client->execute($client->getCommand('ListParts', $params))['Parts'];
+    } else {
+        // 使用 Wings 传入的 parts 列表
+        foreach ($parts as $part) {
+            $params['MultipartUpload']['Parts'][] = [
+                'ETag' => $part['etag'],
+                'PartNumber' => $part['part_number'],
+            ];
+        }
+    }
+
+    $client->execute($client->getCommand('CompleteMultipartUpload', $params));
+}
+```
+
+**异常分支矩阵**：
+
+| 场景 | upload_id | successful | parts | 行为 |
+|-----|-----------|------------|-------|------|
+| 上传前失败 | 空 | false | - | 静默 return |
+| 上传中失败 | 非空 | false | - | AbortMultipartUpload |
+| 上传成功但 upload_id 丢失 | 空 | true | - | 抛 DisplayException |
+| 上传成功，Wings 未传 parts | 非空 | true | null | 自动 ListParts 查询 |
+| 上传成功，Wings 传 parts | 非空 | true | 数组 | 使用传入 parts 合并 |
+
 ---
 
 ## 三、恢复任务完整链路
@@ -203,18 +273,53 @@ if (hash_equals($this->encrypter->decrypt($node->daemon_token), $parts[1])) {
 ### 3.1 API 入口
 
 **路由**：`POST /api/client/servers/{server}/backups/{backup}/restore`
-**控制器**：`app/Http/Controllers/Api/Client/Servers/BackupController.php:198`
+**控制器**：`app/Http/Controllers/Api/Client/Servers\BackupController.php:198`
 
-### 3.2 前置校验
+### 3.2 限流落点
 
-1. **服务器状态校验**：`$server->status` 必须为 `null`（正常状态），防止并发操作
-2. **备份状态校验**：备份必须已成功完成（`is_successful = true` 且 `completed_at != null`）
-3. **权限校验**：`Permission::ACTION_BACKUP_RESTORE`
-4. **参数校验**：`truncate` 布尔值（是否清空目录后恢复）
+> ⚠️ **限流落点说明**：恢复备份的限流与创建备份完全不同。
+>
+> - **路由层面**：有 `ResourceLimit::Backup->middleware()`（见 `routes/api-client.php:138`）
+>   - 限流规则：每 15 分钟最多 3 次，按服务器维度（`app/Enum/ResourceLimit.php:46`）
+> - **业务层面**：无 throttles 检查
 
-### 3.3 恢复执行流程
+### 3.3 前置校验
 
-**代码位置**：`app/Http/Controllers/Api/Client/Servers/BackupController.php:214`
+**代码位置**：`app/Http/Controllers/Api/Client/Servers\BackupController.php:200`
+
+```php
+// 校验1：服务器状态必须为 null（空闲状态）
+if (!is_null($server->status)) {
+    throw new BadRequestHttpException('This server is not currently in a state that allows for a backup to be restored.');
+}
+
+// 校验2：备份状态校验 ⚠️ 注意此处逻辑
+if (!$backup->is_successful && is_null($backup->completed_at)) {
+    throw new BadRequestHttpException('This backup cannot be restored at this time: not completed or failed.');
+}
+```
+
+**⚠️ 恢复可执行条件修正**：
+
+条件 `!$backup->is_successful && is_null($backup->completed_at)` 的真实语义：
+
+| is_successful | completed_at | 条件结果 | 是否允许恢复 | 说明 |
+|---------------|--------------|----------|-------------|------|
+| true | 非空 | false | ✅ 允许 | 成功完成的备份 |
+| false | 非空 | false | ✅ 允许 | 已明确失败的备份（代码未禁止） |
+| false | null | true | ❌ 禁止 | 进行中且未成功的备份 |
+
+> 重要结论：**已失败的备份（is_successful=false 但 completed_at 有值）并未被禁止恢复**。只有"进行中且未成功"的备份被禁止。
+
+**完整校验清单**：
+1. 服务器状态校验：`$server->status` 必须为 `null`
+2. 备份状态校验：见上表
+3. 权限校验：`Permission::ACTION_BACKUP_RESTORE`
+4. 参数校验：`truncate` 布尔值（是否清空目录后恢复）
+
+### 3.4 恢复执行流程
+
+**代码位置**：`app/Http/Controllers/Api/Client/Servers\BackupController.php:214`
 
 ```php
 $log->transaction(function () use ($backup, $server, $request) {
@@ -231,7 +336,7 @@ $log->transaction(function () use ($backup, $server, $request) {
 });
 ```
 
-### 3.4 Wings 恢复请求
+### 3.5 Wings 恢复请求
 
 **代码位置**：`app/Repositories/Wings/DaemonBackupRepository.php:60`
 ```php
@@ -243,7 +348,7 @@ Body: {
 }
 ```
 
-### 3.5 下载链接生成
+### 3.6 下载链接生成
 
 **服务**：`app/Services/Backups/DownloadLinkService.php:24`
 
@@ -261,7 +366,7 @@ Body: {
 
 - **S3 备份**：生成 S3 预签名 URL，有效期 5 分钟
 
-### 3.6 JWT 签名机制
+### 3.7 JWT 签名机制
 
 **服务**：`app/Services/Nodes/NodeJWTService.php:63`
 
@@ -276,7 +381,7 @@ Body: {
   - `exp`：过期时间
   - 自定义：`backup_uuid`、`server_uuid`、`user_uuid`、`unique_id`
 
-### 3.7 恢复完成回调
+### 3.8 恢复完成回调
 
 **接口**：`POST /api/remote/backups/{backup}/restore`
 **控制器**：`app/Http/Controllers/Api/Remote/Backups/BackupStatusController.php:93`
@@ -294,12 +399,21 @@ Body: {
 
 ### 4.1 配额维度
 
-| 配额项 | 存储位置 | 作用 |
-|--------|---------|------|
-| `server.backup_limit` | servers 表 | 单服务器备份数量上限，0 表示无限制 |
-| `backup.bytes` | backups 表 | 单个备份大小，用于统计总存储占用 |
-| throttles 配置 | config/backups.php | 时间窗口内创建次数限制 |
-| ResourceLimit 限流 | app/Enum/ResourceLimit.php | 服务器维度的创建频率限制 |
+| 配额项 | 存储位置 | 作用 | 语义 |
+|--------|---------|------|------|
+| `server.backup_limit` | servers 表 | 单服务器备份数量上限 | **0=禁止，>0=上限数量** |
+| `backup.bytes` | backups 表 | 单个备份大小 | 用于统计总存储占用 |
+| throttles 配置 | config/backups.php | 创建频率限制 | 10分钟2次（仅创建） |
+| ResourceLimit 限流 | app/Enum/ResourceLimit.php | 恢复频率限制 | 15分钟3次（仅恢复） |
+
+**限流对比表**：
+
+| 操作 | 限流方式 | 落点 | 规则 |
+|-----|---------|------|------|
+| 创建备份 | throttles | InitiateBackupService 内部 | 10分钟2次 |
+| 创建备份 | ResourceLimit | ❌ 无 | - |
+| 恢复备份 | throttles | ❌ 无 | - |
+| 恢复备份 | ResourceLimit | 路由中间件 | 15分钟3次 |
 
 ### 4.2 计量字段
 
@@ -374,19 +488,21 @@ try {
 |---------|---------|---------|
 | 备份模型 | `app/Models/Backup.php` | - |
 | 服务器模型（备份限制） | `app/Models/Server.php` | 45, 126 |
-| 备份初始化服务 | `app/Services/Backups/InitiateBackupService.php` | 76 |
+| 备份初始化服务 | `app/Services/Backups/InitiateBackupService.php` | 76, 92, 94 |
 | Wings 备份仓库 | `app/Repositories/Wings/DaemonBackupRepository.php` | 35, 60, 85 |
 | 通信基类 | `app/Repositories/Wings/DaemonRepository.php` | 49 |
-| 备份状态回调 | `app/Http/Controllers/Api/Remote/Backups/BackupStatusController.php` | 32, 93 |
+| 备份状态回调 | `app/Http/Controllers/Api/Remote/Backups/BackupStatusController.php` | 32, 93, 120 |
 | S3 分片上传 | `app/Http/Controllers/Api/Remote/Backups/BackupRemoteUploadController.php` | 34 |
-| 客户端备份控制器 | `app/Http/Controllers/Api/Client/Servers/BackupController.php` | 67, 198 |
+| 客户端备份控制器 | `app/Http/Controllers/Api/Client/Servers/BackupController.php` | 67, 198, 200, 206 |
 | 备份删除服务 | `app/Services/Backups/DeleteBackupService.php` | 29 |
 | 下载链接服务 | `app/Services/Backups/DownloadLinkService.php` | 24 |
 | 节点 JWT 服务 | `app/Services/Nodes/NodeJWTService.php` | 63 |
 | 守护进程认证中间件 | `app/Http/Middleware/Api/Daemon/DaemonAuthenticate.php` | 34 |
 | 孤儿备份清理命令 | `app/Console/Commands/Maintenance/PruneOrphanedBackupsCommand.php` | 23 |
 | 资源限流枚举 | `app/Enum/ResourceLimit.php` | 46 |
+| 定时任务备份限制 | `app/Http/Controllers/Api/Client/Servers/ScheduleTaskController.php` | 47, 107 |
 | 备份配置 | `config/backups.php` | - |
+| 备份路由 | `routes/api-client.php` | 132-141 |
 
 ---
 
@@ -406,7 +522,20 @@ try {
 - 孤儿备份自动清理，防止状态不一致
 - 删除容错，Wings 404 不阻塞面板清理
 - 失败自动解锁，便于用户处理
+- S3 分片异常分级处理（静默/中止/抛错）
 
 ### 7.4 可扩展性
 - 适配器模式：Wings 本地 / S3 云存储可切换
 - 配置驱动：节流、限流、分片大小等均可配置
+
+---
+
+## 八、重要代码事实修正清单
+
+| 原理解 | 修正后 | 依据 |
+|-------|--------|------|
+| backup_limit=0 表示无限制 | backup_limit=0 表示禁止备份 | InitiateBackupService.php:94、ScheduleTaskController.php:47 |
+| 创建和恢复使用相同限流 | 创建用 throttles（10min2次），恢复用 ResourceLimit（15min3次） | routes/api-client.php:138、InitiateBackupService.php:78 |
+| 恢复要求备份必须成功 | 仅禁止"进行中"的备份，已失败的备份也允许恢复 | BackupController.php:206 |
+| S3 上传在完成回调之后 | S3 分片上传在完成回调之前完成 | BackupRemoteUploadController + BackupStatusController 时序 |
+| upload_id 缺失直接报错 | 失败场景下 upload_id 缺失静默返回 | BackupStatusController.php:124-130 |
