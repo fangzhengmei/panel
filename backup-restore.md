@@ -17,7 +17,7 @@ Pterodactyl 面板采用"面板（Panel）+ 守护进程（Wings）"的分布式
 
 ## 二、备份任务完整链路
 
-### 2.1 API 入口
+### 2.1 API 入口与路由中间件链
 
 **路由**：`POST /api/client/servers/{server}/backups`
 **控制器**：`app/Http/Controllers/Api/Client/Servers/BackupController.php:67`
@@ -25,6 +25,39 @@ Pterodactyl 面板采用"面板（Panel）+ 守护进程（Wings）"的分布式
 ```php
 public function store(StoreBackupRequest $request, Server $server): array
 ```
+
+**⚠️ 路由中间件与 api.client 全局限流的关系（精修版）**
+
+创建备份请求经过**四层路由中间件**+**一层业务限流**，限流是从外层到内层逐层校验的：
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ 路由组：/api/client (全局)                                  │
+│   中间件：throttle:api.client → 256次/分钟，按用户UUID/IP     │
+│   定义：app/Providers/RouteServiceProvider.php:56           │
+└────────────────────────┬────────────────────────────────────┘
+                         ↓
+┌─────────────────────────────────────────────────────────────┐
+│ 路由组：/api/client/servers/{server} (服务器组)              │
+│   中间件1：ServerSubject → 活动日志标记                      │
+│   中间件2：AuthenticateServerAccess → 权限+状态校验          │
+│             定义：app/Http/Middleware/Api/Client/Server/    │
+│                    AuthenticateServerAccess.php:29          │
+│   中间件3：ResourceBelongsToServer → 资源归属校验            │
+│             定义：app/Http/Middleware/Api/Client/Server/    │
+│                    ResourceBelongsToServer.php:27           │
+│   定义：routes/api-client.php:57-63                         │
+└────────────────────────┬────────────────────────────────────┘
+                         ↓
+┌─────────────────────────────────────────────────────────────┐
+│ 控制器层：BackupController::store()                         │
+│   调用：InitiateBackupService::handle()                     │
+│     内部限流：throttles → 2次/10分钟，按服务器ID              │
+│             定义：app/Services/Backups/InitiateBackupService.php:78 │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**关键结论**：`api.client` 限流是**路由组全局中间件**，所有 `/api/client` 下的请求（包括创建备份、恢复备份、文件操作等）都会先经过它。创建备份在经过这层后，还会经过服务器组的3个中间件，最后在业务服务层再经过 throttles 限流。
 
 ### 2.2 四层限流/校验机制
 
@@ -145,14 +178,28 @@ return $this->connection->transaction(function () use ($server, $name) {
 });
 ```
 
-**⚠️ 一致性边界的准确表述**：
+**⚠️ 一致性边界的准确表述（代码可证实）**：
 
 | 操作类型 | 是否受事务保护 | 失败时行为 |
 |---------|---------------|-----------|
 | `$this->repository->create()` 插入备份记录 | ✅ 受保护 | 事务回滚，记录被撤销 |
 | `$this->daemonBackupRepository->backup()` 调用 Wings | ❌ 不受保护 | **Wings 动作不会回滚** |
 
-**核心语义**：数据库事务**仅保护数据库操作**，不保护外部 HTTP 调用。Wings 的备份/恢复/删除都是**异步执行**，HTTP 请求只是"触发"，一旦请求发出（哪怕后续网络超时），Wings 侧的动作已开始，无法通过数据库回滚来撤销。
+**核心语义（代码可证实，4 条证据）**：数据库事务**仅保护数据库操作**，不保护外部 HTTP 调用。Wings 的备份/恢复/删除都满足以下特征：
+
+1. **证据 1**：调用方不等待也不校验执行结果。`backup()` 返回 `ResponseInterface`，但 `InitiateBackupService` 没有读取/校验响应体，只是触发请求。
+   - 代码：`app/Repositories/Wings/DaemonBackupRepository.php:35` + `app/Services/Backups/InitiateBackupService.php:120-122`
+
+2. **证据 2**：备份记录创建时 `completed_at` 为 `null`，需要等待 Wings 异步回调才设置完成时间。
+   - 代码：备份记录创建字段（第 130-136 行）不含 `completed_at`；回调在 `app/Http/Controllers/Api/Remote/Backups/BackupStatusController.php:32` 才设置
+
+3. **证据 3**：恢复流程也依赖回调而非同步等待。`STATUS_RESTORING_BACKUP` 状态由 Wings 回调 `POST /api/remote/backups/{backup}/restore` 清除，而非 HTTP 响应返回时清除。
+   - 代码：`app/Http/Controllers/Api/Remote/Backups/BackupStatusController.php:93`
+
+4. **证据 4**：事务回滚无法撤销已发出的 HTTP 请求。Guzzle `TransferException` 包装为 `DaemonConnectionException` 抛出时，数据库事务回滚，但 Wings 侧可能已接收请求并开始执行。
+   - 代码：`app/Repositories/Wings/DaemonBackupRepository.php:50-52` + `app/Exceptions/Http/Connection/DaemonConnectionException.php:28`
+
+> 总结表述：一旦 HTTP 请求发出（哪怕后续网络超时），Wings 侧的动作已开始，无法通过数据库回滚来撤销。
 
 ### 2.5 Wings 通信层
 
@@ -320,10 +367,53 @@ protected function completeMultipartUpload(Backup $backup, S3Filesystem $adapter
 
 ## 三、恢复任务完整链路
 
-### 3.1 API 入口
+### 3.1 API 入口与路由中间件链
 
 **路由**：`POST /api/client/servers/{server}/backups/{backup}/restore`
 **控制器**：`app/Http/Controllers/Api/Client/Servers/BackupController.php:198`
+
+**恢复请求的中间件链**：
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ 路由组：/api/client (全局)                                  │
+│   中间件：throttle:api.client → 256次/分钟，按用户UUID/IP     │
+│   定义：app/Providers/RouteServiceProvider.php:56           │
+└────────────────────────┬────────────────────────────────────┘
+                         ↓
+┌─────────────────────────────────────────────────────────────┐
+│ 路由组：/api/client/servers/{server} (服务器组)              │
+│   中间件1：ServerSubject → 活动日志标记                      │
+│   中间件2：AuthenticateServerAccess → 权限+状态校验          │
+│             定义：app/Http/Middleware/Api/Client/Server/    │
+│                    AuthenticateServerAccess.php:29          │
+│             其中包含 validateCurrentState() 调用：检查未暂停、│
+│             未维护、已安装、非恢复中、无转移                  │
+│   中间件3：ResourceBelongsToServer → 资源归属校验            │
+│             定义：app/Http/Middleware/Api/Client/Server/    │
+│                    ResourceBelongsToServer.php:27           │
+│             其中 case Backup::class 检查 $model->server_id  │
+│             === $server->id                                  │
+│   定义：routes/api-client.php:57-63                         │
+└────────────────────────┬────────────────────────────────────┘
+                         ↓
+┌─────────────────────────────────────────────────────────────┐
+│ 路由级中间件（仅 restore 路由）                              │
+│   中间件：ResourceLimit::Backup->middleware()                │
+│             定义：routes/api-client.php:138                  │
+│             限流：3次/15分钟，按服务器UUID                    │
+└────────────────────────┬────────────────────────────────────┘
+                         ↓
+┌─────────────────────────────────────────────────────────────┐
+│ 控制器层：BackupController::restore()                        │
+│   校验1：$server->status === null  (空闲状态)                │
+│          定义：app/Http/Controllers/Api/Client/Servers/      │
+│                BackupController.php:202                      │
+│   校验2：备份非"进行中且未成功"状态                           │
+│          定义：app/Http/Controllers/Api/Client/Servers/      │
+│                BackupController.php:206                      │
+└─────────────────────────────────────────────────────────────┘
+```
 
 ### 3.2 四层限流/校验机制
 
@@ -350,7 +440,49 @@ public function throttleKey(): string
 
 **排障口径**：HTTP 429，响应头 `X-RateLimit-Limit: 3`，限流 Key 为服务器 UUID。
 
-#### 第二层：服务器状态校验（可发起恢复边界）
+#### 第二层：恢复可发起条件（资源归属校验 + 状态校验，拆开讲）
+
+**⚠️ 恢复可发起条件的两个独立校验层次**：
+
+##### 层次 A：资源归属校验（路由中间件层，早于控制器）
+
+**代码位置**：`app/Http/Middleware/Api/Client/Server/ResourceBelongsToServer.php:50-56`
+
+```php
+case Backup::class:
+    if ($model->server_id !== $server->id) {
+        throw $exception; // 404 Not Found
+    }
+    break;
+```
+
+**校验内容**：确保 URL 路径中的 `{backup}` 确实属于 URL 路径中的 `{server}`。防止用户通过构造 `server=A&backup=B` 越权访问其他服务器的备份。
+
+**通过条件**：`$backup->server_id === $server->id`
+
+##### 层次 B：状态校验（分两处实现）
+
+**B1：服务器全局状态校验（中间件层）**
+
+**代码位置**：`app/Http/Middleware/Api/Client/Server/AuthenticateServerAccess.php:50`
+```php
+$server->validateCurrentState();
+```
+
+**`validateCurrentState()` 定义**：`app/Models/Server.php:390-401`
+```php
+if (
+    $this->isSuspended()                   // 未暂停
+    || $this->node->isUnderMaintenance()    // 节点未维护
+    || !$this->isInstalled()                // 已安装
+    || $this->status === self::STATUS_RESTORING_BACKUP  // 非恢复中
+    || !is_null($this->transfer)            // 无转移任务
+) {
+    throw new ServerStateConflictException($this);
+}
+```
+
+**B2：控制器层状态校验**
 
 **代码位置**：`app/Http/Controllers/Api/Client/Servers/BackupController.php:200-208`
 
@@ -366,15 +498,17 @@ if (!$backup->is_successful && is_null($backup->completed_at)) {
 }
 ```
 
-**⚠️ 状态流转边界 1："可发起恢复"的完整条件**
+**⚠️ 状态流转边界 1："可发起恢复"的完整条件（精修版）**
 
-"可发起恢复"需同时通过三层检查：
+"可发起恢复"需通过以下 5 项检查，按执行顺序排列：
 
-| 检查层级 | 代码位置 | 检查内容 | 通过条件 |
-|---------|---------|---------|---------|
-| 路由中间件 | `app/Http/Middleware/Api/Client/Server/AuthenticateServerAccess.php:50` | `validateCurrentState()` | 未暂停、节点未维护、已安装、非恢复中、无转移任务 |
-| 控制器校验1 | `app/Http/Controllers/Api/Client/Servers/BackupController.php:202` | 服务器状态 | `$server->status === null` |
-| 控制器校验2 | `app/Http/Controllers/Api/Client/Servers/BackupController.php:206` | 备份状态 | 非"进行中且未成功"状态 |
+| 检查顺序 | 检查层级 | 代码位置 | 检查内容 | 通过条件 |
+|---------|---------|---------|---------|---------|
+| 1 | 路由中间件 | `ResourceBelongsToServer.php:54` | 资源归属 | `$backup->server_id === $server->id` |
+| 2 | 路由中间件 | `AuthenticateServerAccess.php:50` | 服务器全局状态 | 未暂停、节点未维护、已安装、非恢复中、无转移任务 |
+| 3 | 路由中间件 | `ResourceLimit` | 恢复限流 | 15分钟内不超过3次 |
+| 4 | 控制器 | `BackupController.php:202` | 服务器即时状态 | `$server->status === null` |
+| 5 | 控制器 | `BackupController.php:206` | 备份状态 | 非"进行中且未成功"状态 |
 
 **备份状态真值表**：
 
@@ -416,7 +550,7 @@ $log->transaction(function () use ($backup, $server, $request) {
 |-----|---------|---------------|-----------|
 | 1 | S3 预签名 URL 生成 | ❌ 外部调用 | 直接抛异常，事务尚未执行任何数据库操作，无不一致 |
 | 2 | `$server->update(['status' => ...])` | ✅ 数据库操作 | 事务回滚，status 还原为 null |
-| 3 | `$this->daemonRepository->restore()` | ❌ 外部调用 | **Wings 动作不会回滚** |
+| 3 | `$this->daemonRepository->restore()` | ❌ 外部调用 | **Wings 动作不会回滚**（同 2.4 节，4 条证据适用） |
 
 **恢复场景下的不一致风险**：
 
@@ -550,24 +684,24 @@ RateLimiter::for('api.client:server-resource:backup', function (Request $request
 
 **创建备份**：
 ```
-1. api.client 全局限流 (256/分钟)   ← 独立计数1
+1. api.client 全局限流 (256/分钟)   ← 独立计数1，路由组全局
    ↓
-2. 权限/参数校验
+2. 服务器组中间件 (权限+归属+状态)
    ↓
-3. throttles 业务限流 (2次/10分钟)   ← 独立计数2
+3. throttles 业务限流 (2次/10分钟)   ← 独立计数2，业务服务内
    ↓
 4. backup_limit 配额校验
 ```
 
 **恢复备份**：
 ```
-1. api.client 全局限流 (256/分钟)   ← 独立计数1
+1. api.client 全局限流 (256/分钟)   ← 独立计数1，路由组全局
    ↓
-2. ResourceLimit 路由限流 (3次/15分钟)  ← 独立计数2
+2. 服务器组中间件 (权限+归属+状态)
    ↓
-3. 权限/参数校验
+3. ResourceLimit 路由限流 (3次/15分钟)  ← 独立计数2，路由级
    ↓
-4. 服务器状态校验 (可发起恢复边界)
+4. 控制器状态校验 (可发起恢复边界)
 ```
 
 ---
@@ -661,7 +795,7 @@ try {
 | 通信基类 | `app/Repositories/Wings/DaemonRepository.php` | 49 |
 | 备份状态回调 | `app/Http/Controllers/Api/Remote/Backups/BackupStatusController.php` | 32, 66, 93, 103, 120 |
 | S3 分片上传 | `app/Http/Controllers/Api/Remote/Backups/BackupRemoteUploadController.php` | 34 |
-| 客户端备份控制器 | `app/Http/Controllers/Api/Client/Servers/BackupController.php` | 67, 198, 200, 206, 214 |
+| 客户端备份控制器 | `app/Http/Controllers/Api/Client/Servers/BackupController.php` | 67, 198, 200, 202, 206, 214 |
 | 备份删除服务 | `app/Services/Backups/DeleteBackupService.php` | 29, 47 |
 | 下载链接服务 | `app/Services/Backups/DownloadLinkService.php` | 24 |
 | 节点 JWT 服务 | `app/Services/Nodes/NodeJWTService.php` | 63 |
@@ -672,9 +806,10 @@ try {
 | 路由服务提供者（全局限流） | `app/Providers/RouteServiceProvider.php` | 56, 93 |
 | HTTP 限流配置 | `config/http.php` | 14-16 |
 | 备份配置 | `config/backups.php` | - |
-| 备份路由 | `routes/api-client.php` | 132-141 |
+| 备份路由 | `routes/api-client.php` | 57-63, 132-141 |
 | 服务器状态异常 | `app/Exceptions/Http/Server/ServerStateConflictException.php` | 23 |
-| 服务器访问认证中间件 | `app/Http/Middleware/Api/Client/Server/AuthenticateServerAccess.php` | 50 |
+| 服务器访问认证中间件 | `app/Http/Middleware/Api/Client/Server/AuthenticateServerAccess.php` | 29, 50 |
+| 资源归属校验中间件 | `app/Http/Middleware/Api/Client/Server/ResourceBelongsToServer.php` | 27, 50-56 |
 | 守护进程连接异常 | `app/Exceptions/Http/Connection/DaemonConnectionException.php` | 13, 28 |
 
 ---
@@ -682,7 +817,7 @@ try {
 ## 八、关键设计决策总结
 
 ### 8.1 数据一致性
-- 数据库事务确保数据库操作的原子性，但**不保护外部 HTTP 调用**
+- 数据库事务确保数据库操作的原子性，但**不保护外部 HTTP 调用**（4 条代码证据）
 - 回调接口节点归属校验，防止越权操作
 - 幂等性校验，避免重复处理
 - 孤儿备份自动清理，作为超时场景的兜底补偿
@@ -691,6 +826,7 @@ try {
 - 双向认证：Panel → Wings 使用 Bearer Token，Wings → Panel 使用 Token 对
 - 传输加密：HTTPS + JWT 签名链接
 - S3 预签名 URL，避免密钥暴露
+- 资源归属校验中间件，防止构造越权请求
 
 ### 8.3 可靠性
 - 孤儿备份自动清理，防止状态不一致
@@ -702,6 +838,7 @@ try {
 ### 8.4 可扩展性
 - 适配器模式：Wings 本地 / S3 云存储可切换
 - 配置驱动：节流、限流、分片大小等均可配置
+- 中间件分层设计，便于新增校验逻辑
 
 ---
 
@@ -715,6 +852,8 @@ try {
 | S3 上传在完成回调之后 | S3 分片上传在完成回调之前完成 | `app/Http/Controllers/Api/Remote/Backups/BackupRemoteUploadController.php` + `BackupStatusController.php` 时序 |
 | upload_id 缺失直接报错 | 失败场景下 upload_id 缺失静默返回 | `app/Http/Controllers/Api/Remote/Backups/BackupStatusController.php:124-130` |
 | restore 回调根据 successful 做业务分支 | successful 仅用于审计事件名，无论成败都清除状态 | `app/Http/Controllers/Api/Remote/Backups/BackupStatusController.php:103-108` |
-| 恢复只需检查 status===null | 还需通过 validateCurrentState()（未暂停/未维护/已安装/无转移） | `app/Http/Middleware/Api/Client/Server/AuthenticateServerAccess.php:50`、`app/Models/Server.php:390` |
-| 数据库事务会回滚 Wings 动作 | 事务仅保护数据库操作，Wings 调用失败/超时会导致数据库回滚但远端动作已执行 | `app/Services/Backups/InitiateBackupService.php:109`、`app/Repositories/Wings/DaemonBackupRepository.php:50` |
+| 恢复只需检查 status===null | 还需通过资源归属校验（`$backup->server_id === $server->id`）和 validateCurrentState()（未暂停/未维护/已安装/无转移） | `app/Http/Middleware/Api/Client/Server/ResourceBelongsToServer.php:54`、`app/Http/Middleware/Api/Client/Server/AuthenticateServerAccess.php:50`、`app/Models/Server.php:390` |
+| 数据库事务会回滚 Wings 动作 | 事务仅保护数据库操作，Wings 调用失败/超时会导致数据库回滚但远端动作已执行，4 条代码证据可证 | `app/Services/Backups/InitiateBackupService.php:109`、`app/Repositories/Wings/DaemonBackupRepository.php:50`、`app/Http/Controllers/Api/Remote/Backups/BackupStatusController.php:32`、`app/Http/Controllers/Api/Remote/Backups/BackupStatusController.php:93` |
 | 三层限流互斥 | 三层限流并存生效，独立计数，任一触发都会拦截 | `app/Providers/RouteServiceProvider.php:93`、`app/Enum/ResourceLimit.php:61` |
+| api.client 限流仅作用于部分接口 | api.client 限流是 /api/client 路由组全局中间件，所有客户端接口共用 | `app/Providers/RouteServiceProvider.php:56` |
+| "异步执行"是模糊描述 | Wings 的调用仅触发不等待，依赖回调更新状态，4 条代码证据可证实：1) 调用方不读响应体；2) completed_at 初始为 null；3) 恢复状态依赖回调清除；4) 事务回滚不影响已发出的请求 | `app/Repositories/Wings/DaemonBackupRepository.php:35`、`app/Http/Controllers/Api/Remote/Backups/BackupStatusController.php:32`、`app/Http/Controllers/Api/Remote/Backups/BackupStatusController.php:93`、`app/Exceptions/Http/Connection/DaemonConnectionException.php:28` |
