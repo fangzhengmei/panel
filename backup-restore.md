@@ -53,6 +53,8 @@ $key = optional($request->user())->uuid ?: $request->ip();
 ```
 > 按用户 UUID 限流（未登录时按 IP），避免用户通过切换 IP 绕过限制。
 
+**排障口径**：HTTP 429，响应头 `X-RateLimit-Limit: 256`、`X-RateLimit-Remaining: 0`
+
 #### 第一层：权限与参数校验
 - **权限校验**：`Permission::ACTION_BACKUP_CREATE`，通过 `StoreBackupRequest` 前置检查
 - **参数校验**：
@@ -83,6 +85,8 @@ if ($previous->count() >= $limit) {
 ```
 
 **查询范围**：包含进行中（`completed_at is null`）和已成功（`is_successful = true`）的备份。
+
+**排障口径**：HTTP 429，响应体含 `Retry-After` 秒数，错误消息含时间窗口信息。
 
 #### 第三层：资源配额校验（backup_limit）
 
@@ -116,12 +120,13 @@ if (!$server->backup_limit || $successful->count() >= $server->backup_limit) {
 3. 查找最旧的**非锁定**备份自动删除
 4. 若无可用备份（全部锁定），抛出 `TooManyBackupsException`
 
-### 2.4 数据库事务与记录创建
+### 2.4 数据库事务与 Wings 外部调用的一致性边界
 
 **代码位置**：`app/Services/Backups/InitiateBackupService.php:109`
 
 ```php
 return $this->connection->transaction(function () use ($server, $name) {
+    /** @var Backup $backup */
     $backup = $this->repository->create([
         'server_id' => $server->id,
         'uuid' => Uuid::uuid4()->toString(),
@@ -131,6 +136,7 @@ return $this->connection->transaction(function () use ($server, $name) {
         'is_locked' => $this->isLocked,
     ], true, true);
 
+    // ⚠️ 外部 HTTP 调用在数据库事务内部
     $this->daemonBackupRepository->setServer($server)
         ->setBackupAdapter($this->backupManager->getDefaultAdapter())
         ->backup($backup);
@@ -139,7 +145,14 @@ return $this->connection->transaction(function () use ($server, $name) {
 });
 ```
 
-**关键设计**：数据库事务确保备份记录创建与 Wings 请求的原子性。
+**⚠️ 一致性边界的准确表述**：
+
+| 操作类型 | 是否受事务保护 | 失败时行为 |
+|---------|---------------|-----------|
+| `$this->repository->create()` 插入备份记录 | ✅ 受保护 | 事务回滚，记录被撤销 |
+| `$this->daemonBackupRepository->backup()` 调用 Wings | ❌ 不受保护 | **Wings 动作不会回滚** |
+
+**核心语义**：数据库事务**仅保护数据库操作**，不保护外部 HTTP 调用。Wings 的备份/恢复/删除都是**异步执行**，HTTP 请求只是"触发"，一旦请求发出（哪怕后续网络超时），Wings 侧的动作已开始，无法通过数据库回滚来撤销。
 
 ### 2.5 Wings 通信层
 
@@ -161,7 +174,19 @@ Body: {
 }
 ```
 
-### 2.6 加密与安全机制
+**异常传播**：Guzzle `TransferException` → 包装为 `DaemonConnectionException`（HTTP 502/504 等）
+
+### 2.6 典型失败场景（数据库回滚但不回滚远端动作）
+
+| 场景 | 时序 | 结果 | 排障建议 |
+|-----|------|------|---------|
+| **Wings 已接收但 HTTP 超时** | 1. 事务内 INSERT 备份记录成功<br>2. Wings 收到请求，已开始打包<br>3. HTTP 超时，抛出 `DaemonConnectionException`<br>4. 事务回滚，记录被撤销 | ✅ 数据库回滚<br>❌ Wings 仍在后台打包 → **孤儿备份任务** | 去节点侧 `daemon.log` 查 `X-Request-Id`，看 Wings 是否实际执行了备份 |
+| **Wings 已创建任务但返回非 200** | 1. 事务内 INSERT 成功<br>2. Wings 收到请求，创建任务<br>3. Wings 返回 400/500 错误<br>4. 事务回滚 | ✅ 数据库回滚<br>❌ Wings 任务已创建，可能仍在执行 | 检查 Wings 侧是否已有该备份 UUID 的任务记录 |
+| **TCP 连接已建立但包丢失** | 1. 事务内 INSERT 成功<br>2. HTTP 请求已发出（Wings 已收到）<br>3. 响应包丢失，Panel 侧读超时<br>4. 事务回滚 | ✅ 数据库回滚<br>❌ Wings 已收到并执行 | 最隐蔽的不一致场景，需依赖孤儿备份清理 |
+
+> **排障总原则**：用户反馈"创建备份失败但节点上有备份进程在跑"时，首先排查网络超时问题，不要盲目重试。`p:maintenance:prune-backups` 命令可以兜底清理这类孤儿备份的面板记录，但无法终止 Wings 侧已启动的进程。
+
+### 2.7 加密与安全机制
 
 #### 节点密钥加密存储
 - 数据库存储：`Node.daemon_token` 使用 Laravel 加密器加密
@@ -185,7 +210,7 @@ if (hash_equals($this->encrypter->decrypt($node->daemon_token), $parts[1])) {
 }
 ```
 
-### 2.7 S3 分片上传完整时序
+### 2.8 S3 分片上传完整时序
 
 **⚠️ 时序修正**：S3 分片上传发生在 Wings 打包完成后、完成回调之前。
 
@@ -210,7 +235,7 @@ if (hash_equals($this->encrypter->decrypt($node->daemon_token), $parts[1])) {
 **预签名 URL 有效期**：`config('backups.presigned_url_lifespan', 60)` 分钟
 **默认分片大小**：`BACKUP_MAX_PART_SIZE = 5GB`（AWS S3 单分片上限）
 
-### 2.8 备份完成回调
+### 2.9 备份完成回调
 
 **接口**：`POST /api/remote/backups/{backup}`
 **控制器**：`app/Http/Controllers/Api/Remote/Backups/BackupStatusController.php:32`
@@ -245,7 +270,7 @@ if (hash_equals($this->encrypter->decrypt($node->daemon_token), $parts[1])) {
    - `completed_at = now()`
    - S3 适配器：`AbortMultipartUpload` 中止分片
 
-### 2.9 S3 分片合并异常分支
+### 2.10 S3 分片合并异常分支
 
 **代码位置**：`app/Http/Controllers/Api/Remote/Backups/BackupStatusController.php:120`
 
@@ -314,6 +339,17 @@ protected function completeMultipartUpload(Backup $backup, S3Filesystem $adapter
 >   - 限流规则：每 15 分钟最多 3 次，按服务器维度（`app/Enum/ResourceLimit.php:46`）
 > - **业务层面**：无 throttles 检查
 
+**限流 Key**：`app/Enum/ResourceLimit.php:30`
+```php
+public function throttleKey(): string
+{
+    return mb_strtolower("api.client:server-resource:{$this->name}");
+}
+// 实际按 server.uuid 限流：return $case->limit()->by($server->uuid);
+```
+
+**排障口径**：HTTP 429，响应头 `X-RateLimit-Limit: 3`，限流 Key 为服务器 UUID。
+
 #### 第二层：服务器状态校验（可发起恢复边界）
 
 **代码位置**：`app/Http/Controllers/Api/Client/Servers/BackupController.php:200-208`
@@ -354,24 +390,42 @@ if (!$backup->is_successful && is_null($backup->completed_at)) {
 - 权限校验：`Permission::ACTION_BACKUP_RESTORE`
 - 参数校验：`truncate` 布尔值（是否清空目录后恢复）
 
-### 3.3 恢复执行流程
+### 3.3 恢复执行流程与事务边界
 
 **代码位置**：`app/Http/Controllers/Api/Client/Servers/BackupController.php:214`
 
 ```php
 $log->transaction(function () use ($backup, $server, $request) {
-    // S3 备份需生成下载 URL
+    // If the backup is for an S3 file we need to generate a unique Download link for
+    // it that will allow Wings to actually access the file.
     if ($backup->disk === Backup::ADAPTER_AWS_S3) {
-        $url = $this->downloadLinkService->handle($backup, $request->user());
+        $url = $this->downloadLinkService->handle($backup, $request->user()); // 外部调用1：S3 预签名
     }
 
-    // 设置服务器状态，防止其他操作
-    $server->update(['status' => Server::STATUS_RESTORING_BACKUP]);
+    // Update the status right away for the server so that we know not to allow certain
+    // actions against it via the Panel API.
+    $server->update(['status' => Server::STATUS_RESTORING_BACKUP]); // 数据库操作
 
-    // 通知 Wings 执行恢复
-    $this->daemonRepository->setServer($server)->restore($backup, $url ?? null, $request->input('truncate'));
+    $this->daemonRepository->setServer($server)->restore($backup, $url ?? null, $request->input('truncate')); // 外部调用2：Wings HTTP
 });
 ```
+
+**⚠️ 恢复流程的事务边界分析**：
+
+| 步骤 | 操作类型 | 是否受事务保护 | 失败时行为 |
+|-----|---------|---------------|-----------|
+| 1 | S3 预签名 URL 生成 | ❌ 外部调用 | 直接抛异常，事务尚未执行任何数据库操作，无不一致 |
+| 2 | `$server->update(['status' => ...])` | ✅ 数据库操作 | 事务回滚，status 还原为 null |
+| 3 | `$this->daemonRepository->restore()` | ❌ 外部调用 | **Wings 动作不会回滚** |
+
+**恢复场景下的不一致风险**：
+
+| 场景 | 结果 | 用户可见现象 |
+|-----|------|-------------|
+| Wings 已开始恢复但 HTTP 超时，事务回滚 | ✅ status 还原为 null<br>❌ Wings 仍在后台恢复 | 服务器状态显示"正常"，但实际在恢复中，可能出现数据不一致 |
+| S3 预签名 URL 已生成但后续步骤失败 | ✅ 数据库回滚<br>❌ S3 URL 已签发（5 分钟后自动过期） | 无业务影响，仅浪费一个预签名 URL |
+
+> **排障建议**：用户反馈"恢复失败但服务器数据好像被改了"时，检查 Wings 侧是否有正在进行的恢复任务。由于状态已回滚，用户可能重复发起恢复，导致多次解压覆盖。
 
 ### 3.4 Wings 恢复请求
 
@@ -459,32 +513,57 @@ public function restore(Request $request, string $backup): JsonResponse
 
 ## 四、限流架构全景
 
-### 4.1 三层限流对比
+### 4.1 三层限流并存关系（排障核心口径）
 
-| 限流类型 | 作用范围 | 落点 | 规则 | 创建备份 | 恢复备份 |
-|---------|---------|------|------|---------|---------|
-| api.client 全局 | 所有 /api/client 路由 | `RouteServiceProvider.php:56` | 256次/分钟/用户 | ✅ 共用 | ✅ 共用 |
-| throttles 业务 | 仅备份创建 | `InitiateBackupService.php:78` | 2次/10分钟/服务器 | ✅ 有 | ❌ 无 |
-| ResourceLimit 路由 | 仅备份恢复 | `routes/api-client.php:138` | 3次/15分钟/服务器 | ❌ 无 | ✅ 有 |
+> ⚠️ **关键结论**：三层限流**并存生效**，独立计数，互不影响。任一限流触发都会拦截请求。
 
-### 4.2 限流执行顺序
+| 限流类型 | 技术实现 | 计数 Key | 创建备份 | 恢复备份 | 响应特征 |
+|---------|---------|----------|---------|---------|---------|
+| api.client 全局 | `RateLimiter::for('api.client')` | 用户 UUID / IP | ✅ | ✅ | `X-RateLimit-Limit: 256` |
+| throttles 业务 | 业务代码内 `getBackupsGeneratedDuringTimespan()` | 服务器 ID | ✅ | ❌ | 429 + `Retry-After` 秒数 |
+| ResourceLimit 路由 | `RateLimiter::for('api.client:server-resource:backup')` | 服务器 UUID | ❌ | ✅ | `X-RateLimit-Limit: 3` |
+
+### 4.2 限流技术实现细节
+
+**api.client 与 ResourceLimit 是两个独立的 Laravel RateLimiter 实例**：
+
+```php
+// api.client - 按用户限流
+RateLimiter::for('api.client', function (Request $request) {
+    $key = optional($request->user())->uuid ?: $request->ip();
+    return Limit::perMinutes(1, 256)->by($key);
+});
+
+// ResourceLimit::Backup - 按服务器限流
+RateLimiter::for('api.client:server-resource:backup', function (Request $request) {
+    $server = $request->route()->parameter('server');
+    return Limit::perMinutes(15, 3)->by($server->uuid);
+});
+```
+
+> **排障指导**：用户报"限流"时，先看响应头。
+> - 只有 `X-RateLimit-Limit: 256` → 触发了用户级全局限流
+> - 有 `X-RateLimit-Limit: 3` → 触发了服务器级恢复限流
+> - 没有 `X-RateLimit` 头但有 `Retry-After` → 触发了备份创建的 throttles 业务限流
+
+### 4.3 限流执行顺序
 
 **创建备份**：
 ```
-1. api.client 全局限流 (256/分钟)
+1. api.client 全局限流 (256/分钟)   ← 独立计数1
    ↓
 2. 权限/参数校验
    ↓
-3. throttles 业务限流 (2次/10分钟)
+3. throttles 业务限流 (2次/10分钟)   ← 独立计数2
    ↓
 4. backup_limit 配额校验
 ```
 
 **恢复备份**：
 ```
-1. api.client 全局限流 (256/分钟)
+1. api.client 全局限流 (256/分钟)   ← 独立计数1
    ↓
-2. ResourceLimit 路由限流 (3次/15分钟)
+2. ResourceLimit 路由限流 (3次/15分钟)  ← 独立计数2
    ↓
 3. 权限/参数校验
    ↓
@@ -577,18 +656,18 @@ try {
 |---------|---------|---------|
 | 备份模型 | `app/Models/Backup.php` | - |
 | 服务器模型（备份限制） | `app/Models/Server.php` | 45, 126, 215, 390 |
-| 备份初始化服务 | `app/Services/Backups/InitiateBackupService.php` | 76, 92, 94 |
+| 备份初始化服务 | `app/Services/Backups/InitiateBackupService.php` | 76, 92, 94, 109 |
 | Wings 备份仓库 | `app/Repositories/Wings/DaemonBackupRepository.php` | 35, 60, 85 |
 | 通信基类 | `app/Repositories/Wings/DaemonRepository.php` | 49 |
-| 备份状态回调 | `app/Http/Controllers/Api/Remote/Backups/BackupStatusController.php` | 32, 93, 103, 120 |
+| 备份状态回调 | `app/Http/Controllers/Api/Remote/Backups/BackupStatusController.php` | 32, 66, 93, 103, 120 |
 | S3 分片上传 | `app/Http/Controllers/Api/Remote/Backups/BackupRemoteUploadController.php` | 34 |
-| 客户端备份控制器 | `app/Http/Controllers/Api/Client/Servers/BackupController.php` | 67, 198, 200, 206 |
-| 备份删除服务 | `app/Services/Backups/DeleteBackupService.php` | 29 |
+| 客户端备份控制器 | `app/Http/Controllers/Api/Client/Servers/BackupController.php` | 67, 198, 200, 206, 214 |
+| 备份删除服务 | `app/Services/Backups/DeleteBackupService.php` | 29, 47 |
 | 下载链接服务 | `app/Services/Backups/DownloadLinkService.php` | 24 |
 | 节点 JWT 服务 | `app/Services/Nodes/NodeJWTService.php` | 63 |
 | 守护进程认证中间件 | `app/Http/Middleware/Api/Daemon/DaemonAuthenticate.php` | 34 |
 | 孤儿备份清理命令 | `app/Console/Commands/Maintenance/PruneOrphanedBackupsCommand.php` | 23 |
-| 资源限流枚举 | `app/Enum/ResourceLimit.php` | 46 |
+| 资源限流枚举 | `app/Enum/ResourceLimit.php` | 30, 46 |
 | 定时任务备份限制 | `app/Http/Controllers/Api/Client/Servers/ScheduleTaskController.php` | 47, 107 |
 | 路由服务提供者（全局限流） | `app/Providers/RouteServiceProvider.php` | 56, 93 |
 | HTTP 限流配置 | `config/http.php` | 14-16 |
@@ -596,15 +675,17 @@ try {
 | 备份路由 | `routes/api-client.php` | 132-141 |
 | 服务器状态异常 | `app/Exceptions/Http/Server/ServerStateConflictException.php` | 23 |
 | 服务器访问认证中间件 | `app/Http/Middleware/Api/Client/Server/AuthenticateServerAccess.php` | 50 |
+| 守护进程连接异常 | `app/Exceptions/Http/Connection/DaemonConnectionException.php` | 13, 28 |
 
 ---
 
 ## 八、关键设计决策总结
 
 ### 8.1 数据一致性
-- 数据库事务确保备份记录创建与 Wings 请求的原子性
+- 数据库事务确保数据库操作的原子性，但**不保护外部 HTTP 调用**
 - 回调接口节点归属校验，防止越权操作
 - 幂等性校验，避免重复处理
+- 孤儿备份自动清理，作为超时场景的兜底补偿
 
 ### 8.2 安全性
 - 双向认证：Panel → Wings 使用 Bearer Token，Wings → Panel 使用 Token 对
@@ -629,9 +710,11 @@ try {
 | 原理解 | 修正后 | 依据 |
 |-------|--------|------|
 | backup_limit=0 表示无限制 | backup_limit=0 表示禁止备份 | `app/Services/Backups/InitiateBackupService.php:94`、`app/Http/Controllers/Api/Client/Servers/ScheduleTaskController.php:47` |
-| 创建和恢复使用相同限流 | 创建用 throttles（10min2次），恢复用 ResourceLimit（15min3次），且共用 api.client 全局限流 | `routes/api-client.php:138`、`app/Services/Backups/InitiateBackupService.php:78`、`app/Providers/RouteServiceProvider.php:56` |
+| 创建和恢复使用相同限流 | 创建用 throttles（10min2次），恢复用 ResourceLimit（15min3次），且共用 api.client 全局限流；三者并存独立计数 | `routes/api-client.php:138`、`app/Services/Backups/InitiateBackupService.php:78`、`app/Providers/RouteServiceProvider.php:56`、`app/Enum/ResourceLimit.php:30` |
 | 恢复要求备份必须成功 | 仅禁止"进行中"的备份，已失败的备份也允许恢复 | `app/Http/Controllers/Api/Client/Servers/BackupController.php:206` |
 | S3 上传在完成回调之后 | S3 分片上传在完成回调之前完成 | `app/Http/Controllers/Api/Remote/Backups/BackupRemoteUploadController.php` + `BackupStatusController.php` 时序 |
 | upload_id 缺失直接报错 | 失败场景下 upload_id 缺失静默返回 | `app/Http/Controllers/Api/Remote/Backups/BackupStatusController.php:124-130` |
 | restore 回调根据 successful 做业务分支 | successful 仅用于审计事件名，无论成败都清除状态 | `app/Http/Controllers/Api/Remote/Backups/BackupStatusController.php:103-108` |
 | 恢复只需检查 status===null | 还需通过 validateCurrentState()（未暂停/未维护/已安装/无转移） | `app/Http/Middleware/Api/Client/Server/AuthenticateServerAccess.php:50`、`app/Models/Server.php:390` |
+| 数据库事务会回滚 Wings 动作 | 事务仅保护数据库操作，Wings 调用失败/超时会导致数据库回滚但远端动作已执行 | `app/Services/Backups/InitiateBackupService.php:109`、`app/Repositories/Wings/DaemonBackupRepository.php:50` |
+| 三层限流互斥 | 三层限流并存生效，独立计数，任一触发都会拦截 | `app/Providers/RouteServiceProvider.php:93`、`app/Enum/ResourceLimit.php:61` |
