@@ -291,16 +291,343 @@ public function transform(User $model): array
 
 ---
 
-## 4. 登录认证流程深度分析
+## 4. 认证入口参数校验与两级限流机制
 
-### 4.1 主登录控制器
+### 4.1 认证入口参数校验
+
+#### 4.1.1 登录请求参数校验
+
+**文件**: `app/Http/Requests/Auth/LoginRequest.php:14-20`
+
+```php
+public function rules(): array
+{
+    return [
+        'user' => 'required|string|min:1',      // 用户名或邮箱
+        'password' => 'required|string',         // 密码
+    ];
+}
+```
+
+**校验时机**:
+- 在 `LoginController::login()` 方法执行前，由 Laravel FormRequest 自动执行
+- 校验失败抛出 `ValidationException`，由 `Handler::invalidJson()` 渲染为 422 响应
+
+**用户字段动态判断**:
+```php
+// AbstractLoginController.php:96-99
+protected function getField(?string $input = null): string
+{
+    return ($input && str_contains($input, '@')) ? 'email' : 'username';
+}
+```
+
+#### 4.1.2 检查点请求参数校验
+
+**文件**: `app/Http/Requests/Auth/LoginCheckpointRequest.php:21-40`
+
+```php
+public function rules(): array
+{
+    return [
+        'confirmation_token' => 'required|string',
+        'authentication_code' => [
+            'nullable',
+            'numeric',
+            Rule::requiredIf(function () {
+                return empty($this->input('recovery_token'));
+            }),
+        ],
+        'recovery_token' => [
+            'nullable',
+            'string',
+            Rule::requiredIf(function () {
+                return empty($this->input('authentication_code'));
+            }),
+        ],
+    ];
+}
+```
+
+**关键设计**: `authentication_code` 和 `recovery_token` 二选一必填，支持两种验证方式。
+
+---
+
+### 4.2 两级限流触发条件深度分析
+
+系统采用 **双层限流架构**，路由级中间件和应用层 trait 协同工作，形成纵深防御。
+
+#### 4.2.1 第一级：`throttle:authentication` 路由中间件
+
+**配置位置**: `routes/auth.php:25`
+```php
+Route::middleware(['throttle:authentication'])->group(function () {
+    Route::post('/login', [Auth\LoginController::class, 'login'])->middleware('recaptcha');
+    Route::post('/login/checkpoint', Auth\LoginCheckpointController::class)->name('auth.login-checkpoint');
+    // ...
+});
+```
+
+**限流定义**: `app/Providers/RouteServiceProvider.php:78-84`
+```php
+RateLimiter::for('authentication', function (Request $request) {
+    if ($request->route()->named('auth.post.forgot-password')) {
+        return Limit::perMinute(2)->by($request->ip());
+    }
+    return Limit::perMinute(10);  // 登录和检查点端点
+});
+```
+
+**限流键分析**:
+- 忘记密码：`IP` 地址（2次/分钟）
+- 登录/检查点：**无自定义键**，使用 Laravel 默认限流键（由 `fingerprint()` 或 `ip()` 生成）
+- 限流阈值：10次/分钟
+
+**执行时机**: 路由中间件栈中，在进入控制器方法 **之前** 执行。
+
+#### 4.2.2 第二级：`ThrottlesLogins` trait 应用层限流
+
+**配置**: `config/auth.php:15-18`
+```php
+'lockout' => [
+    'time' => 2,      // 锁定时间：2分钟
+    'attempts' => 3,  // 最大尝试次数：3次
+],
+```
+
+**限流键生成** (Laravel 内置 `ThrottlesLogins` trait):
+```php
+protected function throttleKey(Request $request)
+{
+    return Str::lower($request->input($this->username()) . '|' . $request->ip());
+}
+```
+
+**限流键 = `strtolower(username) + '|' + ip_address`**
+
+**执行时机**: 在控制器方法 **内部** 手动调用检查：
+```php
+// LoginController.php:34-37
+if ($this->hasTooManyLoginAttempts($request)) {
+    $this->fireLockoutEvent($request);
+    $this->sendLockoutResponse($request);
+}
+```
+
+**触发场景**:
+- `hasTooManyLoginAttempts()`: 检查是否超过阈值
+- `incrementLoginAttempts()`: 每次失败调用（在 `sendFailedLoginResponse` 中）
+- `clearLoginAttempts()`: 登录成功后调用（在 `sendLoginResponse` 中）
+
+#### 4.2.3 两级限流叠加效应
+
+```
+请求到达
+    ↓
+[第一级] throttle:authentication 中间件
+    ↓ 10次/分钟检查
+    ↓ 未触发 → 继续
+    ↓ 触发 → 返回 429 Too Many Requests
+    ↓
+[第二级] 控制器内 ThrottlesLogins 检查
+    ↓ 3次/2分钟检查（按 username+ip）
+    ↓ 未触发 → 继续认证逻辑
+    ↓ 触发 → throw ValidationException（带 X-RateLimit 头）
+    ↓
+认证逻辑（用户查找、密码验证、2FA检查等）
+    ↓
+登录成功 → clearLoginAttempts() → 重置第二级计数
+登录失败 → incrementLoginAttempts() → 第二级计数+1
+```
+
+**限流阈值对比**:
+
+| 层级 | 限流键 | 阈值 | 锁定时间 | 覆盖范围 |
+|------|--------|------|----------|----------|
+| 第一级 | IP (默认) | 10次/分钟 | 1分钟 | 整个认证路由组 |
+| 第二级 | username + IP | 3次/2分钟 | 2分钟 | 特定用户+IP组合 |
+
+**设计意图**:
+- 第一级：防止自动化脚本/机器人的高频泛洪攻击（按IP）
+- 第二级：防止针对特定账号的暴力破解尝试（按用户+IP）
+
+#### 4.2.4 `sendLockoutResponse` 响应分析
+
+`sendLockoutResponse` 是 Laravel 内置方法，位于 `ThrottlesLogins` trait：
+- 抛出 `ValidationException`，携带错误消息 `Too many login attempts. Please try again in :seconds seconds.`
+- 响应包含 `X-RateLimit-Limit` 和 `X-RateLimit-Remaining` 头
+- 状态码：422（注意：不是 429）
+
+> **重要区别**:
+> - 第一级中间件触发：返回 429 Too Many Requests
+> - 第二级 trait 触发：返回 422 Validation Error（带限流消息）
+
+---
+
+### 4.3 `api.application` 限流配置与触发条件
+
+**配置**: `app/Providers/RouteServiceProvider.php:102-109`
+```php
+RateLimiter::for('api.application', function (Request $request) {
+    $key = optional($request->user())->uuid ?: $request->ip();
+    return Limit::perMinutes(
+        config('http.rate_limit.application_period'),   // 1分钟
+        config('http.rate_limit.application')             // 256次/分钟
+    )->by($key);
+});
+```
+
+**限流键优先级**:
+1. 已认证用户：`user.uuid`（即使换IP也无法绕过）
+2. 未认证：`request.ip()`
+
+**阈值**: 默认 256次/分钟（可通过环境变量 `APP_API_APPLICATION_RATELIMIT` 调整）
+
+**覆盖范围**: 所有 `/api/application/*` 端点，包括 external_id 相关的用户创建、更新、查询 API。
+
+---
+
+### 4.4 reCAPTCHA 报错分支边界
+
+**中间件**: `app/Http/Middleware/VerifyReCaptcha.php:25-57`
+
+```php
+public function handle(Request $request, \Closure $next): mixed
+{
+    if (!$this->config->get('recaptcha.enabled')) {
+        return $next($request);  // 未启用时直接跳过
+    }
+
+    if ($request->filled('g-recaptcha-response')) {
+        // 调用 Google API 验证
+        $res = $client->post($this->config->get('recaptcha.domain'), [
+            'form_params' => [
+                'secret' => $this->config->get('recaptcha.secret_key'),
+                'response' => $request->input('g-recaptcha-response'),
+            ],
+        ]);
+
+        if ($res->getStatusCode() === 200) {
+            $result = json_decode($res->getBody());
+            if ($result->success && ...) {
+                return $next($request);  // 验证通过
+            }
+        }
+    }
+
+    // 验证失败分支
+    $this->dispatcher->dispatch(new FailedCaptcha($request->ip(), ...));
+    throw new HttpException(Response::HTTP_BAD_REQUEST, 'Failed to validate reCAPTCHA data.');
+}
+```
+
+**报错分支边界**:
+
+| 场景 | 异常类型 | 状态码 | 错误码 |
+|------|----------|--------|--------|
+| reCAPTCHA 未启用 | - | - | 直接通过 |
+| 缺少 `g-recaptcha-response` 参数 | `HttpException` | 400 | `HttpException` |
+| Google API 响应非 200 | `HttpException` | 400 | `HttpException` |
+| `success: false` | `HttpException` | 400 | `HttpException` |
+| 域名验证失败 | `HttpException` | 400 | `HttpException` |
+
+**事件审计**: 所有 reCAPTCHA 失败都会触发 `FailedCaptcha` 事件，记录 IP 和 hostname。
+
+**路由覆盖范围** (`routes/auth.php:27,34`):
+- ✅ `/auth/login` - 有 `recaptcha` 中间件
+- ❌ `/auth/login/checkpoint` - **无** `recaptcha` 中间件
+- ❌ `api.application` - **无** `recaptcha` 中间件
+
+---
+
+### 4.5 DisplayException 分支边界关系
+
+**类定义**: `app/Exceptions/DisplayException.php:15-81`
+
+```php
+class DisplayException extends PterodactylException implements HttpExceptionInterface
+{
+    public function getStatusCode(): int
+    {
+        return Response::HTTP_BAD_REQUEST;  // 400
+    }
+
+    public function render(Request $request): JsonResponse|RedirectResponse
+    {
+        if ($request->expectsJson()) {
+            return response()->json(Handler::toArray($this), $this->getStatusCode(), $this->getHeaders());
+        }
+        app(AlertsMessageBag::class)->danger($this->getMessage())->flash();
+        return redirect()->back()->withInput();
+    }
+}
+```
+
+#### 4.5.1 DisplayException 抛出场景
+
+| 场景 | 调用位置 | 错误消息 |
+|------|----------|----------|
+| 登录失败（用户不存在） | `AbstractLoginController:67` | `No account matching those credentials could be found.` |
+| 登录失败（密码错误） | `AbstractLoginController:67` | `No account matching those credentials could be found.` |
+| 2FA 检查点失败（通用） | `AbstractLoginController:64` | `The two-factor authentication token was invalid.` |
+| 2FA 检查点失败（令牌过期） | `AbstractLoginController:64` | `The authentication token provided has expired...` |
+| 2FA 检查点失败（恢复码错误） | `AbstractLoginController:64` | `The recovery token provided is not valid.` |
+| 2FA 令牌无效 | `TwoFactorAuthenticationTokenInvalid` | 自定义消息 |
+
+#### 4.5.2 DisplayException 与 HttpException 边界对比
+
+| 特性 | `DisplayException` | `HttpException` (reCAPTCHA) |
+|------|-------------------|-----------------------------|
+| 状态码 | 400 | 400 |
+| 错误码字段 | `DisplayException` | `HttpException` |
+| 渲染方式 | 自定义 `render()` 方法 | `Handler::convertExceptionToArray()` |
+| Web 响应 | 重定向 + 闪存消息 | 标准错误页 |
+| JSON 响应 | `Handler::toArray()` 格式 | `Handler::convertExceptionToArray()` 格式 |
+| 是否报告 | 仅当有 previous 异常时 | 否（在 `$dontReport` 中） |
+| 触发审计事件 | 否（由调用方触发） | 是（`FailedCaptcha` 事件） |
+
+#### 4.5.3 错误响应格式统一
+
+**两者最终都通过 `Handler::convertExceptionToArray()` 渲染** (`app/Exceptions/Handler.php:190-231`):
+
+```json
+{
+    "errors": [
+        {
+            "code": "DisplayException",
+            "status": "400",
+            "detail": "The two-factor authentication token was invalid."
+        }
+    ]
+}
+```
+
+```json
+{
+    "errors": [
+        {
+            "code": "HttpException",
+            "status": "400",
+            "detail": "Failed to validate reCAPTCHA data."
+        }
+    ]
+}
+```
+
+**关键边界区分**: 前端通过 `code` 字段区分错误类型，而非状态码。
+
+---
+
+## 5. 登录认证流程深度分析
+
+### 5.1 主登录控制器
 
 **文件**: `app/Http/Controllers/Auth/LoginController.php:32-74`
 
 ```php
 public function login(Request $request): JsonResponse
 {
-    // 1. 登录限流检查
+    // 1. 应用层限流检查（第二级，3次/2分钟）
     if ($this->hasTooManyLoginAttempts($request)) {
         $this->fireLockoutEvent($request);
         $this->sendLockoutResponse($request);
@@ -340,7 +667,7 @@ public function login(Request $request): JsonResponse
 - **确认令牌有效期**: 5分钟，防止令牌被滥用
 - **防时序攻击**: 使用 `hash_equals` 进行令牌比较
 
-### 4.2 登录请求验证
+### 5.2 登录请求验证
 
 **文件**: `app/Http/Requests/Auth/LoginRequest.php:14-20`
 
@@ -354,7 +681,7 @@ public function rules(): array
 }
 ```
 
-### 4.3 登录限流配置
+### 5.3 登录限流配置
 
 **文件**: `config/auth.php:15-18`
 
@@ -367,9 +694,9 @@ public function rules(): array
 
 ---
 
-## 5. 两步验证（MFA）协同机制
+## 6. 两步验证（MFA）协同机制
 
-### 5.1 TOTP 检查点控制器
+### 6.1 TOTP 检查点控制器
 
 **文件**: `app/Http/Controllers/Auth/LoginCheckpointController.php:44-95`
 
@@ -428,7 +755,7 @@ public function __invoke(LoginCheckpointRequest $request): JsonResponse
 }
 ```
 
-### 5.2 检查点请求验证
+### 6.2 检查点请求验证
 
 **文件**: `app/Http/Requests/Auth/LoginCheckpointRequest.php:21-40`
 
@@ -457,7 +784,7 @@ public function rules(): array
 
 > **设计要点**: `authentication_code` 和 `recovery_token` 二选一必填，支持两种验证方式。
 
-### 5.3 恢复码机制
+### 6.3 恢复码机制
 
 **文件**: `app/Http/Controllers/Auth/LoginCheckpointController.php:103-114`
 
@@ -479,7 +806,7 @@ protected function isValidRecoveryToken(User $user, string $value): bool
 - 使用 `password_hash` 存储（哈希后不可逆向）
 - 每个恢复码使用后立即删除（一次性）
 
-### 5.4 会话数据有效性验证
+### 6.4 会话数据有效性验证
 
 **文件**: `app/Http/Controllers/Auth/LoginCheckpointController.php:121-142`
 
@@ -505,9 +832,9 @@ protected function hasValidSessionData(?array $data): bool
 
 ---
 
-## 6. 会话管理与续期机制
+## 7. 会话管理与续期机制
 
-### 6.1 会话配置
+### 7.1 会话配置
 
 **文件**: `config/session.php`
 
@@ -521,7 +848,7 @@ protected function hasValidSessionData(?array $data): bool
 | `same_site` | `lax` | 跨站请求保护 |
 | `secure` | `env(...)` | HTTPS-only（根据环境配置） |
 
-### 6.2 登录成功后的会话处理
+### 7.2 登录成功后的会话处理
 
 **文件**: `app/Http/Controllers/Auth/AbstractLoginController.php:73-91`
 
@@ -558,7 +885,7 @@ protected function sendLoginResponse(User $user, Request $request): JsonResponse
 - **记住我**: `login($user, true)` 设置长期会话Cookie
 - **即时清理**: 认证令牌一次性使用，立即从会话中移除
 
-### 6.3 会话续期机制
+### 7.3 会话续期机制
 
 Laravel 会话的自动续期逻辑：
 1. 每次请求时检查会话是否接近过期
@@ -569,9 +896,9 @@ Laravel 会话的自动续期逻辑：
 
 ---
 
-## 7. 错误反馈机制
+## 8. 错误反馈机制
 
-### 7.1 异常处理流程
+### 8.1 异常处理流程
 
 **文件**: `app/Exceptions/DisplayException.php:50-59`
 
@@ -587,7 +914,7 @@ public function render(Request $request): JsonResponse|RedirectResponse
 }
 ```
 
-### 7.2 错误消息国际化
+### 8.2 错误消息国际化
 
 **文件**: `resources/lang/en/auth.php`
 
@@ -599,7 +926,7 @@ public function render(Request $request): JsonResponse|RedirectResponse
 'throttle' => 'Too many login attempts. Please try again in :seconds seconds.',
 ```
 
-### 7.3 错误响应格式（JSONAPI）
+### 8.3 错误响应格式（JSONAPI）
 
 **文件**: `app/Exceptions/Handler.php:190-231`
 
@@ -615,7 +942,7 @@ public function render(Request $request): JsonResponse|RedirectResponse
 }
 ```
 
-### 7.4 登录失败响应
+### 8.4 登录失败响应
 
 **文件**: `app/Http/Controllers/Auth/AbstractLoginController.php:56-68`
 
@@ -637,9 +964,9 @@ protected function sendFailedLoginResponse(Request $request, ?Authenticatable $u
 
 ---
 
-## 8. 事件监听与审计追踪
+## 9. 事件监听与审计追踪
 
-### 8.1 事件系统架构
+### 9.1 事件系统架构
 
 **文件**: `app/Providers/EventServiceProvider.php:29-33`
 
@@ -651,7 +978,7 @@ protected $subscribe = [
 ];
 ```
 
-### 8.2 认证事件监听
+### 9.2 认证事件监听
 
 **文件**: `app/Listeners/AuthenticationListener.php:18-32`
 
@@ -673,7 +1000,7 @@ public function login(Failed|DirectLogin $event): void
 }
 ```
 
-### 8.3 两步验证事件监听
+### 9.3 两步验证事件监听
 
 **文件**: `app/Listeners/TwoFactorListener.php:12-18`
 
@@ -687,7 +1014,7 @@ public function __invoke(ProvidedAuthenticationToken $event): void
 }
 ```
 
-### 8.4 事件类定义
+### 9.4 事件类定义
 
 **文件**: `app/Events/Auth/`
 
@@ -697,7 +1024,7 @@ public function __invoke(ProvidedAuthenticationToken $event): void
 | `ProvidedAuthenticationToken` | TOTP/恢复码验证成功 |
 | `Failed` | 登录失败（Laravel内置） |
 
-### 8.5 审计活动日志
+### 9.5 审计活动日志
 
 系统使用 `Activity` Facade 记录所有安全相关事件：
 - `auth:success` - 登录成功
@@ -709,9 +1036,9 @@ public function __invoke(ProvidedAuthenticationToken $event): void
 
 ---
 
-## 9. 前端交互流程
+## 10. 前端交互流程
 
-### 9.1 登录API调用
+### 10.1 登录API调用
 
 **文件**: `resources/scripts/api/auth/login.ts`
 
@@ -738,7 +1065,7 @@ export default ({ username, password, recaptchaData }: LoginData): Promise<Login
 };
 ```
 
-### 9.2 检查点API调用
+### 10.2 检查点API调用
 
 **文件**: `resources/scripts/api/auth/loginCheckpoint.ts`
 
@@ -759,7 +1086,7 @@ export default (token: string, code: string, recoveryToken?: string): Promise<Lo
 };
 ```
 
-### 9.3 前端登录容器
+### 10.3 前端登录容器
 
 **文件**: `resources/scripts/components/auth/LoginContainer.tsx:46-64`
 
@@ -782,7 +1109,7 @@ login({ ...values, recaptchaData: token })
     });
 ```
 
-### 9.4 前端检查点容器
+### 10.4 前端检查点容器
 
 **文件**: `resources/scripts/components/auth/LoginCheckpointContainer.tsx:100-111`
 
@@ -804,33 +1131,33 @@ export default ({ history, location, ...props }: OwnProps) => {
 
 ---
 
-## 10. 安全防护机制
+## 11. 安全防护机制
 
-### 10.1 CSRF 保护
+### 11.1 CSRF 保护
 
 **文件**: `app/Http/Middleware/VerifyCsrfToken.php`
 - 除 `remote/*` 和 `daemon/*` 外，所有请求验证CSRF令牌
 - 前端通过 `/sanctum/csrf-cookie` 预获取CSRF Cookie
 
-### 10.2 reCAPTCHA 保护
+### 11.2 reCAPTCHA 保护
 
 **路由**: `routes/auth.php:27`
 ```php
 Route::post('/login', [Auth\LoginController::class, 'login'])->middleware('recaptcha');
 ```
 
-### 10.3 TOTP 密钥加密存储
+### 11.3 TOTP 密钥加密存储
 
 **迁移文件**: `database/migrations/2017_11_11_161922_Add2FaLastAuthorizationTimeColumn.php:22-33`
 - TOTP密钥使用 Laravel 加密器加密存储
 - 从明文迁移到加密存储时有数据迁移脚本
 
-### 10.4 密码哈希
+### 11.4 密码哈希
 
 - 使用 PHP 原生 `password_hash()` / `password_verify()`
 - 算法由 Laravel 配置决定（默认 bcrypt）
 
-### 10.5 防重放攻击
+### 11.5 防重放攻击
 
 **实现**: `LoginCheckpointController.php:74-83`
 - 记录 `totp_authenticated_at` 时间戳
@@ -839,9 +1166,9 @@ Route::post('/login', [Auth\LoginController::class, 'login'])->middleware('recap
 
 ---
 
-## 11. 2FA 启用/禁用流程
+## 12. 2FA 启用/禁用流程
 
-### 11.1 2FA 设置服务
+### 12.1 2FA 设置服务
 
 **文件**: `app/Services/Users/TwoFactorSetupService.php:32-58`
 
@@ -872,7 +1199,7 @@ public function handle(User $user): array
 }
 ```
 
-### 11.2 2FA 启用/禁用切换
+### 12.2 2FA 启用/禁用切换
 
 **文件**: `app/Services/Users/ToggleTwoFactorService.php:38-88`
 
@@ -918,9 +1245,9 @@ public function handle(User $user, string $token, ?bool $toggleState = null): ar
 
 ---
 
-## 12. 关键代码位置索引
+## 13. 关键代码位置索引
 
-### 12.1 认证链路核心代码
+### 13.1 认证链路核心代码
 
 | 功能模块 | 文件路径 | 关键行号 |
 |----------|----------|----------|
@@ -940,7 +1267,7 @@ public function handle(User $user, string $token, ?bool $toggleState = null): ar
 | 前端登录组件 | `resources/scripts/components/auth/LoginContainer.tsx` | 1-116 |
 | 前端检查点组件 | `resources/scripts/components/auth/LoginCheckpointContainer.tsx` | 1-112 |
 
-### 12.2 external_id 相关代码
+### 13.2 external_id 相关代码
 
 | 功能模块 | 文件路径 | 关键行号 |
 |----------|----------|----------|
@@ -958,7 +1285,7 @@ public function handle(User $user, string $token, ?bool $toggleState = null): ar
 | 基础模型验证规则 | `app/Models\Model.php` | 118-143 |
 | Repository 基类 | `app/Repositories\Eloquent\EloquentRepository.php` | 76-89, 160-179 |
 
-### 12.3 数据库迁移时间线
+### 13.3 数据库迁移时间线
 
 | 迁移文件 | 变更内容 |
 |----------|----------|
@@ -970,11 +1297,11 @@ public function handle(User $user, string $token, ?bool $toggleState = null): ar
 
 ---
 
-## 13. OAuth 集成扩展建议
+## 14. OAuth 集成扩展建议
 
 当前系统未实现完整的 OAuth 登录流程，但架构上预留了扩展点。如需添加 OAuth 支持，建议：
 
-### 13.1 扩展方案
+### 14.1 扩展方案
 
 1. **安装 Laravel Socialite**: 提供 OAuth 驱动支持
 2. **添加 OAuth 路由**: `/auth/{provider}`, `/auth/{provider}/callback`
@@ -985,7 +1312,7 @@ public function handle(User $user, string $token, ?bool $toggleState = null): ar
    - 绑定成功后更新 `external_id` 字段
 5. **2FA 强制检查**: OAuth 登录成功后仍需检查本地 2FA 状态
 
-### 13.2 安全注意事项
+### 14.2 安全注意事项
 
 - OAuth 回调必须验证 `state` 参数防止 CSRF
 - 外部身份提供商的用户邮箱必须验证
@@ -1007,8 +1334,8 @@ $table->unsignedInteger('external_id')->after('id')->nullable()->unique();
 ```
 
 **约束**:
-- 类型：`unsignedInteger`（无符号整数
-- 约束：`nullable + unique 唯一索引
+- 类型：`unsignedInteger`（无符号整数）
+- 约束：`nullable + unique` 唯一索引
 - 设计意图：与 Whmcs 等计费系统的用户ID（整数类型）建立一一映射
 
 #### 15.1.2 阶段二：类型扩展（2018-02-04）
@@ -1082,7 +1409,7 @@ $table->index(['external_id']);  // 注意：是 index，不是 unique
 $user = User::query()->where('external_id', $external_id)->firstOrFail();
 ```
 
-> **风险点 2：数据歧义
+> **风险点 2：数据歧义**
 > 当存在重复 `external_id` 时：
 > - `firstOrFail()` 只返回第一个匹配的用户
 > - 返回哪个用户取决于数据库的返回顺序（通常是主键升序）
@@ -1091,7 +1418,7 @@ $user = User::query()->where('external_id', $external_id)->firstOrFail();
 
 #### 15.2.3 空值（NULL）的特殊处理
 
-**验证规则中的 `nullable` + `unique` 组合：
+**验证规则中的 `nullable` + `unique` 组合**：
 - 在 SQL 标准中，`NULL != NULL`，所以多个 NULL 值不违反 UNIQUE 约束
 - 但在应用层验证中，`nullable` 意味着空值跳过 `unique` 检查
 - 多个用户的 `external_id` 为 NULL 是合法的
@@ -1115,13 +1442,13 @@ DB::table('users')->where('external_id', '=', 'NULL')->update([
 
 ### 15.3 风险缓解建议
 
-1. **数据库层恢复唯一约束（如果业务允许）
+1. **数据库层恢复唯一约束（如果业务允许）**
 ```php
 // 在迁移中添加：
 $table->unique(['external_id']);
 ```
 
-2. **并发安全处理
+2. **并发安全处理**
 ```php
 // 使用事务 + 排他锁
 DB::transaction(function () use ($external_id) {
@@ -1137,7 +1464,7 @@ DB::transaction(function () use ($external_id) {
 });
 ```
 
-3. **定期数据巡检
+3. **定期数据巡检**
 ```sql
 -- 检测重复 external_id
 SELECT external_id, COUNT(*) as cnt 
@@ -1184,7 +1511,7 @@ protected function getField(?string $input = null): string
 $user = User::query()->where($this->getField($username), $username)->firstOrFail();
 ```
 
-> **边界确认 1：登录不使用 external_id
+> **边界确认 1：登录不使用 external_id**
 > - 仅支持 `username` 或 `email` 两种登录
 > - `external_id` **不能** 用于登录
 > - 即使 `external_id` 重复，也不影响登录安全
@@ -1201,7 +1528,7 @@ $user = User::query()->where($this->getField($username), $username)->firstOrFail
 $user = User::query()->findOrFail($details['user_id']);
 ```
 
-> **边界确认 2：2FA 检查点不接触 external_id
+> **边界确认 2：2FA 检查点不接触 external_id**
 > - 检查点通过 `auth_confirmation_token` 中的 `user_id` 查找用户
 > - 不涉及 `external_id` 无交集
 > - `external_id` 重复不会导致检查点逻辑
@@ -1214,11 +1541,11 @@ $user = User::query()->findOrFail($details['user_id']);
 ```php
 protected function throttleKey(Request $request)
 {
-    return Str::lower($request->input($this->username()) . '|' . $request->ip();
+    return Str::lower($request->input($this->username()) . '|' . $request->ip());
 }
 ```
 
-> **边界确认 3：限流基于 username + IP
+> **边界确认 3：限流基于 username + IP**
 > - 限流键 = `strtolower(username) + '|' + ip_address`
 > - 不涉及 `external_id`
 > - `external_id` 重复不会影响限流策略
@@ -1245,7 +1572,7 @@ Route::post('/login', [Auth\LoginController::class, 'login'])->middleware('recap
 Route::post('/login/checkpoint', Auth\LoginCheckpointController::class)->name('auth.login-checkpoint');
 ```
 
-> **边界确认 4：验证码仅保护主登录
+> **边界确认 4：验证码仅保护主登录**
 > - ✅ `/auth/login` 有 `recaptcha` 中间件
 > - ❌ `/auth/login/checkpoint` **无** 验证码保护
 > - ❌ `external_id` 相关 API 也无验证码
@@ -1266,7 +1593,7 @@ Route::post('/login/checkpoint', Auth\LoginCheckpointController::class)->name('a
 
 Application API 的 `external_id` 相关端点：
 - ✅ 有 API 密钥认证
-- ❌ 无专门的速率限制（取决于 API 整体配置
+- ❌ 无专门的速率限制（取决于 API 整体配置）
 - ❌ 无验证码
 - 风险：如果 API 密钥泄露，攻击者可枚举 `external_id` 批量查询用户
 
@@ -1289,15 +1616,15 @@ OAuth 成功 → 获取 external_id → 匹配用户
 
 ### 16.7 边界安全设计优点
 
-1. **隔离原则：
+1. **隔离原则**：
    - 外部身份标识（external_id）与本地认证完全解耦
    - 外部系统问题不会直接影响认证安全
 
-2. **深度防御：
+2. **深度防御**：
    - 即使 `external_id` 重复，登录、2FA、限流均不受影响
    - 本地密码仍是认证的最终凭据
 
-3. **最小权限：
+3. **最小权限**：
    - 管理后台无法修改 `external_id`，防止管理员越权操作
    - Client API 无法读取 `external_id`，防止信息泄露
 
@@ -1315,7 +1642,7 @@ OAuth 成功 → 获取 external_id → 匹配用户
 
 ### 17.1 本次深度分析关键发现
 
-**external_id 主线分析结论：
+**external_id 主线分析结论**：
 
 1. **写入路径**：仅 Application API 可写入，管理后台完全隔离
 2. **读取路径**：Application API 完整可见，Client API 不可见
@@ -1337,6 +1664,6 @@ OAuth 成功 → 获取 external_id → 匹配用户
 
 3. **低优先级**：
 - 补充 `external_id` 变更的审计日志
-- 完善 `external_id` 格式验证（根据实际集成的外部系统规范
+- 完善 `external_id` 格式验证（根据实际集成的外部系统规范）
 
 整体设计遵循了安全最佳实践，特别是 **密码验证前置防止账号枚举**、**TOTP防重放攻击**、**恢复码一次性使用**、**external_id 与认证链路隔离** 等设计亮点。
