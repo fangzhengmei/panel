@@ -406,20 +406,150 @@ $valid = $transfer
 | 迁移失败 | `server_transfers.successful` | `false` |
 | 已归档 | `server_transfers.archived` | `true` |
 
-**⚠️ 易出错点 6：服务器状态无 `transferring` 标记**
+**⚠️ 易出错点 6：服务器 `status` 字段无 `transferring` 标记（但有多重提示链路）
 
-- 服务器 `status` 字段没有 `transferring` 状态，迁移期间服务器状态保持原值（可能是 `null` 或 `suspended`）
-- 用户界面上看不到"迁移中"状态提示
-- `ServerDetailsController::resetState()` [`app/Http/Controllers/Api/Remote/Servers/ServerDetailsController.php:128`] 只清理 `installing` 和 `restoring_backup` 状态，**不处理迁移状态**
+- 服务器 `status` 字段确实没有 `transferring` 状态常量，迁移期间服务器 `status` 字段保持原值（可能是 `null` 或 `suspended`）。但**用户界面上有完整的"迁移中"提示**，通过独立的 `is_transferring` 字段触发。
 
+---
+
+### ✅ 事实修正：迁移期间用户可见提示完整链路
+
+#### 7.2.1 提示触发源
+
+**后端 API 字段 `is_transferring`** [`app/Transformers/Api/Client/ServerTransformer.php:81`
+```php
+'is_transferring' => !is_null($server->transfer),
+```
+
+> **触发条件：** 由 `server_transfers.successful IS NULL` 触发（通过 `$server->transfer` 关联查询），而非 `servers.status` 字段。
+
+#### 7.2.2 三重用户提示界面
+
+**1. **管理员界面提示** [`resources/views/admin/servers/view/manage.blade.php:118-135`]
+```blade
+@else
+    <div class="col-sm-4">
+        <div class="box box-success">
+            <div class="box-header with-border">
+                <h3 class="box-title">Transfer Server</h3>
+            </div>
+            <div class="box-body">
+                <p>
+                    This server is currently being transferred to another node.
+                    Transfer was initiated at <strong>{{ $server->transfer->created_at }}</strong>
+                </p>
+            </div>
+            <div class="box-footer">
+                <button class="btn btn-success disabled">Transfer Server</button>
+            </div>
+        </div>
+    </div>
+@endif
+```
+> **显示内容：** 迁移启动时间 + 禁用的操作按钮（Transfer 和 Suspend 按钮均禁用）
+> **触发条件：** `!is_null($server->transfer)`
+
+**2. 客户端全屏阻挡提示** [`resources/scripts/components/server/ConflictStateRenderer.tsx:33-42`
+```tsx
+) : (
+    <ScreenBlock
+        title={isTransferring ? 'Transferring' : 'Restoring from Backup'}
+        image={ServerRestoreSvg}
+        message={
+            isTransferring
+                ? 'Your server is being transferred to a new node, please check back later.'
+                : 'Your server is currently being restored from a backup, please check back in a few minutes.'
+        }
+    />
+);
+```
+> **显示效果：** 整个服务器控制台、文件管理、设置等所有功能页均被全屏阻挡，用户只能看到 "Transferring" 提示
+> **触发优先级：** 低于 `installing`/`suspended`/`node maintenance`，但高于 `restoring_backup`
+
+**3. Websocket 实时状态同步** [`resources/scripts/components/server/TransferListener.tsx:11-27`
+```tsx
+useWebsocketEvent(SocketEvent.TRANSFER_STATUS, (status: string) => {
+    if (status === 'pending' || status === 'processing') {
+        setServerFromState((s) => ({ ...s, isTransferring: true });
+        return;
+    }
+    if (status === 'failed') {
+        setServerFromState((s) => ({ ...s, isTransferring: false });
+        return;
+    }
+    if (status !== 'completed') {
+        return;
+    }
+    getServer(uuid).catch((error) => console.error(error));
+});
+```
+> **实时事件：** `TRANSFER_STATUS` 事件（`pending`/`processing`/`failed`/`completed`）
+> **效果：`completed` 时自动刷新服务器数据（节点和分配已更新）
+
+**4. 控制台迁移日志** [`resources/scripts/components/server/console/Console.tsx:174-184`
+```tsx
+const listeners: Record<string, (s: string) => void> = {
+    [SocketEvent.TRANSFER_LOGS]: handleConsoleOutput,
+    [SocketEvent.TRANSFER_STATUS]: handleTransferStatus,
+    ...
+};
+// 迁移时不清空控制台
+if (!isTransferring) {
+    terminal.clear();
+}
+```
+> **效果：`TRANSFER_LOGS` 事件将迁移进度输出到终端
+> **失败提示：`failure 状态时输出 "Transfer has failed."
+
+---
+
+#### 7.2.3 API 访问限制对提示链路
+
+**中间件拦截逻辑** [`app/Http/Middleware/Api/Client/Server/AuthenticateServerAccess.php:49-62`
+```php
+try {
+    $server->validateCurrentState();
+} catch (ServerStateConflictException $exception) {
+    // 仍允许用户查看服务器基本信息
+    if (!$request->routeIs('api:client:server.view')) {
+        if (($server->isSuspended() || $server->node->isUnderMaintenance()) && !$request->routeIs('api:client:server.resources')) {
+            throw $exception;
+        }
+        if (!$user->root_admin || !$request->routeIs($this->except)) {
+            throw $exception;
+        }
+    }
+}
+```
+> **限制规则：**
+> - 迁移期间，只有 `view` API 可访问（用于显示提示页面）
+> - 其他 API 均被拦截（409 Conflict 错误
+> - root_admin 可访问 websocket（`api:client:server.ws`）
+
+---
+
+#### 7.2.4 提示信号对故障排查的影响
+
+| 用户视角 | 管理员视角 | 故障影响
+---------|-----------|--------
+✅ 明确知道"迁移中" | ✅ 知道迁移中 + 启动时间 | 都无法判断迁移进度 |
+❌ 看不到进度百分比/错误细节 | ❌ 看不到进度/错误 | 无法区分"正常进行中" vs "已卡住" |
+❌ 无法操作任何功能 | ❌ 无法暂停/删除/重新迁移 | 僵尸迁移时完全无计可施 |
+❌ 无法估算完成时间 | ❌ 无法估算完成时间 | 只能通过数据库 `created_at` 字段判断 |
+| | ❌ 无手动中止按钮 | ❌ 无手动中止按钮 | 必须手动修改数据库才能恢复 |
+
+**僵尸迁移判断难点：
+1. 用户和管理员都只能看到静态的 "Transferring" 提示
+2. 没有超时自动解除机制
+3. 没有进度条或日志输出（除非用户打开控制台且 websocket 连接）
+4. `resetState()` 接口 [`app/Http/Controllers/Api/Remote/Servers/ServerDetailsController.php:128` 只清理 `installing` 和 `restoring_backup` 状态，**不处理迁移状态**：
 ```php
 // resetState() 只重置以下状态，不处理迁移中的服务器
 Server::query()->where('node_id', $node->id)
     ->whereIn('status', [Server::STATUS_INSTALLING, Server::STATUS_RESTORING_BACKUP])
     ->update(['status' => null]);
 ```
-
-**风险：** 如果目标节点重启并调用 `resetState()`，迁移中的服务器状态不会被重置，可能导致"僵尸迁移"。
+> **风险：** 如果目标节点重启并调用 `resetState()`，迁移中的服务器状态不会被重置，可能导致"永久僵尸迁移"。
 
 **⚠️ 易出错点 7：`archived` 字段未被使用**
 
@@ -454,7 +584,10 @@ Server::query()->where('node_id', $node->id)
 - 属于"向前恢复"而非"向后回滚"
 
 ### 第四层：状态封锁
-- 迁移期间服务器状态为"迁移中"，禁止其他状态变更
+- 迁移期间通过 `is_transferring` 字段（由 `!is_null($server->transfer)` 计算）触发完整的功能封锁
+- **管理员界面：** Transfer 和 Suspend 按钮禁用，显示迁移启动时间
+- **客户端界面：** `ConflictStateRenderer` 全屏阻挡所有功能页
+- **API 中间件：** `AuthenticateServerAccess` 只允许 `view` API 通过，其他均返回 409 Conflict
 - 防止用户在迁移过程中执行暂停、删除等操作
 
 ### 第五层：双向失败报告
@@ -690,7 +823,7 @@ Activity::event('server:transfer.failed')
     ->property('error', $errorMessage)
     ->log();
 
-// 在 resetState() 中增加迁移状态清理
+// 在 resetState() 中增加迁移状态清理（修复：此前只清理 installing 和 restoring_backup）
 Server::query()->where('node_id', $node->id)
     ->whereHas('transfer', function ($query) {
         $query->whereNull('successful')
@@ -700,7 +833,7 @@ Server::query()->where('node_id', $node->id)
         $transfer = $server->transfer;
         $transfer->update(['successful' => false]);
         
-        // 释放预占端口
+        // 释放预占端口（增加安全边界校验）
         Allocation::query()
             ->whereIn('id', array_merge(
                 [$transfer->new_allocation], 
@@ -714,6 +847,15 @@ Server::query()->where('node_id', $node->id)
             ->subject($server)
             ->log();
     });
+
+// 【补充】在客户端提示页增加更多诊断信息
+// 在 ConflictStateRenderer.tsx 中显示迁移已用时间：
+const transferElapsed = useMemo(() => {
+    if (!server?.transferStartedAt) return null;
+    const elapsed = Date.now() - new Date(server.transferStartedAt).getTime();
+    const minutes = Math.floor(elapsed / 60000);
+    return minutes > 5 ? `(已耗时 ${minutes} 分钟)` : null;
+}, [server?.transferStartedAt]);
 ```
 
 ---
@@ -736,9 +878,24 @@ Server::query()->where('node_id', $node->id)
 | 3 | 失败回滚时端口释放缺少安全边界校验 | `ServerTransferController.php:123-124` | 🔴 高 | 建议 5 |
 | 4 | 成功回调更新顺序错误，存在不一致窗口 | `ServerTransferController.php:81-96` | 🔴 高 | 建议 6 |
 | 5 | 迁移全流程无审计日志 | 全局 | 🟠 中 | 建议 7 |
-| 6 | 服务器状态无 `transferring` 标记 | `Server.php` status 常量 | 🟡 低 | 建议 7 |
+| 6 | `servers.status` 字段无 `transferring` 状态（虽有 `is_transferring` 字段但 `resetState()` 不清理） | `Server.php` status 常量 + `ServerDetailsController.php:128` | 🟠 中 | 建议 7 |
 | 7 | `archived` 字段设计但未被使用 | `ServerTransfer.php` | 🟡 低 | 建议 6 |
 | 8 | 僵尸迁移无超时清理机制 | 全局 | 🔴 高 | 建议 2、7 |
+
+---
+
+### 事实修正说明
+
+**已修正的错误：
+
+❌ **此前错误："用户界面上看不到迁移中状态提示"
+✅ **事实：有多重提示链路，通过 `is_transferring` 字段触发四重提示：
+1. 管理员管理页显示迁移启动时间，按钮禁用
+2. 客户端全屏阻挡 "Transferring" 页面
+3. Websocket 实时状态更新
+4. 控制台迁移日志输出
+
+**状态驱动字段：`is_transferring`（由 `!is_null($server->transfer)` 计算得出，独立于 `servers.status` 字段
 
 ### 核心文件索引
 | 模块 | 文件路径 | 关键行 |
@@ -752,3 +909,10 @@ Server::query()->where('node_id', $node->id)
 | 资源检查 | `app/Models/Node.php` | 242 |
 | 节点重置 | `app/Http/Controllers/Api/Remote/Servers/ServerDetailsController.php` | 89 |
 | 构建修改（参考） | `app/Services/Servers/BuildModificationService.php` | 33 |
+| **API 字段转换** | `app/Transformers/Api/Client/ServerTransformer.php` | 81 |
+| **API 访问拦截** | `app/Http/Middleware/Api/Client/Server/AuthenticateServerAccess.php` | 49 |
+| **Admin 迁移提示** | `resources/views/admin/servers/view/manage.blade.php` | 118 |
+| **客户端阻挡页** | `resources/scripts/components/server/ConflictStateRenderer.tsx` | 33 |
+| **迁移状态监听** | `resources/scripts/components/server/TransferListener.tsx` | 11 |
+| **控制台迁移日志** | `resources/scripts/components/server/console/Console.tsx` | 174 |
+| **事件枚举** | `resources/scripts/components/server/events.ts` | 10 |
