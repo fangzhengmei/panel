@@ -589,16 +589,35 @@ useWebsocketEvent(SocketEvent.TRANSFER_STATUS, (status: string) => {
 });
 ```
 
-**⚠️ 一致性问题 1：状态词枚举仅存在于前端**
+**⚠️ 一致性问题 1：状态词枚举仅存在于前端，后端 Panel 不定义不校验**
+
+**✅ 事实修正：Transfer Status 状态词的来源边界**
+
+| 系统边界 | 状态词定义 | 处理逻辑 | 可见性 |
+|---------|-----------|---------|--------|
+| **Wings 守护节点** | ✅ 定义并发送 | 迁移过程中发送 `transfer status` 和 `transfer logs` 事件 | 状态词真实来源 |
+| **Panel 后端** | ❌ 无常量定义 ❌ 不校验 | 仅做 Websocket 透明转发，不解析、不校验状态词 | 对 Panel 完全不可见 |
+| **前端 TypeScript** | ✅ 硬编码 `pending`/`processing`/`failed`/`completed` | 根据状态词更新 UI 状态 | 唯一的消费端 |
+
+**状态词流转路径：**
+```
+Wings 节点 → [Websocket 通道] → Panel 后端（透明转发）→ [Websocket 通道] → 前端浏览器
+```
+
+**Panel 后端的角色：**
+- Panel 不发送任何 `TRANSFER_STATUS` 或 `TRANSFER_LOGS` 事件
+- Panel 仅作为 Websocket 代理，转发 Wings 节点和前端之间的消息
+- 后端 PHP 代码中**不存在**任何地方发送这些事件或定义这些状态词
+- 这是一个跨系统协议约定，状态词契约由 Wings 节点定义
 
 | 状态词 | 前端处理逻辑 | 后端 PHP 定义 | Wings 节点发送 |
 |--------|-------------|---------------|---------------|
-| `pending` | ✅ `isTransferring = true` | ❌ 无常量定义 | ⚠️ 未在 Panel 代码中找到发送逻辑 |
-| `processing` | ✅ `isTransferring = true` | ❌ 无常量定义 | ⚠️ 未在 Panel 代码中找到发送逻辑 |
-| `failed` | ✅ `isTransferring = false` | ❌ 无常量定义 | ⚠️ 未在 Panel 代码中找到发送逻辑 |
-| `completed` | ✅ 刷新服务器数据 | ❌ 无常量定义 | ⚠️ 未在 Panel 代码中找到发送逻辑 |
+| `pending` | ✅ `isTransferring = true` | ❌ 无 | ✅ Wings 定义并发送 |
+| `processing` | ✅ `isTransferring = true` | ❌ 无 | ✅ Wings 定义并发送 |
+| `failed` | ✅ `isTransferring = false` | ❌ 无 | ✅ Wings 定义并发送 |
+| `completed` | ✅ 刷新服务器数据 | ❌ 无 | ✅ Wings 定义并发送 |
 
-> **风险：** 状态词硬编码在前端 TypeScript 中，后端 PHP 无对应常量，Wings 节点发送的状态词如果拼写错误（如 `fail` vs `failed`），前端会静默忽略，导致 UI 永远卡在"迁移中"。
+> **风险：** 状态词硬编码在前端 TypeScript 中，与 Wings 节点形成隐式契约。如果 Wings 发送的状态词拼写错误（如 `fail` vs `failed`）或新增状态词，前端会静默忽略，导致 UI 永远卡在"迁移中"。由于 Panel 不参与校验，无法在后端层面发现此类不兼容问题。
 
 #### 8.1.2 各状态触发的界面和连接动作
 
@@ -662,9 +681,37 @@ const listeners: Record<string, (s: string) => void> = {
 1. 管理员在迁移期间可以点击"Unsuspend Server"按钮
 2. 表单提交到 `manageSuspension()` 控制器
 3. 后端 `SuspensionService::toggle()` 检查到 `!is_null($server->transfer)`，抛出 `ConflictHttpException`
-4. 用户看到 500 错误页面，而非友好提示
 
-> **体验缺陷：** 前端应该在 UI 层面就禁用按钮，避免用户点击后看到错误页面。
+**✅ 事实修正：返回语义不是 500 错误，而是 409 Conflict 错误页面**
+
+**异常类层次与错误分层：**
+
+| 异常类 | 继承关系 | 状态码 | 错误类型 |
+|--------|---------|--------|---------|
+| `ConflictHttpException` | extends `HttpException` | 409 | 语义冲突（可预期的业务错误） |
+| `ServerStateConflictException` | extends `ConflictHttpException` | 409 | 服务器状态冲突 |
+| 通用未捕获异常 | - | 500 | 系统内部错误（不可预期） |
+
+**异常处理流程：** [`app/Exceptions/Handler.php:124-142`]
+```php
+public function render($request, \Throwable $e): Response
+{
+    // 如果在事务中，回滚到起点
+    if ($connections->transactionLevel()) {
+        $connections->rollBack(0);
+    }
+    
+    return parent::render($request, $e);  // Laravel 基础异常渲染
+}
+```
+
+**Laravel 渲染逻辑：**
+- `HttpExceptionInterface` 类型的异常会根据 `getStatusCode()` 返回对应 HTTP 状态码
+- `ConflictHttpException` 的 `getStatusCode()` 返回 409
+- 对于 Admin Web 路由（`Accept: text/html`），Laravel 渲染 `errors/409.blade.php` 或通用错误页面
+- 对于 API 路由（`Accept: application/json`），返回 JSON 格式错误，`status` 字段为 `"409"`
+
+> **体验缺陷：** 前端应该在 UI 层面就禁用按钮，避免用户点击后看到 409 错误页面。虽然 409 是语义正确的错误码，但用户体验不佳，应该从源头阻止误操作。
 
 #### 8.2.2 后端锁定的完整流程
 
@@ -706,30 +753,74 @@ public function toggle(Server $server, string $action = self::ACTION_SUSPEND): v
 
 | 缺陷 | 故障场景 | 排查困难 |
 |------|---------|---------|
-| 状态词无后端常量 | Wings 发送 `fail` 而非 `failed` | 前端静默忽略，无法区分"Wings 未发送" vs "状态词错误" |
-| `completed` 依赖 API 刷新 | API 请求超时或失败 | UI 永远显示迁移中，但实际已成功，用户困惑 |
-| 进度仅输出到控制台 | 用户未打开控制台页面 | 完全看不到迁移进度，无法判断是否卡住 |
-| 解暂停按钮不禁用 | 管理员误点击 | 看到 500 错误，误以为系统崩溃 |
-| 无迁移活动日志 | 迁移失败需要追溯 | 无法知道谁在何时发起了迁移，无审计轨迹 |
-| 无超时自动清理 | Wings 节点宕机 | 永久卡在迁移中，只能手动修改数据库 |
+| 状态词无 Panel 端校验 | Wings 发送 `fail` 而非 `failed` | 前端静默忽略，无法区分"Wings 未发送" vs "状态词错误" vs "网络丢包" |
+| `completed` 依赖 API 刷新 | API 请求超时或失败 | UI 永远显示迁移中，但实际已成功，用户困惑。需刷新页面才能恢复 |
+| 进度仅输出到控制台 | 用户未打开控制台页面 | 完全看不到迁移进度，无法判断是否卡住。管理员需登录数据库查询 `created_at` 估算 |
+| 解暂停按钮不禁用 | 管理员误点击 | 看到 409 错误页面（非 500），虽语义正确但体验不佳，可能误以为操作成功了 |
+| 无迁移活动日志 | 迁移失败需要追溯 | 无法知道谁在何时发起了迁移，无审计轨迹。对比备份/恢复操作都有日志 |
+| 无超时自动清理 | Wings 节点宕机 | 永久卡在迁移中，只能手动修改数据库。`resetState()` 不处理迁移状态 |
+| **Panel 不校验状态词** | Wings 版本升级变更状态词 | 跨版本不兼容问题无法在 Panel 层面被发现和告警 |
+
+**故障排查难点分析：**
+
+1. **状态词错误静默失败：** 由于 Panel 不校验状态词，Wings 发送的未知状态词会被前端 `if (status !== 'completed') { return; }` 等逻辑静默忽略，没有任何日志或告警。排查时无法判断是 Wings 未发送、发送了错误值、还是网络问题。
+
+2. **409 与 500 的错误分层：** `ConflictHttpException`（409）是可预期的业务冲突，`Handler.php` 中 `HttpException` 被列入 `$dontReport` 列表，不会记录到错误日志。如果管理员误点击解暂停按钮，不会留下错误日志，排查时无迹可寻。
+
+3. **跨系统契约不可见：** 状态词契约仅存在于 Wings 代码和前端硬编码中，Panel 作为中间转发层完全不可见。当 Wings 与 Panel 版本不匹配时，没有任何机制能够检测和报告这种不兼容。
 
 ---
 
 ### 8.4 可观测性优化建议
 
-#### 建议 8：统一状态词枚举（解决一致性问题 1）
+#### 建议 8：显式定义跨系统状态词契约（解决一致性问题 1）
+
+由于状态词由 Wings 节点定义、Panel 透明转发、前端消费，属于跨系统隐式契约。建议在 Panel 中显式定义状态词枚举，作为契约文档和校验边界：
 
 ```php
-// 在 app/Models/ServerTransfer.php 中新增常量
-public const STATUS_PENDING = 'pending';
-public const STATUS_PROCESSING = 'processing';
-public const STATUS_FAILED = 'failed';
-public const STATUS_COMPLETED = 'completed';
+// 在 app/Models/ServerTransfer.php 中新增常量，作为跨系统契约文档
+public const TRANSFER_STATUS_PENDING = 'pending';
+public const TRANSFER_STATUS_PROCESSING = 'processing';
+public const TRANSFER_STATUS_FAILED = 'failed';
+public const TRANSFER_STATUS_COMPLETED = 'completed';
+
+// 可选：在 Websocket 消息中间件中增加校验
+public function handle($request, Closure $next)
+{
+    $event = $request->input('event');
+    if ($event === 'transfer status') {
+        $status = $request->input('args.status');
+        $validStatuses = [
+            self::TRANSFER_STATUS_PENDING,
+            self::TRANSFER_STATUS_PROCESSING,
+            self::TRANSFER_STATUS_FAILED,
+            self::TRANSFER_STATUS_COMPLETED,
+        ];
+        if (!in_array($status, $validStatuses)) {
+            Log::warning('Invalid transfer status received from Wings', [
+                'status' => $status,
+                'server_uuid' => $request->input('server_uuid'),
+            ]);
+            // 可选择记录日志后继续转发，或直接拦截
+        }
+    }
+    return $next($request);
+}
 ```
 
 ```typescript
 // 在 resources/scripts/api/server/types.d.ts 中新增类型
 export type TransferStatus = 'pending' | 'processing' | 'failed' | 'completed';
+
+// 在 TransferListener.tsx 中增加未知状态日志
+useWebsocketEvent(SocketEvent.TRANSFER_STATUS, (status: string) => {
+    const validStatuses: TransferStatus[] = ['pending', 'processing', 'failed', 'completed'];
+    if (!validStatuses.includes(status as TransferStatus)) {
+        console.warn(`[TransferListener] Unknown transfer status received: ${status}`);
+        return;
+    }
+    // ... 原有处理逻辑
+});
 ```
 
 #### 建议 9：修复解暂停按钮禁用状态（解决 UI 不一致）
@@ -786,8 +877,9 @@ if (status === 'completed') {
 - 迁移期间通过 `is_transferring` 字段（由 `!is_null($server->transfer)` 计算）触发功能封锁
 - **管理员界面：** Transfer 和 Suspend 按钮禁用，但 **Unsuspend 按钮未禁用**（已知缺陷，见易出错点 12），显示迁移启动时间
 - **客户端界面：** `ConflictStateRenderer` 全屏阻挡所有功能页
-- **API 中间件：** `AuthenticateServerAccess` 只允许 `view` API 通过，其他均返回 409 Conflict
-- **后端 Service：** `SuspensionService::toggle()` 对 suspend 和 unsuspend 一视同仁，均抛出异常
+- **API 中间件：** `AuthenticateServerAccess` 只允许 `view` API 通过，其他均返回 409 Conflict 错误（非 500）
+- **后端 Service：** `SuspensionService::toggle()` 对 suspend 和 unsuspend 一视同仁，均抛出 `ConflictHttpException`（409）
+- **错误分层：** `HttpException` 类型异常被列入 `$dontReport` 列表，不会记录到错误日志
 - 防止用户在迁移过程中执行暂停、删除等操作
 
 ### 第五层：双向失败报告
@@ -1081,10 +1173,10 @@ const transferElapsed = useMemo(() => {
 | 6 | `servers.status` 字段无 `transferring` 状态（虽有 `is_transferring` 字段但 `resetState()` 不清理） | `Server.php` status 常量 + `ServerDetailsController.php:128` | 🟠 中 | 建议 7 |
 | 7 | `archived` 字段设计但未被使用 | `ServerTransfer.php` | 🟡 低 | 建议 6 |
 | 8 | 僵尸迁移无超时清理机制 | 全局 | 🔴 高 | 建议 2、7 |
-| 9 | **Transfer Status 状态词仅存在于前端，后端无统一常量** | `TransferListener.tsx:11-27` | 🔴 高 | 建议 8 |
+| 9 | **Transfer Status 状态词仅存在于前端和 Wings，Panel 不定义不校验** | `TransferListener.tsx:11-27` | 🔴 高 | 建议 8 |
 | 10 | **`completed` 状态动作依赖隐式 API 刷新，无显式状态更新** | `TransferListener.tsx:22-27` | 🟠 中 | 建议 10 |
 | 11 | **迁移进度仅输出到控制台，用户不打开则无感知** | `Console.tsx:174-184` | 🟠 中 | 建议 11 |
-| 12 | **解暂停按钮在迁移期间未禁用，与暂停按钮不一致** | `manage.blade.php:88` | 🔴 高 | 建议 9 |
+| 12 | **解暂停按钮在迁移期间未禁用，与暂停按钮不一致** | `manage.blade.php:88` | 🟠 中 | 建议 9 |
 
 ---
 
@@ -1110,12 +1202,22 @@ const transferElapsed = useMemo(() => {
 | 前端 UI | ✅ 禁用按钮 | ❌ 不禁用按钮 |
 | 后端 Service | ✅ 抛出异常 | ✅ 抛出异常 |
 | Application API | ✅ 被拦截 | ✅ 被拦截 |
-> **关键问题：** 解暂停按钮在迁移期间仍可点击，提交后后端抛出 500 错误，用户体验不佳。
+> **关键问题：** 解暂停按钮在迁移期间仍可点击，提交后后端抛出 409 Conflict 错误（语义正确但体验不佳），用户看到错误页面而非友好提示。
 
 ---
 
 ❌ **此前错误 3："Transfer Status 状态词前后端一致"
 ✅ **事实：状态词 `pending`/`processing`/`failed`/`completed` 仅硬编码在前端 TypeScript 中，后端 PHP 无对应常量定义，存在拼写错误导致静默失败的风险。
+
+---
+
+❌ **此前错误 4："暂停点击操作返回 500 错误"
+✅ **事实：** 返回 409 Conflict 错误，属于 `HttpException` 类型，是可预期的业务冲突错误，而非 500 系统内部错误。`ConflictHttpException` 继承自 `HttpException`，`getStatusCode()` 返回 409，Laravel 异常处理器会根据 `Accept` 请求头渲染对应格式，返回 HTML 错误页面或 JSON 错误响应。
+
+---
+
+❌ **此前错误 5："后端定义 Transfer Status 状态词"
+✅ **事实：** Panel 后端**不定义、不校验、不发送 Transfer Status 状态词，仅作为 Websocket 透明代理转发 Wings 节点与前端之间的消息。状态词契约由 Wings 节点定义，Panel 完全不可见。
 
 ### 核心文件索引
 | 模块 | 文件路径 | 关键行 |
@@ -1140,3 +1242,5 @@ const transferElapsed = useMemo(() => {
 | **控制台迁移日志** | `resources/scripts/components/server/console/Console.tsx` | 174 |
 | **事件枚举** | `resources/scripts/components/server/events.ts` | 10 |
 | **状态 Store** | `resources/scripts/state/server/index.ts` | 33 |
+| **异常处理器** | `app/Exceptions/Handler.php` | 124 |
+| **HTTP 异常类** | `app/Exceptions/Http/Server/ServerStateConflictException.php` | 8 |
