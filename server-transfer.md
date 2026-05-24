@@ -57,6 +57,19 @@ $validatedData = $request->validate([
 ]);
 ```
 
+> **⚠️ 易出错点 1：端口校验不完整**
+> 
+> - **主端口** (`allocation_id`)：有 `unique:servers` 和 `exists:allocations,id` 校验，但**缺少节点归属校验**，没有显式验证该端口确实属于目标节点。虽然 `getUnassignedAllocationIds()` 会隐式过滤掉其他节点的端口，但这是"静默过滤"而非"显式拒绝"，用户无法获得明确的错误反馈。
+> 
+> - **附加端口** (`allocation_additional`)：几乎无校验，只有 `nullable`，缺少：
+>   - 数组格式校验
+>   - 元素存在性校验（`exists:allocations,id`）
+>   - 节点归属校验（必须属于目标节点）
+>   - 唯一性校验（不能与主端口重复，不能自身重复）
+>   - 未被占用校验
+> 
+> 对比 `BuildModificationService` 的严谨实现 [`app/Services/Servers/BuildModificationService.php:90`]，迁移控制器的校验过于宽松。
+
 **第二层：目标节点资源可行性检查** [`app/Repositories/Eloquent/NodeRepository.php:142`]
 ```php
 $node = $this->nodeRepository->getNodeWithResourceUsage($node_id);
@@ -134,9 +147,11 @@ private function assignAllocationsToServer(Server $server, int $node_id, int $al
     
     $updateIds = [];
     foreach ($allocations as $allocation) {
-        if (in_array($allocation, $unassigned)) {
-            $updateIds[] = $allocation;
+        if (!in_array($allocation, $unassigned)) {
+            continue;
         }
+
+        $updateIds[] = $allocation;
     }
 
     if (!empty($updateIds)) {
@@ -146,6 +161,10 @@ private function assignAllocationsToServer(Server $server, int $node_id, int $al
 ```
 
 > **核心设计：** 将目标节点的端口分配预先绑定到该服务器，`server_id` 字段作为"占位标记"，防止迁移期间被其他服务器占用。此设计巧妙地复用了现有 `allocations` 表结构，无需新增锁表。
+>
+> **⚠️ 易出错点 2：分配占位的静默跳过风险**
+> 
+> 代码中 `if (!in_array($allocation, $unassigned)) { continue; }` 会静默跳过已被占用的端口，**不报错也不记录日志**。如果某个附加端口恰好在请求间隙被占用，用户不会收到任何通知，但迁移后该端口实际不可用，造成数据库记录（`new_additional_allocations`）与实际状态不一致。
 
 #### 3.3 JWT 认证设计 [`app/Services/Nodes/NodeJWTService.php:63`]
 
@@ -237,6 +256,32 @@ try {
 ```
 
 > **容错设计：** 源节点删除失败**不影响迁移结果**，仅记录日志。这是一种"最终一致性"设计，宁可源节点残留垃圾文件，也不让迁移失败。
+>
+> **⚠️ 易出错点 4：成功迁移后节点归属与端口一致性风险**
+> 
+> 当前成功回调的事务处理顺序：
+> ```php
+> // 1. 先释放源节点端口
+> Allocation::query()->whereIn('id', $allocations)->update(['server_id' => null]);
+> 
+> // 2. 再更新服务器归属
+> $server->update([
+>     'allocation_id' => $transfer->new_allocation,
+>     'node_id' => $transfer->new_node,
+> ]);
+> 
+> // 3. 标记迁移成功
+> $server->transfer->update(['successful' => true]);
+> ```
+> 
+> **四大风险点：**
+> 1. **更新顺序风险**：先释放源端口，再更新服务器归属。如果在释放端口后、更新服务器前事务失败，会导致**源端口被释放但服务器仍指向源节点**的不一致状态。正确顺序应是"先更新归属，再释放源端口"。
+> 
+> 2. **缺少一致性校验**：更新 `allocation_id` 前没有验证该端口确实：(a) 属于 `new_node`，(b) `server_id` 确实是当前服务器 ID（预占成功）。如果 Wings 回调时数据已被篡改，会导致服务器指向无效端口。
+> 
+> 3. **附加端口一致性缺失**：只更新了主 `allocation_id`，没有验证附加端口确实都绑定到了该服务器。如果某些附加端口预占失败（静默跳过），迁移后这些端口不可用但数据库记录仍存在于 `new_additional_allocations` 中。
+> 
+> 4. **目标节点状态同步缺失**：成功后只通知源节点删除，没有通知目标节点同步服务器配置。对比 `BuildModificationService` 的实现 [`app/Services/Servers/BuildModificationService.php:62`]，它会调用 `sync()` 同步 Wings 状态。
 
 #### 5.2 失败回调 `failure()` [`app/Http/Controllers/Api/Remote/Servers/ServerTransferController.php:38`]
 
@@ -269,6 +314,23 @@ protected function processFailedTransfer(ServerTransfer $transfer): JsonResponse
 ```
 
 > **回滚保险的核心：** 预占的分配在失败时被释放，恢复可用状态。服务器本身仍停留在源节点，用户无感知。
+>
+> **⚠️ 易出错点 3：失败回滚时端口释放的安全边界缺失**
+> 
+> 当前 `processFailedTransfer()` 实现：
+> ```php
+> $allocations = array_merge([$transfer->new_allocation], $transfer->new_additional_allocations);
+> Allocation::query()->whereIn('id', $allocations)->update(['server_id' => null]);
+> ```
+> 
+> **三大风险：**
+> 1. **缺少节点归属校验**：直接根据 `allocation.id` 释放，没有验证这些端口确实属于 `transfer->new_node`。如果数据不一致（如 `new_additional_allocations` 包含其他节点的端口），会**错误释放其他节点的端口**。
+> 
+> 2. **缺少归属服务器校验**：没有验证这些端口的 `server_id` 确实是 `$transfer->server_id`。如果在迁移过程中这些端口被手动分配给了其他服务器，回滚会**错误释放其他服务器的端口**。
+> 
+> 3. **空值边界问题**：如果 `$transfer->new_additional_allocations` 是 `null`，`array_merge` 仍能工作，但缺少显式的空值防御性编程。
+> 
+> **同样问题也存在于成功回调中释放源节点端口的逻辑** [line 82-86]。
 
 ---
 
@@ -321,7 +383,59 @@ $valid = $transfer
 
 ---
 
-## 七、回滚保险体系总结
+## 七、迁移日志与目标节点状态位生命周期
+
+### 7.1 迁移活动日志缺失
+
+**⚠️ 易出错点 5：迁移全流程无审计日志**
+
+- 代码中不存在 `server:transfer.started`、`server:transfer.succeeded`、`server:transfer.failed` 等活动日志事件
+- 迁移启动、成功、失败三个关键节点都没有审计记录
+- 对比 `ServerDetailsController::resetState()` [`app/Http/Controllers/Api/Remote/Servers/ServerDetailsController.php:118`]，它会记录 `server:backup.restore-failed` 活动日志
+
+**风险：** 迁移出现问题时无法追溯操作时间、操作人员和具体错误，缺乏审计能力。
+
+### 7.2 目标节点状态位生命周期分析
+
+**状态位设计现状：**
+
+| 状态位 | 字段 | 值含义 |
+|--------|------|--------|
+| 迁移进行中 | `server_transfers.successful` | `null` |
+| 迁移成功 | `server_transfers.successful` | `true` |
+| 迁移失败 | `server_transfers.successful` | `false` |
+| 已归档 | `server_transfers.archived` | `true` |
+
+**⚠️ 易出错点 6：服务器状态无 `transferring` 标记**
+
+- 服务器 `status` 字段没有 `transferring` 状态，迁移期间服务器状态保持原值（可能是 `null` 或 `suspended`）
+- 用户界面上看不到"迁移中"状态提示
+- `ServerDetailsController::resetState()` [`app/Http/Controllers/Api/Remote/Servers/ServerDetailsController.php:128`] 只清理 `installing` 和 `restoring_backup` 状态，**不处理迁移状态**
+
+```php
+// resetState() 只重置以下状态，不处理迁移中的服务器
+Server::query()->where('node_id', $node->id)
+    ->whereIn('status', [Server::STATUS_INSTALLING, Server::STATUS_RESTORING_BACKUP])
+    ->update(['status' => null]);
+```
+
+**风险：** 如果目标节点重启并调用 `resetState()`，迁移中的服务器状态不会被重置，可能导致"僵尸迁移"。
+
+**⚠️ 易出错点 7：`archived` 字段未被使用**
+
+- 数据库迁移 [`database/migrations/2020_12_17_014330_add_archived_field_to_server_transfers.php:20`] 显示设计意图是成功的迁移自动归档
+- 但**业务代码中从未设置 `archived=true`**，所有迁移记录的 `archived` 始终为 `false`
+
+**⚠️ 易出错点 8：僵尸迁移无超时清理**
+
+- 如果 Wings 节点宕机或网络中断，迁移永远停留在 `successful=null` 状态
+- `Server::transfer()` 关联通过 `whereNull('successful')` 始终返回这条"僵尸"记录
+- `validateTransferState()` 会一直阻止新的迁移
+- 必须手动清理数据库才能恢复
+
+---
+
+## 九、回滚保险体系总结
 
 系统设计了多层回滚保险机制：
 
@@ -349,7 +463,7 @@ $valid = $transfer
 
 ---
 
-## 八、代码优化建议
+## 十、代码优化建议
 
 ### 建议 1：迁移失败后的源节点清理
 
@@ -407,7 +521,204 @@ public function transfer(): HasOne
 
 ---
 
-## 九、总结
+### 建议 4：完善端口校验逻辑（解决易出错点 1、2）
+
+```php
+// 在 transfer() 方法中增强校验
+$validatedData = $request->validate([
+    'node_id' => 'required|exists:nodes,id',
+    'allocation_id' => [
+        'required',
+        'bail',
+        'unique:servers',
+        'exists:allocations,id',
+        // 新增：验证属于目标节点且未被占用
+        function ($attribute, $value, $fail) use ($node_id) {
+            $exists = Allocation::query()
+                ->where('id', $value)
+                ->where('node_id', $node_id)
+                ->whereNull('server_id')
+                ->exists();
+            if (!$exists) {
+                $fail('The selected allocation is not available on the target node.');
+            }
+        },
+    ],
+    'allocation_additional' => [
+        'nullable',
+        'array',
+        // 新增：每个附加端口都要验证
+        function ($attribute, $value, $fail) use ($node_id, $validatedData) {
+            $allIds = array_merge([$validatedData['allocation_id']], $value);
+            if (count($allIds) !== count(array_unique($allIds))) {
+                $fail('Duplicate allocations are not allowed.');
+            }
+            foreach ($value as $id) {
+                $exists = Allocation::query()
+                    ->where('id', $id)
+                    ->where('node_id', $node_id)
+                    ->whereNull('server_id')
+                    ->exists();
+                if (!$exists) {
+                    $fail("Allocation $id is not available on the target node.");
+                }
+            }
+        },
+    ],
+]);
+
+// 新增：分配占位失败时显式报错
+$failedAllocations = array_diff($allocations, $updateIds);
+if (!empty($failedAllocations)) {
+    throw new ValidationException(trans('admin/server.alerts.transfer_allocation_failed', [
+        'ids' => implode(', ', $failedAllocations),
+    ]));
+}
+```
+
+---
+
+### 建议 5：增强端口释放的安全边界（解决易出错点 3）
+
+```php
+protected function processFailedTransfer(ServerTransfer $transfer): JsonResponse
+{
+    $this->connection->transaction(function () use (&$transfer) {
+        $transfer->forceFill(['successful' => false])->saveOrFail();
+        
+        $allocations = array_merge(
+            [$transfer->new_allocation], 
+            $transfer->new_additional_allocations ?? []  // 防御性编程
+        );
+        
+        // 增强：只释放属于目标节点且归属当前服务器的端口
+        Allocation::query()
+            ->whereIn('id', $allocations)
+            ->where('node_id', $transfer->new_node)      // 新增：节点归属校验
+            ->where('server_id', $transfer->server_id)    // 新增：服务器归属校验
+            ->update(['server_id' => null]);
+    });
+    
+    // 【已在建议1】尝试清理目标节点上的部分同步文件
+    ...
+    
+    return new JsonResponse([], Response::HTTP_NO_CONTENT);
+}
+```
+
+---
+
+### 建议 6：修正成功回调的更新顺序与一致性（解决易出错点 4）
+
+```php
+$server = $this->connection->transaction(function () use ($server, $transfer) {
+    // 【新增】先验证新端口的一致性
+    $newAllocations = array_merge(
+        [$transfer->new_allocation], 
+        $transfer->new_additional_allocations ?? []
+    );
+    $validCount = Allocation::query()
+        ->whereIn('id', $newAllocations)
+        ->where('node_id', $transfer->new_node)
+        ->where('server_id', $server->id)
+        ->count();
+    
+    if ($validCount !== count($newAllocations)) {
+        throw new ConflictHttpException('Transfer allocation validation failed.');
+    }
+    
+    // 【修正顺序】先更新服务器归属
+    $server->update([
+        'allocation_id' => $transfer->new_allocation,
+        'node_id' => $transfer->new_node,
+    ]);
+    
+    // 【后释放】再释放源节点端口（同样增加安全边界）
+    $oldAllocations = array_merge(
+        [$transfer->old_allocation], 
+        $transfer->old_additional_allocations ?? []
+    );
+    Allocation::query()
+        ->whereIn('id', $oldAllocations)
+        ->where('node_id', $transfer->old_node)
+        ->where('server_id', $server->id)
+        ->update(['server_id' => null]);
+    
+    // 【新增】设置归档标记
+    $server->transfer->update(['successful' => true, 'archived' => true]);
+    
+    return $server->fresh();
+});
+
+// 【新增】同步目标节点状态
+try {
+    $this->daemonServerRepository
+        ->setServer($server)
+        ->setNode($transfer->newNode)
+        ->sync();
+} catch (DaemonConnectionException $exception) {
+    Log::warning('Failed to sync target node after transfer', [
+        'transfer_id' => $server->transfer->id,
+        'server_id' => $server->id,
+    ]);
+}
+```
+
+---
+
+### 建议 7：增加迁移活动日志与状态管理（解决易出错点 5、6、7、8）
+
+```php
+// 在迁移启动时记录日志
+Activity::event('server:transfer.started')
+    ->subject($server)
+    ->property('old_node', $transfer->oldNode->name)
+    ->property('new_node', $transfer->newNode->name)
+    ->property('old_allocation', $transfer->old_allocation)
+    ->property('new_allocation', $transfer->new_allocation)
+    ->log();
+
+// 在成功时
+Activity::event('server:transfer.succeeded')
+    ->subject($server)
+    ->property('new_node', $transfer->newNode->name)
+    ->log();
+
+// 在失败时
+Activity::event('server:transfer.failed')
+    ->subject($server)
+    ->property('error', $errorMessage)
+    ->log();
+
+// 在 resetState() 中增加迁移状态清理
+Server::query()->where('node_id', $node->id)
+    ->whereHas('transfer', function ($query) {
+        $query->whereNull('successful')
+              ->where('created_at', '<', Carbon::now()->subHours(2));
+    })
+    ->each(function (Server $server) {
+        $transfer = $server->transfer;
+        $transfer->update(['successful' => false]);
+        
+        // 释放预占端口
+        Allocation::query()
+            ->whereIn('id', array_merge(
+                [$transfer->new_allocation], 
+                $transfer->new_additional_allocations ?? []
+            ))
+            ->where('node_id', $transfer->new_node)
+            ->where('server_id', $server->id)
+            ->update(['server_id' => null]);
+        
+        Activity::event('server:transfer.timed-out')
+            ->subject($server)
+            ->log();
+    });
+```
+
+---
+
+## 十一、总结
 
 ### 架构亮点
 1. **职责分离清晰**：Panel 管状态，Wings 管数据
@@ -415,6 +726,19 @@ public function transfer(): HasOne
 3. **回滚机制完善**：从事务原子性到最终一致性的多层防护
 4. **安全边界明确**：严格的节点权限控制，防止恶意回调
 5. **失败容错设计**：非关键路径失败不阻塞主流程
+
+### 易出错点汇总（8 个关键风险）
+
+| 编号 | 风险点 | 位置 | 影响程度 | 建议 |
+|------|--------|------|----------|------|
+| 1 | 端口校验不完整，附加端口几乎无校验 | `ServerTransferController.php:42-43` | 🔴 高 | 建议 4 |
+| 2 | 分配占位静默跳过，不报错也不记录 | `ServerTransferController.php:106` | 🟠 中 | 建议 4 |
+| 3 | 失败回滚时端口释放缺少安全边界校验 | `ServerTransferController.php:123-124` | 🔴 高 | 建议 5 |
+| 4 | 成功回调更新顺序错误，存在不一致窗口 | `ServerTransferController.php:81-96` | 🔴 高 | 建议 6 |
+| 5 | 迁移全流程无审计日志 | 全局 | 🟠 中 | 建议 7 |
+| 6 | 服务器状态无 `transferring` 标记 | `Server.php` status 常量 | 🟡 低 | 建议 7 |
+| 7 | `archived` 字段设计但未被使用 | `ServerTransfer.php` | 🟡 低 | 建议 6 |
+| 8 | 僵尸迁移无超时清理机制 | 全局 | 🔴 高 | 建议 2、7 |
 
 ### 核心文件索引
 | 模块 | 文件路径 | 关键行 |
@@ -426,3 +750,5 @@ public function transfer(): HasOne
 | 失败回滚 | `app/Http/Controllers/Api/Remote/Servers/ServerTransferController.php` | 118 |
 | 状态校验 | `app/Models/Server.php` | 409 |
 | 资源检查 | `app/Models/Node.php` | 242 |
+| 节点重置 | `app/Http/Controllers/Api/Remote/Servers/ServerDetailsController.php` | 89 |
+| 构建修改（参考） | `app/Services/Servers/BuildModificationService.php` | 33 |
