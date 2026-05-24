@@ -1667,3 +1667,235 @@ OAuth 成功 → 获取 external_id → 匹配用户
 - 完善 `external_id` 格式验证（根据实际集成的外部系统规范）
 
 整体设计遵循了安全最佳实践，特别是 **密码验证前置防止账号枚举**、**TOTP防重放攻击**、**恢复码一次性使用**、**external_id 与认证链路隔离** 等设计亮点。
+
+---
+
+## 18. 登录控制器与路由声明深度分析
+
+### 18.1 LoginRequest 校验链路核定
+
+#### 18.1.1 关键发现：主登录接口未使用 LoginRequest
+
+**路由声明** (`routes/auth.php:27`)：
+```php
+Route::post('/login', [Auth\LoginController::class, 'login'])->middleware('recaptcha');
+```
+
+**控制器方法签名** (`app/Http/Controllers/Auth/LoginController.php:32`)：
+```php
+public function login(Request $request): JsonResponse
+```
+
+> **⚠️ 重要核定结论**：主登录接口参数类型是 `Illuminate\Http\Request`，**不是** `LoginRequest`。这意味着：
+> - 参数校验**没有经过** `LoginRequest` 的 `FormRequest` 自动校验
+> - `LoginRequest` 类虽然存在，但当前代码中**未被实际使用**
+> - 参数校验依赖控制器内部的 `isset()` 和 `input()` 调用
+
+#### 18.1.2 对比：检查点接口正确使用 FormRequest
+
+**路由声明** (`routes/auth.php:28`)：
+```php
+Route::post('/login/checkpoint', Auth\LoginCheckpointController::class)->name('auth.login-checkpoint');
+```
+
+**控制器方法签名** (`app/Http/Controllers/Auth/LoginCheckpointController.php:44`)：
+```php
+public function __invoke(LoginCheckpointRequest $request): JsonResponse
+```
+
+> ✅ 检查点接口正确使用 `LoginCheckpointRequest`，参数会经过自动校验。
+
+#### 18.1.3 实际校验链路对比
+
+| 接口 | 参数类型 | 校验方式 | 校验时机 |
+|------|----------|----------|----------|
+| `/auth/login` | `Request` | 控制器内手动 `isset()` + `input()` | 控制器方法执行中 |
+| `/auth/login/checkpoint` | `LoginCheckpointRequest` | `FormRequest` 自动验证 | 控制器方法执行前 |
+
+**主登录接口实际校验点**：
+1. `$request->input('user')` - 无前置校验，直接使用
+2. `$request->input('password')` - 无前置校验，直接使用
+3. 仅在 `password_verify()` 时才会真正处理参数
+
+**潜在风险**：缺少 `required` 和 `string` 类型校验，如果传入 `null` 或非字符串类型，可能导致意外行为。
+
+---
+
+### 18.2 api.application 限流器覆盖边界
+
+#### 18.2.1 路由组配置
+
+**配置位置** (`app/Providers/RouteServiceProvider.php:50-54`)：
+```php
+Route::middleware(['api', RequireTwoFactorAuthentication::class])->group(function () {
+    Route::middleware(['application-api', 'throttle:api.application'])
+        ->prefix('/api/application')
+        ->scopeBindings()
+        ->group(base_path('routes/api-application.php'));
+});
+```
+
+**限流配置** (`app/Providers/RouteServiceProvider.php:102-109`)：
+```php
+RateLimiter::for('api.application', function (Request $request) {
+    $key = optional($request->user())->uuid ?: $request->ip();
+    return Limit::perMinutes(
+        config('http.rate_limit.application_period'),   // 1分钟
+        config('http.rate_limit.application')             // 256次/分钟
+    )->by($key);
+});
+```
+
+#### 18.2.2 覆盖范围边界
+
+**✅ 受 `throttle:api.application` 保护的端点**：
+
+| 端点 | 路由名 | 说明 |
+|------|--------|------|
+| `GET /api/application/users` | `api.application.users` | 用户列表（支持 `external_id` 过滤） |
+| `GET /api/application/users/{user:id}` | `api.application.users.view` | 用户详情 |
+| `GET /api/application/users/external/{external_id}` | `api.application.users.external` | **external_id 查询** |
+| `POST /api/application/users` | - | 创建用户（可设置 `external_id`） |
+| `PATCH /api/application/users/{user:id}` | - | 更新用户（可修改 `external_id`） |
+| `DELETE /api/application/users/{user:id}` | - | 删除用户 |
+| 其他 `/api/application/*` | - | 所有节点、服务器、位置等接口 |
+
+**限流键优先级**：
+1. 已认证 API 用户：`user.uuid`（换IP无法绕过）
+2. 未认证：`request.ip()`
+
+---
+
+### 18.3 external_id 查询与管理端用户接口限流覆盖
+
+#### 18.3.1 external_id 查询接口限流覆盖
+
+**接口**：`GET /api/application/users/external/{external_id}`
+
+**路由定义** (`routes/api-application.php:18`)：
+```php
+Route::get('/external/{external_id}', [Application\Users\ExternalUserController::class, 'index'])
+    ->name('api.application.users.external');
+```
+
+**限流覆盖**：✅ **受 `throttle:api.application` 保护**
+- 属于 `/api/application/users` 路由组
+- 继承 `throttle:api.application` 中间件
+- 限流阈值：256次/分钟（默认）
+
+**控制器实现** (`app/Http/Controllers/Api/Application/Users/ExternalUserController.php:15-22`)：
+```php
+public function index(GetExternalUserRequest $request, string $external_id): array
+{
+    $user = User::query()->where('external_id', $external_id)->firstOrFail();
+    return $this->fractal->item($user)
+        ->transformWith($this->getTransformer(UserTransformer::class))
+        ->toArray();
+}
+```
+
+#### 18.3.2 管理端用户接口限流覆盖
+
+**管理端路由组配置** (`app/Providers/RouteServiceProvider.php:43-45`)：
+```php
+Route::middleware(['auth.session', RequireTwoFactorAuthentication::class, AdminAuthenticate::class])
+    ->prefix('/admin')
+    ->group(base_path('routes/admin.php'));
+```
+
+**❌ 管理端用户接口**不受 `throttle:api.application` 保护：
+
+| 端点 | 路由名 | 限流状态 |
+|------|--------|----------|
+| `GET /admin/users` | `admin.users` | ❌ 无 `throttle:api.application` |
+| `GET /admin/users/view/{user:id}` | `admin.users.view` | ❌ 无 `throttle:api.application` |
+| `POST /admin/users/new` | - | ❌ 无 `throttle:api.application` |
+| `PATCH /admin/users/view/{user:id}` | - | ❌ 无 `throttle:api.application` |
+| `DELETE /admin/users/view/{user:id}` | `admin.users.delete` | ❌ 无 `throttle:api.application` |
+
+**管理端安全机制**：
+- ✅ `auth.session` - 需要登录会话
+- ✅ `AdminAuthenticate` - 需要管理员权限
+- ✅ `RequireTwoFactorAuthentication` - 需要2FA
+- ❌ 无 API 速率限制（依赖 Web 会话保护）
+
+#### 18.3.3 管理端 external_id 访问权限
+
+**管理端创建用户** (`app/Http/Requests/Admin/NewUserFormRequest.php:14-27`)：
+```php
+public function rules(): array
+{
+    return Collection::make(
+        User::getRules()
+    )->only([
+        'email', 'username', 'name_first', 'name_last', 
+        'password', 'language', 'root_admin',
+    ])->toArray();
+}
+```
+
+**管理端更新用户** (`app/Http/Requests/Admin/UserFormRequest.php:14-27`)：
+- 同样使用 `only()` 白名单，**不包含** `external_id`
+
+> **核定结论**：管理端用户接口
+> - ❌ 无法写入 `external_id`（被表单请求白名单过滤）
+> - ❌ 无法读取 `external_id`（管理端视图无此字段展示）
+> - ❌ 不受 `throttle:api.application` 限流保护
+> - ✅ 有完整的 Web 会话和权限保护
+
+---
+
+### 18.4 统一 external_id 风险判断结论口径
+
+#### 18.4.1 风险分层矩阵
+
+| 风险维度 | 真实状态 | 影响范围 | 风险等级 |
+|----------|----------|----------|----------|
+| 数据库层唯一约束 | ❌ 缺失（仅普通 INDEX） | Application API 写入 | **中** |
+| 应用层唯一验证 | ✅ 存在（`unique:users,external_id`） | 所有写入路径 | 缓解 |
+| 并发安全间隙 | ⚠️ 存在（竞态条件） | 高并发写入场景 | **中** |
+| 登录链路隔离 | ✅ 完全隔离 | 认证安全 | **无影响** |
+| 2FA 链路隔离 | ✅ 完全隔离 | 两步验证 | **无影响** |
+| 限流链路隔离 | ✅ 完全隔离 | 限流策略 | **无影响** |
+| 验证码链路隔离 | ✅ 完全隔离 | 验证码保护 | **无影响** |
+| 管理端访问隔离 | ✅ 完全隔离 | 管理员操作 | **无影响** |
+| external_id 查询限流 | ✅ 有保护（api.application） | 枚举攻击 | 缓解 |
+
+#### 18.4.2 统一结论口径
+
+**✅ 安全边界确认（无需担忧）**：
+1. `external_id` **不能** 用于登录，登录仅支持 `username` 或 `email`
+2. `external_id` 重复 **不影响** 认证安全，本地密码仍是最终凭据
+3. 管理端 **无法** 读取或修改 `external_id`，权限隔离完整
+4. 认证、2FA、限流、验证码链路与 `external_id` **无交集**
+
+**⚠️ 真实风险点（需要关注）**：
+1. **并发写入风险**：数据库层无唯一约束，高并发场景下可能出现重复
+2. **数据歧义风险**：如果出现重复，`firstOrFail()` 只返回第一个匹配用户
+3. **外部系统集成风险**：如果外部身份系统返回重复 ID，可能导致本地数据混乱
+
+**🛡️ 已有的保护机制**：
+1. 应用层 `unique:users,external_id` 验证（单请求有效）
+2. `throttle:api.application` 限流（256次/分钟）减缓攻击
+3. API 密钥认证防止未授权访问
+4. `external_id` 字段仅 Application API 可写，权限控制严格
+
+#### 18.4.3 风险缓解优先级
+
+| 优先级 | 措施 | 预期效果 |
+|--------|------|----------|
+| **高** | 添加数据库事务 + 排他锁保护并发写入 | 从根本上解决竞态条件 |
+| **高** | 定期巡检重复 `external_id` 数据 | 及时发现异常 |
+| **中** | 业务允许时恢复数据库层 UNIQUE 约束 | 数据库层强制唯一 |
+| **中** | 为 `external_id` 字段添加格式验证 | 提前拦截无效数据 |
+| **低** | 补充 `external_id` 变更审计日志 | 便于追溯问题 |
+
+---
+
+### 18.5 本次分析关键核定结论
+
+1. **LoginRequest 未被使用**：主登录接口参数类型是 `Request` 而非 `LoginRequest`，参数校验依赖控制器内部逻辑
+2. **api.application 限流覆盖完整**：所有 `/api/application/*` 端点（包括 external_id 查询）都受 256次/分钟 限流保护
+3. **管理端接口限流边界清晰**：管理端用户接口不受 `throttle:api.application` 保护，但有 Web 会话和权限保护
+4. **external_id 风险已收敛**：与认证链路完全隔离，真实风险仅存在于并发写入场景，且已有多层保护
+5. **权限控制设计合理**：`external_id` 字段的读写权限严格控制，管理端完全无法触及
