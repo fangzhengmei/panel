@@ -565,6 +565,205 @@ Server::query()->where('node_id', $node->id)
 
 ---
 
+## 八、迁移可观测性一致性深度分析
+
+### 8.1 Transfer Status 事件状态词一致性核对
+
+#### 8.1.1 事件定义与状态词枚举
+
+**事件名称定义** [`resources/scripts/components/server/events.ts:11`]
+```typescript
+export enum SocketEvent {
+    TRANSFER_LOGS = 'transfer logs',
+    TRANSFER_STATUS = 'transfer status',  // 事件名：空格分隔
+}
+```
+
+**前端处理的状态词** [`resources/scripts/components/server/TransferListener.tsx:11-27`]
+```typescript
+useWebsocketEvent(SocketEvent.TRANSFER_STATUS, (status: string) => {
+    if (status === 'pending' || status === 'processing') { /* 设置 isTransferring = true */ }
+    if (status === 'failed') { /* 设置 isTransferring = false */ }
+    if (status !== 'completed') { return; }
+    /* 刷新服务器数据 */
+});
+```
+
+**⚠️ 一致性问题 1：状态词枚举仅存在于前端**
+
+| 状态词 | 前端处理逻辑 | 后端 PHP 定义 | Wings 节点发送 |
+|--------|-------------|---------------|---------------|
+| `pending` | ✅ `isTransferring = true` | ❌ 无常量定义 | ⚠️ 未在 Panel 代码中找到发送逻辑 |
+| `processing` | ✅ `isTransferring = true` | ❌ 无常量定义 | ⚠️ 未在 Panel 代码中找到发送逻辑 |
+| `failed` | ✅ `isTransferring = false` | ❌ 无常量定义 | ⚠️ 未在 Panel 代码中找到发送逻辑 |
+| `completed` | ✅ 刷新服务器数据 | ❌ 无常量定义 | ⚠️ 未在 Panel 代码中找到发送逻辑 |
+
+> **风险：** 状态词硬编码在前端 TypeScript 中，后端 PHP 无对应常量，Wings 节点发送的状态词如果拼写错误（如 `fail` vs `failed`），前端会静默忽略，导致 UI 永远卡在"迁移中"。
+
+#### 8.1.2 各状态触发的界面和连接动作
+
+| 状态词 | 界面动作 | 连接/网络动作 |
+|--------|---------|--------------|
+| `pending` | 设置 `isTransferring = true` → 触发 `ConflictStateRenderer` 全屏阻挡 | 无额外连接动作 |
+| `processing` | 同 `pending`，UI 无变化 | 无额外连接动作（但会接收 `TRANSFER_LOGS` 事件） |
+| `failed` | 设置 `isTransferring = false` → 恢复正常界面<br>控制台输出 "Transfer has failed." | 无额外连接动作 |
+| `completed` | 不直接修改 `isTransferring`（通过刷新数据自动更新） | 调用 `getServer(uuid)` → 重新拉取服务器详情（含新 node_id 和 allocation） |
+
+**⚠️ 一致性问题 2：`completed` 状态的动作依赖隐式逻辑**
+
+- `pending`/`processing`/`failed` 都显式设置 `isTransferring`
+- 但 `completed` 不直接设置，而是依赖 `getServer()` 返回的新数据中 `is_transferring = false`
+- 如果 API 返回延迟或失败，UI 会一直显示"迁移中"，即使迁移实际已成功
+
+**⚠️ 一致性问题 3：控制台迁移日志的特殊处理** [`resources/scripts/components/server/console/Console.tsx:174-184`]
+
+```typescript
+// 迁移时不清空控制台
+if (!isTransferring) {
+    terminal.clear();
+}
+
+// 监听迁移日志事件
+const listeners: Record<string, (s: string) => void> = {
+    [SocketEvent.TRANSFER_LOGS]: handleConsoleOutput,
+    [SocketEvent.TRANSFER_STATUS]: handleTransferStatus,
+};
+```
+
+> **特殊行为：** 迁移期间不清空终端，`TRANSFER_LOGS` 事件直接输出到终端，便于用户观察迁移进度。但如果用户没打开控制台页面，就看不到任何进度。
+
+---
+
+### 8.2 暂停/解暂停操作的迁移锁定机制核对
+
+#### 8.2.1 三层锁定机制对比
+
+| 锁定层面 | 暂停（Suspend） | 解暂停（Unsuspend） | 一致性 |
+|---------|-----------------|-------------------|--------|
+| **前端 UI（Blade）** | ✅ 禁用按钮<br>`@if(! is_null($server->transfer)) disabled @endif` | ❌ **不禁用按钮**<br>无 `disabled` 类 | ❌ 不一致 |
+| **后端 Service** | ✅ 抛出异常<br>`SuspensionService::toggle()` line 41-43 | ✅ 抛出异常<br>同一检查逻辑 | ✅ 一致 |
+| **Application API** | ✅ 被后端拦截<br>`/api/application/servers/{id}/suspend` | ✅ 被后端拦截<br>`/api/application/servers/{id}/unsuspend` | ✅ 一致 |
+
+**⚠️ 关键不一致：管理页解暂停按钮未禁用** [`resources/views/admin/servers/view/manage.blade.php:57-92`]
+
+```blade
+{{-- 暂停按钮：迁移期间禁用 --}}
+<button type="submit" class="btn btn-warning @if(! is_null($server->transfer)) disabled @endif">
+    Suspend Server
+</button>
+
+{{-- 解暂停按钮：迁移期间未禁用 --}}
+<button type="submit" class="btn btn-success">
+    Unsuspend Server
+</button>
+```
+
+**影响分析：**
+1. 管理员在迁移期间可以点击"Unsuspend Server"按钮
+2. 表单提交到 `manageSuspension()` 控制器
+3. 后端 `SuspensionService::toggle()` 检查到 `!is_null($server->transfer)`，抛出 `ConflictHttpException`
+4. 用户看到 500 错误页面，而非友好提示
+
+> **体验缺陷：** 前端应该在 UI 层面就禁用按钮，避免用户点击后看到错误页面。
+
+#### 8.2.2 后端锁定的完整流程
+
+**`SuspensionService::toggle()` 完整检查** [`app/Services/Servers/SuspensionService.php:28-43`]
+
+```php
+public function toggle(Server $server, string $action = self::ACTION_SUSPEND): void
+{
+    Assert::oneOf($action, [self::ACTION_SUSPEND, self::ACTION_UNSUSPEND]);
+
+    $isSuspending = $action === self::ACTION_SUSPEND;
+    
+    // 状态无变化时静默返回
+    if ($isSuspending === $server->isSuspended()) {
+        return;
+    }
+
+    // ⚠️ 迁移检查：对 suspend 和 unsuspend 一视同仁
+    if (!is_null($server->transfer)) {
+        throw new ConflictHttpException(
+            'Cannot toggle suspension status on a server that is currently being transferred.'
+        );
+    }
+
+    // 更新状态 + 同步 Wings
+    $server->update(['status' => $isSuspending ? Server::STATUS_SUSPENDED : null]);
+    $this->daemonServerRepository->setServer($server)->sync();
+}
+```
+
+> **设计意图：** 迁移期间禁止任何 suspension 状态变更，因为：
+> 1. 迁移需要停止服务器进程
+> 2. 迁移期间服务器可能在源节点或目标节点，suspension 状态同步目标不明确
+> 3. 避免状态竞争导致迁移后状态不一致
+
+---
+
+### 8.3 可观测性缺陷对故障排查的影响
+
+| 缺陷 | 故障场景 | 排查困难 |
+|------|---------|---------|
+| 状态词无后端常量 | Wings 发送 `fail` 而非 `failed` | 前端静默忽略，无法区分"Wings 未发送" vs "状态词错误" |
+| `completed` 依赖 API 刷新 | API 请求超时或失败 | UI 永远显示迁移中，但实际已成功，用户困惑 |
+| 进度仅输出到控制台 | 用户未打开控制台页面 | 完全看不到迁移进度，无法判断是否卡住 |
+| 解暂停按钮不禁用 | 管理员误点击 | 看到 500 错误，误以为系统崩溃 |
+| 无迁移活动日志 | 迁移失败需要追溯 | 无法知道谁在何时发起了迁移，无审计轨迹 |
+| 无超时自动清理 | Wings 节点宕机 | 永久卡在迁移中，只能手动修改数据库 |
+
+---
+
+### 8.4 可观测性优化建议
+
+#### 建议 8：统一状态词枚举（解决一致性问题 1）
+
+```php
+// 在 app/Models/ServerTransfer.php 中新增常量
+public const STATUS_PENDING = 'pending';
+public const STATUS_PROCESSING = 'processing';
+public const STATUS_FAILED = 'failed';
+public const STATUS_COMPLETED = 'completed';
+```
+
+```typescript
+// 在 resources/scripts/api/server/types.d.ts 中新增类型
+export type TransferStatus = 'pending' | 'processing' | 'failed' | 'completed';
+```
+
+#### 建议 9：修复解暂停按钮禁用状态（解决 UI 不一致）
+
+```blade
+{{-- 修改 manage.blade.php 第 88 行 --}}
+<button type="submit" class="btn btn-success @if(! is_null($server->transfer)) disabled @endif">
+    Unsuspend Server
+</button>
+```
+
+#### 建议 10：`completed` 状态显式更新 `isTransferring`（解决一致性问题 2）
+
+```typescript
+// 修改 TransferListener.tsx
+if (status === 'completed') {
+    // 先显式设置，避免依赖 API 刷新
+    setServerFromState((s) => ({ ...s, isTransferring: false }));
+    getServer(uuid).catch((error) => console.error(error));
+}
+```
+
+#### 建议 11：在管理页增加迁移日志链接
+
+```blade
+{{-- 在迁移中提示框中增加 --}}
+<p>
+    迁移进行中，您可以在 <a href="{{ route('admin.servers.view.console', $server->id) }}">控制台</a>
+    查看实时迁移日志。
+</p>
+```
+
+---
+
 ## 九、回滚保险体系总结
 
 系统设计了多层回滚保险机制：
@@ -584,10 +783,11 @@ Server::query()->where('node_id', $node->id)
 - 属于"向前恢复"而非"向后回滚"
 
 ### 第四层：状态封锁
-- 迁移期间通过 `is_transferring` 字段（由 `!is_null($server->transfer)` 计算）触发完整的功能封锁
-- **管理员界面：** Transfer 和 Suspend 按钮禁用，显示迁移启动时间
+- 迁移期间通过 `is_transferring` 字段（由 `!is_null($server->transfer)` 计算）触发功能封锁
+- **管理员界面：** Transfer 和 Suspend 按钮禁用，但 **Unsuspend 按钮未禁用**（已知缺陷，见易出错点 12），显示迁移启动时间
 - **客户端界面：** `ConflictStateRenderer` 全屏阻挡所有功能页
 - **API 中间件：** `AuthenticateServerAccess` 只允许 `view` API 通过，其他均返回 409 Conflict
+- **后端 Service：** `SuspensionService::toggle()` 对 suspend 和 unsuspend 一视同仁，均抛出异常
 - 防止用户在迁移过程中执行暂停、删除等操作
 
 ### 第五层：双向失败报告
@@ -596,7 +796,7 @@ Server::query()->where('node_id', $node->id)
 
 ---
 
-## 十、代码优化建议
+## 十一、代码优化建议
 
 ### 建议 1：迁移失败后的源节点清理
 
@@ -860,7 +1060,7 @@ const transferElapsed = useMemo(() => {
 
 ---
 
-## 十一、总结
+## 十二、总结
 
 ### 架构亮点
 1. **职责分离清晰**：Panel 管状态，Wings 管数据
@@ -869,7 +1069,7 @@ const transferElapsed = useMemo(() => {
 4. **安全边界明确**：严格的节点权限控制，防止恶意回调
 5. **失败容错设计**：非关键路径失败不阻塞主流程
 
-### 易出错点汇总（8 个关键风险）
+### 易出错点汇总（12 个关键风险）
 
 | 编号 | 风险点 | 位置 | 影响程度 | 建议 |
 |------|--------|------|----------|------|
@@ -881,6 +1081,10 @@ const transferElapsed = useMemo(() => {
 | 6 | `servers.status` 字段无 `transferring` 状态（虽有 `is_transferring` 字段但 `resetState()` 不清理） | `Server.php` status 常量 + `ServerDetailsController.php:128` | 🟠 中 | 建议 7 |
 | 7 | `archived` 字段设计但未被使用 | `ServerTransfer.php` | 🟡 低 | 建议 6 |
 | 8 | 僵尸迁移无超时清理机制 | 全局 | 🔴 高 | 建议 2、7 |
+| 9 | **Transfer Status 状态词仅存在于前端，后端无统一常量** | `TransferListener.tsx:11-27` | 🔴 高 | 建议 8 |
+| 10 | **`completed` 状态动作依赖隐式 API 刷新，无显式状态更新** | `TransferListener.tsx:22-27` | 🟠 中 | 建议 10 |
+| 11 | **迁移进度仅输出到控制台，用户不打开则无感知** | `Console.tsx:174-184` | 🟠 中 | 建议 11 |
+| 12 | **解暂停按钮在迁移期间未禁用，与暂停按钮不一致** | `manage.blade.php:88` | 🔴 高 | 建议 9 |
 
 ---
 
@@ -888,7 +1092,7 @@ const transferElapsed = useMemo(() => {
 
 **已修正的错误：
 
-❌ **此前错误："用户界面上看不到迁移中状态提示"
+❌ **此前错误 1："用户界面上看不到迁移中状态提示"
 ✅ **事实：有多重提示链路，通过 `is_transferring` 字段触发四重提示：
 1. 管理员管理页显示迁移启动时间，按钮禁用
 2. 客户端全屏阻挡 "Transferring" 页面
@@ -896,6 +1100,22 @@ const transferElapsed = useMemo(() => {
 4. 控制台迁移日志输出
 
 **状态驱动字段：`is_transferring`（由 `!is_null($server->transfer)` 计算得出，独立于 `servers.status` 字段
+
+---
+
+❌ **此前错误 2："暂停和解暂停的迁移锁定机制相同"
+✅ **事实：三层锁定机制不一致：
+| 锁定层面 | 暂停（Suspend） | 解暂停（Unsuspend） |
+|---------|-----------------|-------------------|
+| 前端 UI | ✅ 禁用按钮 | ❌ 不禁用按钮 |
+| 后端 Service | ✅ 抛出异常 | ✅ 抛出异常 |
+| Application API | ✅ 被拦截 | ✅ 被拦截 |
+> **关键问题：** 解暂停按钮在迁移期间仍可点击，提交后后端抛出 500 错误，用户体验不佳。
+
+---
+
+❌ **此前错误 3："Transfer Status 状态词前后端一致"
+✅ **事实：状态词 `pending`/`processing`/`failed`/`completed` 仅硬编码在前端 TypeScript 中，后端 PHP 无对应常量定义，存在拼写错误导致静默失败的风险。
 
 ### 核心文件索引
 | 模块 | 文件路径 | 关键行 |
@@ -909,10 +1129,14 @@ const transferElapsed = useMemo(() => {
 | 资源检查 | `app/Models/Node.php` | 242 |
 | 节点重置 | `app/Http/Controllers/Api/Remote/Servers/ServerDetailsController.php` | 89 |
 | 构建修改（参考） | `app/Services/Servers/BuildModificationService.php` | 33 |
+| **暂停服务** | `app/Services/Servers/SuspensionService.php` | 28 |
+| **暂停控制器** | `app/Http/Controllers/Admin/ServersController.php` | 125 |
+| **暂停 API** | `app/Http/Controllers/Api/Application/Servers/ServerManagementController.php` | 29 |
 | **API 字段转换** | `app/Transformers/Api/Client/ServerTransformer.php` | 81 |
 | **API 访问拦截** | `app/Http/Middleware/Api/Client/Server/AuthenticateServerAccess.php` | 49 |
-| **Admin 迁移提示** | `resources/views/admin/servers/view/manage.blade.php` | 118 |
+| **Admin 管理页** | `resources/views/admin/servers/view/manage.blade.php` | 118 |
 | **客户端阻挡页** | `resources/scripts/components/server/ConflictStateRenderer.tsx` | 33 |
 | **迁移状态监听** | `resources/scripts/components/server/TransferListener.tsx` | 11 |
 | **控制台迁移日志** | `resources/scripts/components/server/console/Console.tsx` | 174 |
 | **事件枚举** | `resources/scripts/components/server/events.ts` | 10 |
+| **状态 Store** | `resources/scripts/state/server/index.ts` | 33 |
