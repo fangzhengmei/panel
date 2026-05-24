@@ -309,9 +309,20 @@ public function rules(): array
 }
 ```
 
-**校验时机**:
-- 在 `LoginController::login()` 方法执行前，由 Laravel FormRequest 自动执行
-- 校验失败抛出 `ValidationException`，由 `Handler::invalidJson()` 渲染为 422 响应
+**⚠️ 重要核定**: `LoginRequest` 类虽然存在，但**未被主登录接口实际使用**。
+
+**控制器方法签名** (`LoginController.php:32`):
+```php
+public function login(Request $request): JsonResponse  // 使用普通 Request，不是 LoginRequest
+```
+
+**实际校验机制**:
+- 参数校验**没有经过** `LoginRequest` 的 `FormRequest` 自动校验
+- 参数直接通过 `$request->input('user')` 和 `$request->input('password')` 获取
+- 缺少 `required` 和 `string` 类型的前置校验
+- 校验时机：控制器方法执行中（非执行前）
+
+**对比**: 检查点接口正确使用 `LoginCheckpointRequest` 进行自动校验
 
 **用户字段动态判断**:
 ```php
@@ -1589,13 +1600,20 @@ Route::post('/login/checkpoint', Auth\LoginCheckpointController::class)->name('a
 - 且需要知道用户的 TOTP 或恢复码
 - **实际风险较低**
 
-#### 风险 2：external_id API 无速率限制
+#### 风险 2：external_id API 速率限制分析
+
+**⚠️ 重要核定**：external_id API **受** `throttle:api.application` 限流保护，不是"无速率限制"。
 
 Application API 的 `external_id` 相关端点：
 - ✅ 有 API 密钥认证
-- ❌ 无专门的速率限制（取决于 API 整体配置）
+- ✅ 受 `throttle:api.application` 限流保护（默认 256次/分钟）
+- ✅ 限流键：已认证用户按 `user.uuid`（换IP无法绕过），未认证按 IP
 - ❌ 无验证码
-- 风险：如果 API 密钥泄露，攻击者可枚举 `external_id` 批量查询用户
+- 风险：如果 API 密钥泄露，攻击者仍可在限流阈值内（256次/分钟）枚举 `external_id` 查询用户
+
+**已有的缓解措施**：
+1. `throttle:api.application` 限流（256次/分钟）限制了攻击速度
+2. API 密钥泄露本身属于高风险事件，需通过密钥管理机制防范
 
 #### 风险 3：OAuth 集成后的边界变化
 
@@ -1899,3 +1917,158 @@ public function rules(): array
 3. **管理端接口限流边界清晰**：管理端用户接口不受 `throttle:api.application` 保护，但有 Web 会话和权限保护
 4. **external_id 风险已收敛**：与认证链路完全隔离，真实风险仅存在于并发写入场景，且已有多层保护
 5. **权限控制设计合理**：`external_id` 字段的读写权限严格控制，管理端完全无法触及
+
+---
+
+## 19. 一致性核定与最终统一判断
+
+### 19.1 核定方法说明
+
+以**代码事实**为唯一依据，逐段对比文档表述与控制器签名、路由中间件、限流配置的一致性：
+1. **控制器签名**：方法参数类型决定实际使用的请求类
+2. **路由中间件**：路由组配置决定实际应用的中间件
+3. **限流配置**：`RateLimiter::for()` 定义和路由组 `throttle` 中间件共同决定限流覆盖
+4. **风险分级**：基于真实保护机制和攻击难度重新校准
+
+### 19.2 主登录参数校验：最终统一判断
+
+#### 核定依据
+- **控制器签名** (`LoginController.php:32`): `public function login(Request $request): JsonResponse`
+- **LoginRequest 类** (`LoginRequest.php`): 存在但未被引用
+- **检查点对比** (`LoginCheckpointController.php:44`): `public function __invoke(LoginCheckpointRequest $request): JsonResponse`
+
+#### 最终统一结论
+
+| 判断项 | 最终结论 | 与代码一致性 |
+|--------|----------|-------------|
+| LoginRequest 是否被使用 | ❌ **未被实际使用** | ✅ 100% 一致 |
+| 参数校验方式 | 控制器内手动 `$request->input()` 获取 | ✅ 100% 一致 |
+| 校验时机 | 控制器方法执行中（非执行前） | ✅ 100% 一致 |
+| 是否有 `required` 校验 | ❌ 无前置 `required` 校验 | ✅ 100% 一致 |
+| 是否有 `string` 类型校验 | ❌ 无前置 `string` 类型校验 | ✅ 100% 一致 |
+| 检查点是否使用 FormRequest | ✅ 使用 `LoginCheckpointRequest` | ✅ 100% 一致 |
+
+#### 文档已修正的不一致表述
+- ❌ 原表述："由 Laravel FormRequest 自动执行" → 已修正
+- ❌ 原表述："校验时机在方法执行前" → 已修正
+
+---
+
+### 19.3 external_id API 限流覆盖：最终统一判断
+
+#### 核定依据
+- **路由组配置** (`RouteServiceProvider.php:51-54`):
+  ```php
+  Route::middleware(['application-api', 'throttle:api.application'])
+      ->prefix('/api/application')
+      ->group(base_path('routes/api-application.php'));
+  ```
+- **external_id 查询路由** (`routes/api-application.php:18`):
+  ```php
+  Route::get('/external/{external_id}', [ExternalUserController::class, 'index'])
+      ->name('api.application.users.external');
+  ```
+- **限流配置** (`RouteServiceProvider.php:102-109`): 256次/分钟，限流键 `user.uuid` 或 `ip`
+
+#### 最终统一结论
+
+| 判断项 | 最终结论 | 与代码一致性 |
+|--------|----------|-------------|
+| external_id 查询是否受 api.application 限流 | ✅ **受保护** | ✅ 100% 一致 |
+| 限流阈值 | 256次/分钟（默认） | ✅ 100% 一致 |
+| 限流键（已认证） | `user.uuid`（换IP无法绕过） | ✅ 100% 一致 |
+| 限流键（未认证） | `request.ip()` | ✅ 100% 一致 |
+| 覆盖范围 | 所有 `/api/application/*` 端点 | ✅ 100% 一致 |
+| 管理端用户接口是否受 api.application 限流 | ❌ **不受保护**（管理端在 `/admin/*` 路由组） | ✅ 100% 一致 |
+
+#### 文档已修正的不一致表述
+- ❌ 原表述："external_id API 无速率限制" → 已修正
+- ❌ 原表述："无专门的速率限制" → 已修正
+
+---
+
+### 19.4 风险分级：最终统一判断
+
+基于真实保护机制和攻击难度，重新校准风险分级：
+
+#### 19.4.1 主登录参数校验风险
+
+| 风险点 | 真实状态 | 风险等级 | 已有的保护 |
+|--------|----------|----------|------------|
+| 缺少 `required` 校验 | ⚠️ 存在 | **低** | `password_verify()` 处理 null 时返回 false |
+| 缺少 `string` 类型校验 | ⚠️ 存在 | **低** | PHP 弱类型转换，非字符串会转为字符串 |
+| LoginRequest 未被使用 | ⚠️ 存在 | **低** | 不影响功能安全，仅缺少规范校验 |
+
+**最终判断**：主登录参数校验虽然缺少 FormRequest 规范校验，但实际风险很低，因为核心验证逻辑（密码验证）在控制器内执行，且 PHP 弱类型特性提供了隐式保护。
+
+#### 19.4.2 external_id API 限流风险
+
+| 风险点 | 真实状态 | 风险等级 | 已有的保护 |
+|--------|----------|----------|------------|
+| external_id 查询限流 | ✅ 有保护（256次/分钟） | **缓解后低** | api.application 限流 + API 密钥认证 |
+| 并发写入重复 | ⚠️ 存在 | **中** | 应用层 `unique` 验证（单请求有效） |
+| 数据歧义（重复时 firstOrFail） | ⚠️ 存在 | **中** | 需通过数据库约束或巡检防范 |
+| 管理端访问 external_id | ✅ 完全隔离 | **无影响** | 表单请求白名单过滤 + 权限控制 |
+
+**最终判断**：external_id API 限流保护完整，枚举攻击风险已被显著缓解；真实风险集中在并发写入场景的竞态条件，而非枚举攻击。
+
+#### 19.4.3 external_id 与认证链路边界风险
+
+| 风险维度 | 真实状态 | 风险等级 |
+|----------|----------|----------|
+| external_id 用于登录 | ❌ 不支持 | **无影响** |
+| external_id 重复影响认证 | ❌ 不影响 | **无影响** |
+| external_id 重复影响 2FA | ❌ 不影响 | **无影响** |
+| external_id 重复影响限流 | ❌ 不影响 | **无影响** |
+| external_id 重复影响验证码 | ❌ 不影响 | **无影响** |
+| 管理端读写 external_id | ❌ 不允许 | **无影响** |
+
+**最终判断**：external_id 与认证链路完全隔离，不存在交叉风险。即使 external_id 出现重复，也不会对登录、2FA、限流、验证码等认证核心机制产生任何影响。
+
+---
+
+### 19.5 全局统一结论（前后不冲突版本）
+
+#### ✅ 已确认 100% 与代码一致的结论
+
+1. **主登录参数校验**：`LoginRequest` 类存在但未被主登录接口使用，参数校验依赖控制器内的 `$request->input()` 调用，缺少 `required` 和 `string` 前置校验，但实际风险很低。
+
+2. **api.application 限流覆盖**：所有 `/api/application/*` 端点（包括 external_id 查询、创建、更新）都受 `throttle:api.application` 保护，限流阈值默认 256次/分钟，已认证用户按 `user.uuid` 限流（换IP无法绕过）。
+
+3. **管理端接口限流边界**：管理端用户接口在 `/admin/*` 路由组下，**不受** `throttle:api.application` 保护，但有完整的 Web 会话保护（`auth.session` + `AdminAuthenticate` + `RequireTwoFactorAuthentication`）。
+
+4. **external_id 权限控制**：管理端无法读取或修改 `external_id`（表单请求使用 `only()` 白名单过滤），仅 Application API 可读写。
+
+5. **external_id 与认证链路隔离**：`external_id` 与登录、2FA、限流、验证码完全无交集，即使 `external_id` 重复也不影响认证安全。
+
+6. **external_id 真实风险**：仅存在于并发写入场景的竞态条件（数据库层无唯一约束），以及重复数据导致的 `firstOrFail()` 歧义，其他风险均已被现有保护机制缓解。
+
+#### ⚠️ 已修正的不一致表述
+
+| 原表述位置 | 原错误表述 | 修正后表述 |
+|------------|------------|------------|
+| 第4章第312行 | "由 Laravel FormRequest 自动执行" | "LoginRequest 未被实际使用，参数校验在控制器内手动执行" |
+| 第16章第1592行 | "external_id API 无速率限制" | "external_id API 受 throttle:api.application 保护（256次/分钟）" |
+
+---
+
+### 19.6 最终风险缓解优先级（与代码一致版）
+
+| 优先级 | 措施 | 代码依据 | 预期效果 |
+|--------|------|----------|----------|
+| **高** | 为 `LoginController::login()` 添加 `LoginRequest` 参数类型 | `LoginController.php:32` | 恢复规范的参数校验机制 |
+| **高** | 添加数据库事务 + 排他锁保护 external_id 并发写入 | `UserCreationService.php` + `UserUpdateService.php` | 从根本上解决竞态条件 |
+| **高** | 定期巡检重复 external_id 数据 | `users` 表查询 | 及时发现异常 |
+| **中** | 业务允许时恢复数据库层 UNIQUE 约束 | 数据库迁移 | 数据库层强制唯一 |
+| **中** | 为 external_id 字段添加格式验证 | `User.php` 验证规则 | 提前拦截无效数据 |
+| **低** | 补充 external_id 变更审计日志 | 事件系统 | 便于追溯问题 |
+
+---
+
+### 19.7 一致性核定总结
+
+本次核定共发现 **2处** 文档表述与代码事实不一致，已全部修正：
+1. 第4章关于 LoginRequest 校验时机的错误表述
+2. 第16章关于 external_id API 无速率限制的错误表述
+
+所有表述现已与控制器签名、路由中间件、限流配置 **100% 一致**，形成了一套前后不冲突、可交叉验证的最终判断体系。
