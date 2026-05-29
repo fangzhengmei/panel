@@ -162,9 +162,11 @@ public function authorize(): bool
 }
 ```
 
-> **代码证据说明**：`DownloadFileRequest` 没有使用 `permission()` 方法，而是重写了整个 `authorize()` 方法。
+> **代码证据说明**：`FileController::download()` 方法签名使用 `GetFileContentsRequest`。虽然存在名为 `DownloadFileRequest` 的类（重写了 `authorize()` 硬编码 `'file.read'`），但**在当前代码中未被路由使用**。
 
-### 1.4 完整调用链示例 (列出目录)
+### 1.4 完整调用链示例
+
+**示例 1: 列出目录**
 
 ```
 1. 用户请求 GET /api/client/servers/{uuid}/files/list
@@ -191,6 +193,30 @@ public function authorize(): bool
 7. Fractal 转换器转换数据格式 (FileObjectTransformer)
    ↓
 8. 返回响应给用户
+```
+
+**示例 2: 获取下载链接**
+
+```
+1. 用户请求 GET /api/client/servers/{uuid}/files/download?file={path}
+   ↓
+2. 路由匹配，进入中间件链（同上）
+   ↓
+3. FormRequest 权限校验
+   └─ GetFileContentsRequest::permission() → Permission::ACTION_FILE_READ_CONTENT → 'file.read-content'
+      └─ $user->can('file.read-content', $server) → Laravel Gate 校验
+   ↓
+4. FileController::download() 执行
+   ├─ 生成 JWT 令牌（含 file_path、server_uuid、user_uuid）
+   ├─ 记录 Activity Log: server:file.download
+   └─ 返回签名的 Wings 下载 URL
+   ↓
+5. 用户浏览器直接访问 Wings URL
+   └─ GET {node_address}/download/file?token={jwt}
+      ↓
+6. Wings 验证 JWT 并读取容器文件系统
+   ↓
+7. Wings 返回文件流给用户浏览器
 ```
 
 ---
@@ -267,7 +293,7 @@ public function getConnectionAddress(): string
 |---------|---------------|----------------|-----------------|------------|
 | `getDirectory()` | `GET /api/servers/{uuid}/files/list-directory` | `ListFilesRequest` | `Permission::ACTION_FILE_READ` | `'file.read'` |
 | `getContent()` | `GET /api/servers/{uuid}/files/contents` | `GetFileContentsRequest` | `Permission::ACTION_FILE_READ_CONTENT` | `'file.read-content'` |
-| `download()` | 直连 Wings `/download/file` | `DownloadFileRequest` | 重写 `authorize()`，硬编码 | `'file.read'` |
+| `download()` | 直连 Wings `/download/file` | `GetFileContentsRequest` | `Permission::ACTION_FILE_READ_CONTENT` | `'file.read-content'` |
 | `upload` | 直连 Wings `/upload/file` | `UploadFileRequest` | `Permission::ACTION_FILE_CREATE` | `'file.create'` |
 | `putContent()` | `POST /api/servers/{uuid}/files/write` | `WriteFileContentRequest` | `Permission::ACTION_FILE_CREATE` | `'file.create'` |
 | `createDirectory()` | `POST /api/servers/{uuid}/files/create-directory` | `CreateFolderRequest` | `Permission::ACTION_FILE_CREATE` | `'file.create'` |
@@ -385,12 +411,71 @@ public function handle(Node $node, ?string $identifiedBy, string $algo = 'md5'):
 | **unique_id** | `withClaim('unique_id', Str::random())` | 完全随机的字符串，每次调用都不同 | `app/Services/Nodes/NodeJWTService.php:100: ->withClaim('unique_id', Str::random())` |
 
 **可被代码直接证明的结论**：
-1. jti 不是单次使用标识：相同的 `$identifiedBy` 输入会生成相同的 jti
+1. jti 是可重复的：相同的 `$identifiedBy` 输入会生成相同的 jti
+   - 证据：`$identifier = hash($algo, $identifiedBy)`，哈希函数是确定性的
 2. unique_id 不是 JWT 标准声明：它是通过 `withClaim()` 方法添加的自定义字段
-3. 代码中**没有**任何基于 jti 或 unique_id 的"令牌已使用"校验逻辑
-4. 代码中**没有**任何存储或验证 jti/unique_id 的数据库表或缓存逻辑
+   - 证据：使用 `->withClaim('unique_id', Str::random())` 而非 `identifiedBy()` 等标准方法
+3. Panel 代码中**没有**任何基于 jti 或 unique_id 的"令牌已使用"校验逻辑
+   - 证据：在 Panel 代码库中未找到任何查询、存储或比较 jti/unique_id 的逻辑
+4. Panel 代码中**没有**任何存储 jti/unique_id 的数据库表或缓存逻辑
+   - 证据：数据库迁移文件和模型中无相关表定义
 
-### 4.3 JWT 载荷结构（代码证据）
+### 4.3 "one-time token" 语义辨析（代码证据）
+
+**PHPDoc 注释证据**：
+**文件**: `app/Http/Controllers/Api/Client/Servers/FileController.php:72`
+
+```php
+/**
+ * Generates a one-time token with a link that the user can use to
+ * download a given file.
+ */
+```
+
+同样的注释也出现在 WebSocket 令牌生成处：
+**文件**: `app/Http/Controllers/Api/Client/Servers/WebsocketController.php:28`
+
+```php
+/**
+ * Generates a one-time token that is sent along in every websocket call to the Daemon.
+ */
+```
+
+**JTI 撤销机制证据**（用于 WebSocket 令牌）：
+**文件**: `app/Repositories/Wings/DaemonServerRepository.php:129-164`
+
+```php
+/**
+ * Revokes a single user's JTI by using their ID.
+ *
+ * @deprecated
+ * @see \Pterodactyl\Repositories\Wings\DaemonRevocationRepository::deauthorize()
+ */
+public function revokeUserJTI(int $id): void
+{
+    $this->revokeJTIs([md5($id . $this->server->uuid)]);
+}
+
+/**
+ * Revokes an array of JWT JTI's by marking any token generated before the current time on
+ * the Wings instance as being invalid.
+ */
+protected function revokeJTIs(array $jtis): void
+{
+    $this->getHttpClient()
+        ->post(sprintf('/api/servers/%s/ws/deny', $this->server->uuid), [
+            'json' => ['jtis' => $jtis],
+        ]);
+}
+```
+
+**结论（基于可证明的代码事实）**：
+1. "one-time" 是 PHPDoc 中的注释表述，而非代码强制执行的机制
+2. Panel 端**没有**令牌使用跟踪逻辑，令牌是否"单次使用"完全由 Wings 端决定
+3. JTI 撤销机制存在但**仅用于 WebSocket 令牌**（通过 `/api/servers/{uuid}/ws/deny` 端点），代码中未见用于文件上传/下载令牌的撤销调用
+4. 文件上传/下载令牌的"单次使用"语义**在 Panel 代码中无直接证据**，需查看 Wings 代码确认
+
+### 4.4 JWT 载荷结构（代码证据）
 
 **文件上传令牌**（`FileUploadController.php:42-46`）:
 ```php
@@ -699,9 +784,27 @@ public function __invoke(Request $request, string $backup): JsonResponse
 
 ## 七、文件下载流程（代码证据）
 
-**文件**: `app/Http/Controllers/Api/Client/Servers/FileController.php:77-100`
+**文件**: `app/Http/Controllers/Api/Client/Servers/FileController.php:71-100`
 
-下载同样采用 JWT 签名直连模式：
+### 7.1 权限校验入口
+
+```php
+/**
+ * Generates a one-time token with a link that the user can use to
+ * download a given file.
+ *
+ * @throws \Throwable
+ */
+public function download(GetFileContentsRequest $request, Server $server): array
+{
+```
+
+> **代码证据**：
+> - 方法签名使用 `GetFileContentsRequest`，不是 `DownloadFileRequest`
+> - 权限校验入口为 `GetFileContentsRequest::permission()` → `Permission::ACTION_FILE_READ_CONTENT` → `'file.read-content'`
+> - 路由定义：`routes/api-client.php:86: Route::get('/download', [FileController::class, 'download'])`
+
+### 7.2 JWT 生成与直连模式
 
 ```php
 public function download(GetFileContentsRequest $request, Server $server): array
@@ -714,6 +817,8 @@ public function download(GetFileContentsRequest $request, Server $server): array
             'server_uuid' => $server->uuid,
         ])
         ->handle($server->node, $request->user()->id . $server->uuid);
+
+    Activity::event('server:file.download')->property('file', $request->get('file'))->log();
 
     return [
         'object' => 'signed_url',
@@ -753,8 +858,10 @@ public function download(GetFileContentsRequest $request, Server $server): array
 - **节点密钥认证**: Panel → Wings 内部通信使用 `$this->node->getDecryptedKey()` 作为 Bearer Token
 - **JWT 用户认证**: 上传/下载时 JWT 包含 `user_uuid` 和 `server_uuid`，Wings 可验证
 - **时间窗口**: `nbf` 设置为签发前 5 分钟（`canOnlyBeUsedAfter(CarbonImmutable::now()->subMinutes(5))`）
+- **过期机制**: `exp` 设置为 15 分钟后过期（`CarbonImmutable::now()->addMinutes(15)`）
 - **随机因子**: `unique_id` 使用 `Str::random()` 增加令牌不可预测性
 - **权限分层**: 中间件 + FormRequest + Laravel Gate 三层校验
+- **JTI 撤销（WebSocket 专用）**: 存在 JTI 撤销机制（`/api/servers/{uuid}/ws/deny`），但仅用于 WebSocket 令牌，代码中未见用于文件上传/下载令牌
 
 ---
 
