@@ -270,6 +270,8 @@ send(event: string, payload?: string | string[]) {
 | `SocketEvent.BACKUP_COMPLETED` | `backup completed` | 无 | 备份完成 | - |
 | `SocketEvent.BACKUP_RESTORE_COMPLETED` | `backup restore completed` | 无 | 备份恢复完成 | `InstallListener.tsx:12` |
 
+> **transfer status 发送端说明**: 所有 `transfer status` 事件均由 **Wings 端通过 WebSocket 直接推送到前端**，Panel 不参与事件发送。「代码可直接证明」（Panel 代码全面搜索未发现任何发送 "transfer status" 的逻辑，且 WebSocket 连接为前端与 Wings 的直连，无 Panel 中间转发）
+
 ### 4.4 STATS 事件参数结构
 
 **文件**: `StatGraphs.tsx:52-66`
@@ -286,35 +288,78 @@ send(event: string, payload?: string | string[]) {
 }
 ```
 
-### 4.5 TRANSFER STATUS 事件状态全集
+### 4.5 TRANSFER STATUS 事件状态全集与证据链
 
-`transfer status` 事件的参数是一个字符串，Wings 在服务器迁移流程的不同阶段推送不同状态。前端有三个组件分别监听该事件，各自处理不同状态：
+`transfer status` 事件的参数是一个字符串，在服务器迁移流程的不同阶段推送不同状态。前端有三个组件分别监听该事件，各自处理不同状态。
 
-#### 状态枚举与分发处理
+#### 证据等级说明
 
-| 状态值 | 触发时机 | WebsocketHandler | TransferListener | Console |
-|--------|----------|-----------------|------------------|---------|
-| `starting` | 源节点开始将服务器归档时推送 | **忽略** (return) | 未匹配 | 未匹配 |
-| `pending` | 迁移请求已创建，等待源节点处理 | 触发重连 | `isTransferring = true` | 未匹配 |
-| `processing` | 源节点正在执行归档操作 | 触发重连 | `isTransferring = true` | 未匹配 |
-| `success` | 目标节点通知 Panel 迁移成功后推送 | **忽略** (return) | 未匹配 | 未匹配 |
-| `completed` | Panel 确认迁移完成，服务器信息已更新 | 触发重连 | 刷新服务器信息 | 未匹配 |
-| `failed` | 迁移失败（Panel 端确认） | 触发重连 | `isTransferring = false` | 未匹配 |
-| `failure` | 迁移失败（Wings/节点端推送） | 触发重连 | 未匹配 | 终端显示 "Transfer has failed." |
+每个结论标注以下等级之一：
+- **「代码可直接证明」**：Panel 代码中有明确的代码逻辑可直接验证
+- **「基于跨服务推断」**：Panel 代码中无直接证据，需结合 Wings 职责和流程逻辑推断
 
-#### starting 与 success 的语义
+---
 
-**`starting`** — 由**源节点 Wings**推送：
-- 源节点开始对服务器进行归档（archive）操作时发送
-- 标志着迁移流程从"准备阶段"进入"执行阶段"
-- WebsocketHandler 中直接 `return` 忽略，因为此时连接仍然指向源节点，无需重连
-- 归档完成后，源节点会将 `server_transfer.archived` 标记为 `true`
+#### 状态枚举与发送端归属
 
-**`success`** — 由**目标节点 Wings**推送：
-- 目标节点成功接收并解压服务器数据后发送
-- 标志着迁移在 Wings 层面已成功，但 Panel 端的数据库更新可能尚未完成
-- WebsocketHandler 中直接 `return` 忽略，因为后续会有 `completed` 事件触发最终重连
-- Panel 收到目标节点通知后更新数据库（`successful = true`，切换 `node_id`）
+| 状态值 | 发送端归属 | 触发时机 | WebsocketHandler | TransferListener | Console |
+|--------|-----------|----------|-----------------|------------------|---------|
+| `starting` | 源节点 Wings「基于跨服务推断」 | 源节点开始将服务器归档时推送 | **忽略** (return)「代码可直接证明」 | 未匹配 | 未匹配 |
+| `pending` | 源节点 Wings「基于跨服务推断」 | 迁移请求已创建，等待源节点处理 | 触发重连「代码可直接证明」 | `isTransferring = true`「代码可直接证明」 | 未匹配 |
+| `processing` | 源节点 Wings「基于跨服务推断」 | 源节点正在执行归档操作 | 触发重连「代码可直接证明」 | `isTransferring = true`「代码可直接证明」 | 未匹配 |
+| `success` | 目标节点 Wings「基于跨服务推断」 | 目标节点接收完成数据后推送 | **忽略** (return)「代码可直接证明」 | 未匹配 | 未匹配 |
+| `completed` | 目标节点 Wings「基于跨服务推断」 | Panel 数据库更新完成后推送 | 触发重连「代码可直接证明」 | 刷新服务器信息 (getServer)「代码可直接证明」 | 未匹配 |
+| `failed` | 源节点或目标节点 Wings「基于跨服务推断」 | 迁移失败（Panel 收到回调后确认） | 触发重连「代码可直接证明」 | `isTransferring = false`「代码可直接证明」 | 未匹配 |
+| `failure` | 源节点或目标节点 Wings「基于跨服务推断」 | 迁移失败（节点端直接推送） | 触发重连「代码可直接证明」 | 未匹配 | 终端显示 "Transfer has failed."「代码可直接证明」 |
+
+---
+
+#### 核心结论与证据链
+
+**所有 transfer status 事件均由 Wings 端推送，Panel 不参与事件发送**
+- 「代码可直接证明」：Panel 代码全面搜索（`app/` 目录）未发现任何发送 "transfer status" 的逻辑
+- 「代码可直接证明」：WebSocket 连接为前端与 Wings 的直连，无 Panel 中间转发
+- 补充：Panel 仅通过 HTTP 回调 `/api/remote/servers/{uuid}/transfer/success` 和 `/failure` 接收 Wings 的迁移结果通知
+
+---
+
+**starting 发送端证据边界**
+- 「基于跨服务推断」：归档（archive）是源节点的职责，只有源节点知道何时开始归档
+- 「代码可直接证明」：WebsocketHandler 对 `starting` 直接 `return`，说明此时连接仍有效（仍指向源节点）
+- 「代码可直接证明」：`WebsocketHandler.tsx:65-71` 明确将 `starting` 和 `success` 列为不触发重连的状态
+
+---
+
+**success 发送端证据边界**
+- 「基于跨服务推断」：只有目标节点知道何时完成数据接收
+- 「代码可直接证明」：`Remote/ServerTransferController.php:74-78` 注释明确 "Only the new node communicates a successful state to the panel"
+- 「代码可直接证明」：WebsocketHandler 对 `success` 直接 `return`，不触发重连
+- 设计意图：`success` 仅表示 Wings 层面数据传输完成，此时 Panel 数据库可能尚未更新 `node_id`，等 `completed` 再重连可确保 Token 正确指向目标节点
+
+---
+
+**completed 发送端证据边界**
+- 「基于跨服务推断」：应是目标节点在确认 Panel 数据库更新完成后推送
+- 「代码可直接证明」：`TransferListener.tsx:24-26` 收到 `completed` 后调用 `getServer(uuid)` 刷新，说明此时 Panel 数据已更新
+- 「代码可直接证明」：`ServerTransformer.php:81` `is_transferring = !is_null($server->transfer)`，刷新后服务器信息已更新到新节点
+
+---
+
+#### starting 与 success 的完整语义
+
+**`starting` — 源节点 Wings 推送**
+- 触发时机：源节点开始对服务器进行归档（archive）操作时
+- 语义标志：迁移流程从"准备阶段"进入"执行阶段"
+- 处理行为：WebsocketHandler 直接 `return` 忽略，因为此时连接仍然指向源节点，无需重连
+- 后续动作：归档完成后，源节点会将 `server_transfer.archived` 标记为 `true`「基于跨服务推断」
+
+**`success` — 目标节点 Wings 推送**
+- 触发时机：目标节点成功接收并解压服务器数据后
+- 语义标志：迁移在 Wings 层面已成功，但 Panel 端的数据库更新可能尚未完成
+- 处理行为：WebsocketHandler 直接 `return` 忽略，因为后续会有 `completed` 事件触发最终重连
+- 后续动作：目标节点回调 Panel 的 `/api/remote/servers/{uuid}/transfer/success`，Panel 更新数据库（`successful = true`，切换 `node_id`）「代码可直接证明」
+
+---
 
 #### 多组件监听分工
 
@@ -324,16 +369,16 @@ Wings 推送 transfer status 事件
         ▼
    EventEmitter 广播
         │
-        ├─→ WebsocketHandler.tsx:65-77
-        │     - starting/success → 忽略 (连接仍有效，无需操作)
-        │     - 其他状态 → 关闭连接 + 重新连接到新节点
+        ├─→ WebsocketHandler.tsx:65-77 「代码可直接证明」
+        │     - starting/success → return（忽略，不重连）
+        │     - pending/processing/completed/failed/failure → 关闭连接 + 重新连接
         │
-        ├─→ TransferListener.tsx:11-28
-        │     - pending/processing → isTransferring = true
-        │     - failed → isTransferring = false
-        │     - completed → 刷新服务器信息 (getServer)
+        ├─→ TransferListener.tsx:11-28 「代码可直接证明」
+        │     - pending/processing → isTransferring = true（前端状态）
+        │     - failed → isTransferring = false（前端状态）
+        │     - completed → 刷新服务器信息 (getServer(uuid))
         │
-        └─→ Console.tsx:175 (handleTransferStatus)
+        └─→ Console.tsx:80-87, 175 「代码可直接证明」
               - failure → 终端显示 "Transfer has failed."
               - 其他状态 → 无处理 (switch 无匹配 case)
 ```
@@ -738,13 +783,104 @@ const handleDaemonErrorOutput = (line: string) =>
 
 ## 9. 服务器迁移与 WebSocket 重连机制
 
-### 9.1 迁移场景下 WebSocket 连接的切换需求
+### 9.1 三个核心状态字段定义与证据链
 
-服务器迁移时，服务器从源节点（Source Node）转移到目标节点（Target Node）。WebSocket 连接始终连接到某一个 Node，因此迁移过程中需要：
-- 在源节点归档完成后，切换连接到目标节点
-- 确保 Token 签发指向正确的 Node（源节点归档前 vs 归档后）
+迁移流程由三个关键状态字段串联，每个字段的定义和设置时机如下：
 
-### 9.2 WebsocketController 中的 Node 路由逻辑
+| 字段 | 位置 | 定义 | 设置时机 | 证据等级 |
+|------|------|------|----------|----------|
+| **`is_transferring`** | 后端 API 返回 (`ServerTransformer.php:81`) | `!is_null($server->transfer)` | 只要 transfer 记录存在即为 `true` | 「代码可直接证明」 |
+| **`archived`** | `server_transfer` 表 | 源节点是否已完成归档 | 源节点归档完成后设置 | 「基于跨服务推断」（Panel 代码只读不写） |
+| **`successful`** | `server_transfer` 表 | 迁移是否成功 | Panel 收到目标节点 success 回调后设置 `true` | 「代码可直接证明」 |
+
+> **重要区分**:
+> - **后端 `is_transferring`**（API 返回）: 由 `ServerTransformer.php:81` 计算，`= !is_null($server->transfer)`「代码可直接证明」
+> - **前端 `isTransferring`**（React State）: 由 `TransferListener.tsx:13` 根据 `transfer status` 事件设置，与后端字段是两个独立概念「代码可直接证明」
+
+---
+
+### 9.2 迁移阶段与字段状态流转图（含证据等级）
+
+```
+┌──────────────────────────────────────────────────────────────────────────────────────┐
+│                      迁移阶段与字段状态流转图（含证据等级）                            │
+└──────────────────────────────────────────────────────────────────────────────────────┘
+
+  阶段 0: 正常状态
+    ├─ transfer 记录: 不存在
+    ├─ is_transferring: false  「代码可直接证明」
+    ├─ archived: N/A
+    └─ successful: N/A
+
+  阶段 1: 管理员发起迁移
+    ├─ Panel 创建 server_transfer 记录
+    ├─ transfer 记录: 存在
+    ├─ is_transferring: true   「代码可直接证明」
+    ├─ archived: false
+    └─ successful: null
+
+  阶段 2: 源节点开始归档（starting 事件）
+    ├─ transfer status: starting  「基于跨服务推断：源节点 Wings 推送」
+    ├─ WebsocketHandler: return（不重连） 「代码可直接证明」
+    ├─ 连接仍指向源节点，有效
+    ├─ archived: false
+    └─ successful: null
+
+  阶段 3: 源节点归档中（processing 事件）
+    ├─ transfer status: processing  「基于跨服务推断：源节点 Wings 推送」
+    ├─ WebsocketHandler: 触发重连  「代码可直接证明」
+    ├─ 重连请求 GET /websocket
+    ├─ Panel: archived=false → Token 指向源节点  「代码可直接证明」
+    ├─ 重连后仍连源节点
+    ├─ archived: false
+    └─ successful: null
+
+  阶段 4: 源节点归档完成
+    ├─ archived: true  「基于跨服务推断：源节点 Wings 设置」
+    ├─ 后续重连 Token 将指向目标节点  「代码可直接证明」
+    └─ successful: null
+
+  阶段 5: 源节点传输数据 → 目标节点
+    ├─ 期间可能推送 processing / transfer logs 事件
+    ├─ archived: true
+    └─ successful: null
+
+  阶段 6: 目标节点接收完成（success 事件）
+    ├─ transfer status: success  「基于跨服务推断：目标节点 Wings 推送」
+    ├─ 目标节点回调 Panel: POST /api/remote/servers/{uuid}/transfer/success
+    ├─ WebsocketHandler: return（不重连） 「代码可直接证明」
+    │   设计意图：此时 Panel 数据库可能尚未更新 node_id，等 completed 再重连
+    ├─ archived: true
+    └─ successful: null
+
+  阶段 7: Panel 更新数据库
+    ├─ Panel 收到目标节点 success 回调  「代码可直接证明」
+    ├─ 更新: node_id → 目标节点 ID
+    ├─ 更新: successful = true  「代码可直接证明：Remote/ServerTransferController.php:93」
+    ├─ 后端 is_transferring: 仍为 true（transfer 记录还在）
+    ├─ archived: true
+    └─ successful: true
+
+  阶段 8: 迁移完成（completed 事件）
+    ├─ transfer status: completed  「基于跨服务推断：目标节点 Wings 推送」
+    ├─ 注意：**不是 Panel 推送**，Panel 无发送 transfer status 代码
+    ├─ WebsocketHandler: 触发重连  「代码可直接证明」
+    ├─ 重连请求 GET /websocket
+    ├─ Panel: node_id 已更新 → Token 指向目标节点  「代码可直接证明」
+    ├─ 重连后连接到目标节点
+    ├─ TransferListener: getServer(uuid) 刷新服务器信息  「代码可直接证明」
+    ├─ archived: true
+    └─ successful: true
+
+  阶段 9: 最终状态（transfer 记录被清理后）
+    ├─ transfer 记录: 不存在（或被软删除）
+    ├─ is_transferring: false  「代码可直接证明」
+    └─ 服务器已在目标节点正常运行
+```
+
+---
+
+### 9.3 WebsocketController 中的 Node 路由逻辑
 
 **文件**: `WebsocketController.php:42-53`
 
@@ -753,22 +889,33 @@ $node = $server->node;
 if (!is_null($server->transfer)) {
     // 需要管理员权限才能在迁移期间获取 WebSocket Token
     if (!in_array('admin.websocket.transfer', $permissions)) {
-        throw new HttpForbiddenException('...');
+        throw new HttpForbiddenException('You do not have permission to view server transfer logs.');
     }
 
     // 关键：归档完成后，Token 指向目标节点
+    // 「代码可直接证明」：读 archived 字段决定 Node
     if ($server->transfer->archived) {
         $node = $server->transfer->newNode;
     }
 }
 ```
 
-**路由逻辑**:
-- `transfer` 为 `null` → 正常情况，连接到服务器当前 Node
-- `transfer` 存在 + `archived == false` → 迁移进行中但未归档，Token 指向**源节点**
-- `transfer` 存在 + `archived == true` → 源节点已归档，Token 指向**目标节点**
+**路由逻辑证据链**:
+| 条件 | Token 指向 | 证据等级 |
+|------|-----------|----------|
+| `transfer` 为 `null` | 服务器当前 Node | 「代码可直接证明」 |
+| `transfer` 存在 + `archived == false` | 源节点 | 「代码可直接证明」 |
+| `transfer` 存在 + `archived == true` | 目标节点 | 「代码可直接证明」 |
 
-### 9.3 迁移流程与 WebSocket 重连时序
+> **`archived` 字段设置证据边界**:
+> - Panel 代码中**只读不写** `archived` 字段（全面搜索 `app/` 目录，未找到任何 `->archived = true` 或 `update(['archived' => ...])` 的代码）
+> - 因此：`archived = true` 必然由**源节点 Wings** 回调或直接设置 「基于跨服务推断」
+
+---
+
+### 9.4 迁移流程与 WebSocket 重连时序（修正版）
+
+**重要修正**: 之前的时序图错误地将 `completed` 事件标注为"Panel 通知客户端"，实际所有 `transfer status` 事件均由 Wings 推送。
 
 ```
 Source Node Wings              Panel              Target Node Wings       Browser (WebSocket)
@@ -776,15 +923,19 @@ Source Node Wings              Panel              Target Node Wings       Browse
      | 1. 管理员发起迁移请求     |                       |                       |
      |                           |  创建 ServerTransfer  |                       |
      |                           |  archived = false     |                       |
+     |                           |  successful = null    |                       |
+     |                           |  is_transferring = true [代码可直接证明]     |
      |<-- notify(transfer) ------|                       |                       |
      |                           |                       |                       |
      | 2. 源节点开始归档         |                       |                       |
      | push: transfer status     |                       |                       |
      |   args: ["starting"]      |                       |                       |
+     | [基于跨服务推断: 源节点发送]|                       |                       |
      |-------------------------------------------------->|                       |
      |                           |                       |  收到 starting        |
      |                           |                       |  WebsocketHandler:    |
      |                           |                       |  return (忽略)        |
+     |                           |                       |  [代码可直接证明]     |
      |                           |                       |  仍在源节点，连接有效 |
      |                           |                       |                       |
      | 3. 源节点归档进行中       |                       |                       |
@@ -798,14 +949,16 @@ Source Node Wings              Panel              Target Node Wings       Browse
      |                           |                       |    │                  |
      |                           |                       |    │ GET /websocket   |
      |                           |                       |    │ Panel 此时       |
-     |                           |                       |    │ archived仍=false |
+     |                           |                       |    │ archived=false   |
      |                           |                       |    │ → Token指向源节点 |
+     |                           |                       |    │ [代码可直接证明]  |
      |                           |                       |    │                  |
      |                           |                       |    ├── 重新连接源节点 |
      |                           |                       |    └── 恢复日志接收  |
      |                           |                       |                       |
      | 4. 源节点完成归档         |                       |                       |
      |    设置 archived = true   |                       |                       |
+     |    [基于跨服务推断]        |                       |                       |
      |                           |                       |                       |
      | 5. 源节点传输数据到目标   |                       |                       |
      |---------------------------|---------------------->|                       |
@@ -813,10 +966,12 @@ Source Node Wings              Panel              Target Node Wings       Browse
      | 6. 目标节点接收完成       |                       |                       |
      |    push: transfer status  |                       |                       |
      |      args: ["success"]    |                       |                       |
+     |    [基于跨服务推断: 目标节点发送]                |                       |
      |                           |                       |---------------------->|
      |                           |                       |  收到 success         |
      |                           |                       |  WebsocketHandler:    |
      |                           |                       |  return (忽略)        |
+     |                           |                       |  [代码可直接证明]     |
      |                           |                       |  等待 completed       |
      |                           |                       |                       |
      | 7. 目标节点通知 Panel     |                       |                       |
@@ -824,15 +979,18 @@ Source Node Wings              Panel              Target Node Wings       Browse
      |                           | POST /api/remote/     |                       |
      |                           |   servers/{uuid}/     |                       |
      |                           |   transfer/success    |                       |
+     |                           | [代码可直接证明]       |                       |
      |                           |                       |                       |
      |                           | 更新数据库：          |                       |
      |                           | - node_id → new_node  |                       |
      |                           | - successful = true   |                       |
+     |                           |   [代码可直接证明]     |                       |
      |                           |                       |                       |
-     | 8. Panel 通知客户端       |                       |                       |
-     |   push: transfer status   |                       |                       |
-     |     args: ["completed"]   |                       |                       |
-     |-------------------------------------------------->|                       |
+     | 8. 目标节点推送 completed |                       |                       |
+     |                           |                       | push: transfer status |
+     |                           |                       |   args: ["completed"] |
+     |                           |                       | [基于跨服务推断: 目标节点发送]|
+     |                           |                       |---------------------->|
      |                           |                       |  触发重连！           |
      |                           |                       |  socket.close()       |
      |                           |                       |  setInstance(null)    |
@@ -842,12 +1000,18 @@ Source Node Wings              Panel              Target Node Wings       Browse
      |                           |                       |    │ Panel 此时       |
      |                           |                       |    │ node_id已更新    |
      |                           |                       |    │ → Token指向目标  |
+     |                           |                       |    │ [代码可直接证明]  |
      |                           |                       |    │                  |
      |                           |                       |    ├── 连接目标节点   |
      |                           |                       |    └── 接收目标节点日志|
+
+   注意：步骤 8 的 completed 事件**不是 Panel 推送**，是目标节点 Wings 推送。
+   Panel 代码中无任何发送 transfer status 的逻辑。「代码可直接证明」
 ```
 
-### 9.4 WebsocketHandler 重连逻辑详解
+---
+
+### 9.5 WebsocketHandler 重连逻辑详解
 
 **文件**: `WebsocketHandler.tsx:65-77`
 
@@ -857,6 +1021,7 @@ socket.on('transfer status', (status: string) => {
     // - starting: 源节点刚开始归档，当前连接仍指向源节点，连接有效
     // - success: 目标节点完成接收，但 Panel 可能尚未更新 node_id
     //           等 completed 事件时再重连，确保 Panel 已切换节点
+    // 「代码可直接证明」
     if (status === 'starting' || status === 'success') {
         return;
     }
@@ -871,45 +1036,59 @@ socket.on('transfer status', (status: string) => {
 ```
 
 **重连后的 Node 路由关键点**:
-- `connect(uuid)` 会重新调用 `getWebsocketToken(uuid)`
-- Panel 根据当前 `server_transfer.archived` 状态决定签发 Token 到哪个 Node
-- 归档前: Token 指向源节点 → 重连仍连源节点
-- 归档后: Token 指向目标节点 → 重连连到目标节点
+| 重连触发时机 | archived 状态 | Token 指向 | 证据等级 |
+|-------------|--------------|-----------|----------|
+| processing（归档中） | `false` | 源节点 | 「代码可直接证明」 |
+| completed（迁移完成） | `true` | 目标节点 | 「代码可直接证明」 |
+| failed/failure（失败） | 取决于失败阶段 | 原节点或目标节点 | 「代码可直接证明」 |
 
-### 9.5 迁移失败场景
+---
+
+### 9.6 迁移失败场景
 
 ```
 Source/Target Node Wings        Panel              Browser
      |                           |                    |
      | push: transfer status     |                    |
      |   args: ["failed"]        |                    |
+     | [基于跨服务推断]           |                    |
      |------------------------------------------------->|
-     |                           |                    | 触发重连
+     |                           |                    | 触发重连 [代码可直接证明]
      |                           |                    | socket.close()
      |                           |                    | connect(uuid)
-     |                           |                    |
-     |                           |                    | 重新获取Token
-     |                           |                    | 迁移已失败，transfer记录
-     |                           |                    | 可能已被清除或标记
-     |                           |                    | → 连接回原节点
+     |                           |                    |   │
+     |                           |                    |   │ GET /websocket
+     |                           |                    |   │ Panel: transfer 记录
+     |                           |                    |   │ 可能已被清理或标记
+     |                           |                    |   │ → 连接回原节点
      |                           |                    |
      | push: transfer status     |                    |
      |   args: ["failure"]       |                    |
+     | [基于跨服务推断]           |                    |
      |------------------------------------------------->|
-     |                           |                    | 触发重连 (同上)
+     |                           |                    | 触发重连（同上）
      |                           |                    | Console 终端显示:
      |                           |                    | "Transfer has failed."
+     |                           |                    | [代码可直接证明]
      |                           |                    | TransferListener:
      |                           |                    | isTransferring = false
+     |                           |                    | [代码可直接证明]
 ```
 
-### 9.6 Console 组件的迁移感知
+**失败回调证据链**:
+- 目标节点或源节点失败 → 回调 Panel `/api/remote/servers/{uuid}/transfer/failure` 「代码可直接证明」
+- Panel 设置 `successful = false` 「代码可直接证明：`Remote/ServerTransferController.php:121`」
+- 清理新分配的端口等资源
 
-**文件**: `Console.tsx:80-87, 175, 182`
+---
+
+### 9.7 Console 组件的迁移感知
+
+**文件**: `Console.tsx:80-87, 180-184`
 
 Console 组件对迁移的处理体现在两方面：
 
-1. **迁移失败终端提示** (`Console.tsx:80-87`):
+1. **迁移失败终端提示** (`Console.tsx:80-87`)「代码可直接证明」:
 ```typescript
 const handleTransferStatus = (status: string) => {
     switch (status) {
@@ -920,7 +1099,7 @@ const handleTransferStatus = (status: string) => {
 };
 ```
 
-2. **迁移期间不清空终端** (`Console.tsx:180-184`):
+2. **迁移期间不清空终端** (`Console.tsx:180-184`)「代码可直接证明」:
 ```typescript
 if (connected && instance) {
     if (!isTransferring) {
@@ -930,11 +1109,15 @@ if (connected && instance) {
 }
 ```
 
-### 9.7 迁移权限要求
+> `isTransferring` 是前端 React 状态，由 `TransferListener.tsx:13` 根据 `transfer status` 事件设置，与后端 `is_transferring` API 字段是两个独立概念。
+
+---
+
+### 9.8 迁移权限要求
 
 迁移期间获取 WebSocket Token 需要额外权限：
 
-**文件**: `WebsocketController.php:44-46`
+**文件**: `WebsocketController.php:44-46`「代码可直接证明」
 ```php
 if (!in_array('admin.websocket.transfer', $permissions)) {
     throw new HttpForbiddenException('You do not have permission to view server transfer logs.');
@@ -994,6 +1177,7 @@ if (!in_array('admin.websocket.transfer', $permissions)) {
 | `app/Services/Servers/GetUserPermissionsService.php` | 用户权限获取 |
 | `app/Models/Permission.php` | 权限常量定义 |
 | `app/Models/ServerTransfer.php` | 服务器迁移模型 |
+| `app/Transformers/Api/Client/ServerTransformer.php` | 服务器数据转换（含 is_transferring 定义） |
 | `app/Http/Controllers/Api/Remote/Servers/ServerTransferController.php` | 迁移成功/失败回调（Wings→Panel） |
 | `app/Http/Controllers/Admin/Servers/ServerTransferController.php` | 管理员发起迁移 |
 | `app/Repositories/Wings/DaTransferRepository.php` | Panel→源节点通知迁移 |
