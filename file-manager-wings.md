@@ -47,6 +47,22 @@ Route::group([
 
 ### 1.2 中间件详解
 
+**ServerSubject 中间件**
+**文件**: `app/Http/Middleware/Activity/ServerSubject.php:19-28`
+
+```php
+public function handle(Request $request, \Closure $next)
+{
+    $server = $request->route()->parameter('server');
+    if ($server instanceof Server) {
+        LogTarget::setActor($request->user());    // 设置日志操作者
+        LogTarget::setSubject($server);            // 设置日志主体
+    }
+
+    return $next($request);
+}
+```
+
 **AuthenticateServerAccess 中间件**
 **文件**: `app/Http/Middleware/Api/Client/Server/AuthenticateServerAccess.php:29-67`
 
@@ -78,7 +94,51 @@ public function handle(Request $request, \Closure $next): mixed
 }
 ```
 
+**ResourceBelongsToServer 中间件**
+**文件**: `app/Http/Middleware/Api/Client/Server/ResourceBelongsToServer.php:27-85`
+
+```php
+public function handle(Request $request, \Closure $next): mixed
+{
+    $server = $request->route()->parameter('server');
+    
+    // 遍历路由参数，检查除 server 外的其他 Model 是否属于该服务器
+    foreach ($params as $key => $model) {
+        if ($key === 'server' || !$model instanceof Model) {
+            continue;
+        }
+
+        switch (get_class($model)) {
+            case Allocation::class:
+            case Backup::class:
+            case Database::class:
+            case Schedule::class:
+            case Subuser::class:
+                if ($model->server_id !== $server->id) {
+                    throw $exception;
+                }
+                break;
+            // ... 其他类型检查
+        }
+    }
+
+    return $next($request);
+}
+```
+
+> **代码证据说明**：对于纯文件操作路由（如 `/files/list`、`/files/upload`），路由参数中只有 `server`，没有其他 Model。因此 `ResourceBelongsToServer` 中间件在这些路由上实际不执行任何校验。
+
 ### 1.3 FormRequest 权限校验
+
+**ClientPermissionsRequest 接口**
+**文件**: `app/Contracts/Http/ClientPermissionsRequest.php:5-13`
+
+```php
+interface ClientPermissionsRequest
+{
+    public function permission(): string;
+}
+```
 
 **ClientApiRequest 基类**
 **文件**: `app/Http/Requests/Api/Client/ClientApiRequest.php:17-32`
@@ -86,7 +146,7 @@ public function handle(Request $request, \Closure $next): mixed
 ```php
 public function authorize(): bool
 {
-    // 如果请求类定义了 permission() 方法，则执行细粒度权限检查
+    // 如果请求类实现了 ClientPermissionsRequest 接口或定义了 permission() 方法
     if ($this instanceof ClientPermissionsRequest || method_exists($this, 'permission')) {
         $server = $this->route()->parameter('server');
 
@@ -102,27 +162,7 @@ public function authorize(): bool
 }
 ```
 
-**具体权限示例**
-**文件**: `app/Http/Requests/Api/Client/Servers/Files/UploadFileRequest.php:8-13`
-
-```php
-class UploadFileRequest extends ClientApiRequest
-{
-    public function permission(): string
-    {
-        return Permission::ACTION_FILE_CREATE; // 'file.create'
-    }
-}
-```
-
-**文件**: `app/Http/Requests/Api/Client/Servers/Files/ListFilesRequest.php:14-17`
-
-```php
-public function permission(): string
-{
-    return Permission::ACTION_FILE_READ; // 'file.read'
-}
-```
+> **代码证据说明**：`DownloadFileRequest` 没有使用 `permission()` 方法，而是重写了整个 `authorize()` 方法。
 
 ### 1.4 完整调用链示例 (列出目录)
 
@@ -130,22 +170,25 @@ public function permission(): string
 1. 用户请求 GET /api/client/servers/{uuid}/files/list
    ↓
 2. 路由匹配，进入中间件链
-   ├─ ServerSubject: 设置日志上下文
-   ├─ AuthenticateServerAccess: 验证服务器访问权限
-   └─ ResourceBelongsToServer: 验证资源归属
+   ├─ ServerSubject: 设置 LogTarget::actor 和 LogTarget::subject
+   ├─ AuthenticateServerAccess: 验证服务器存在、用户权限、服务器状态
+   └─ ResourceBelongsToServer: 无额外路由参数，直接通过
    ↓
 3. FormRequest 权限校验
-   └─ ListFilesRequest::permission() → 'file.read'
+   └─ ListFilesRequest::permission() → Permission::ACTION_FILE_READ → 'file.read'
+      └─ $user->can('file.read', $server) → Laravel Gate 校验
    ↓
 4. FileController::directory() 执行
-   └─ DaemonFileRepository::getDirectory()
+   └─ DaemonFileRepository::setServer($server)->getDirectory()
       ↓
 5. Guzzle HTTP 请求到 Wings
    └─ GET /api/servers/{uuid}/files/list-directory
+      ├─ Authorization: Bearer {node.daemon_token}
+      └─ query: directory={path}
       ↓
 6. Wings 访问容器文件系统，返回 JSON
    ↓
-7. Fractal 转换器转换数据格式
+7. Fractal 转换器转换数据格式 (FileObjectTransformer)
    ↓
 8. 返回响应给用户
 ```
@@ -190,7 +233,7 @@ abstract class DaemonRepository
 }
 ```
 
-**关键点**:
+**关键点（代码证据）**:
 - 使用节点的 `daemon_token`（解密后）作为 Bearer Token
 - `base_uri` 动态指向节点地址：`scheme://fqdn:daemonListen`
 - 支持超时配置（默认 15s 超时，5s 连接超时）
@@ -214,32 +257,50 @@ public function getConnectionAddress(): string
 
 **文件**: `app/Repositories/Wings/DaemonFileRepository.php:18-301`
 
-这是 Panel 与 Wings 文件系统通信的核心类，封装了所有文件操作：
+这是 Panel 与 Wings 文件系统通信的核心类，封装了所有文件操作。
 
-| 方法 | Wings API 端点 | 所需权限 | 功能 |
-|------|---------------|----------|------|
-| `getContent()` | `GET /api/servers/{uuid}/files/contents` | `file.read-content` | 读取文件内容 |
-| `putContent()` | `POST /api/servers/{uuid}/files/write` | `file.update` | 写入文件内容 |
-| `getDirectory()` | `GET /api/servers/{uuid}/files/list-directory` | `file.read` | 列出目录内容 |
-| `createDirectory()` | `POST /api/servers/{uuid}/files/create-directory` | `file.create` | 创建目录 |
-| `renameFiles()` | `PUT /api/servers/{uuid}/files/rename` | `file.update` | 重命名/移动文件 |
-| `copyFile()` | `POST /api/servers/{uuid}/files/copy` | `file.create` | 复制文件 |
-| `deleteFiles()` | `POST /api/servers/{uuid}/files/delete` | `file.delete` | 删除文件/目录 |
-| `compressFiles()` | `POST /api/servers/{uuid}/files/compress` | `file.archive` | 压缩文件 |
-| `decompressFile()` | `POST /api/servers/{uuid}/files/decompress` | `file.archive` | 解压文件 |
-| `chmodFiles()` | `POST /api/servers/{uuid}/files/chmod` | `file.update` | 修改文件权限 |
-| `pull()` | `POST /api/servers/{uuid}/files/pull` | `file.create` | 从 URL 拉取文件 |
+### 3.2 操作权限对照表（代码核对结果）
 
-### 3.2 FileController 控制器
+以下权限均来自各 FormRequest 类的 `permission()` 方法或 `authorize()` 方法：
+
+| 操作方法 | Wings API 端点 | FormRequest 类 | 代码中的权限常量 | 实际权限值 |
+|---------|---------------|----------------|-----------------|------------|
+| `getDirectory()` | `GET /api/servers/{uuid}/files/list-directory` | `ListFilesRequest` | `Permission::ACTION_FILE_READ` | `'file.read'` |
+| `getContent()` | `GET /api/servers/{uuid}/files/contents` | `GetFileContentsRequest` | `Permission::ACTION_FILE_READ_CONTENT` | `'file.read-content'` |
+| `download()` | 直连 Wings `/download/file` | `DownloadFileRequest` | 重写 `authorize()`，硬编码 | `'file.read'` |
+| `upload` | 直连 Wings `/upload/file` | `UploadFileRequest` | `Permission::ACTION_FILE_CREATE` | `'file.create'` |
+| `putContent()` | `POST /api/servers/{uuid}/files/write` | `WriteFileContentRequest` | `Permission::ACTION_FILE_CREATE` | `'file.create'` |
+| `createDirectory()` | `POST /api/servers/{uuid}/files/create-directory` | `CreateFolderRequest` | `Permission::ACTION_FILE_CREATE` | `'file.create'` |
+| `copyFile()` | `POST /api/servers/{uuid}/files/copy` | `CopyFileRequest` | `Permission::ACTION_FILE_CREATE` | `'file.create'` |
+| `decompressFile()` | `POST /api/servers/{uuid}/files/decompress` | `DecompressFilesRequest` | `Permission::ACTION_FILE_CREATE` | `'file.create'` |
+| `pull()` | `POST /api/servers/{uuid}/files/pull` | `PullFileRequest` | `Permission::ACTION_FILE_CREATE` | `'file.create'` |
+| `renameFiles()` | `PUT /api/servers/{uuid}/files/rename` | `RenameFileRequest` | `Permission::ACTION_FILE_UPDATE` | `'file.update'` |
+| `chmodFiles()` | `POST /api/servers/{uuid}/files/chmod` | `ChmodFilesRequest` | `Permission::ACTION_FILE_UPDATE` | `'file.update'` |
+| `deleteFiles()` | `POST /api/servers/{uuid}/files/delete` | `DeleteFileRequest` | `Permission::ACTION_FILE_DELETE` | `'file.delete'` |
+| `compressFiles()` | `POST /api/servers/{uuid}/files/compress` | `CompressFilesRequest` | `Permission::ACTION_FILE_ARCHIVE` | `'file.archive'` |
+
+**权限常量定义**
+**文件**: `app/Models/Permission.php:51-57`
+
+```php
+public const ACTION_FILE_READ = 'file.read';
+public const ACTION_FILE_READ_CONTENT = 'file.read-content';
+public const ACTION_FILE_CREATE = 'file.create';
+public const ACTION_FILE_UPDATE = 'file.update';
+public const ACTION_FILE_DELETE = 'file.delete';
+public const ACTION_FILE_ARCHIVE = 'file.archive';
+public const ACTION_FILE_SFTP = 'file.sftp';
+```
+
+### 3.3 FileController 控制器
 
 **文件**: `app/Http/Controllers/Api/Client/Servers/FileController.php:26-265`
 
 控制器负责：
-1. 接收用户请求
-2. FormRequest 已完成权限校验
-3. 调用 `DaemonFileRepository` 转发请求
-4. 记录操作日志 (Activity Log)
-5. 返回转换后的数据
+1. 接收用户请求（FormRequest 已完成权限校验）
+2. 调用 `DaemonFileRepository` 转发请求
+3. 记录操作日志 (Activity Log)
+4. 返回转换后的数据
 
 **代码示例**:
 ```php
@@ -255,7 +316,7 @@ public function directory(ListFilesRequest $request, Server $server): array
 }
 ```
 
-### 3.3 文件大小限制
+### 3.4 文件大小限制
 
 **文件**: `app/Repositories/Wings/DaemonFileRepository.php:29-50`
 
@@ -288,7 +349,7 @@ public function getContent(string $path, ?int $notLargerThan = null): string
 ```php
 public function handle(Node $node, ?string $identifiedBy, string $algo = 'md5'): UnencryptedToken
 {
-    // jti: 基于传入标识的哈希值，可重复生成
+    // jti: 基于传入标识的哈希值
     $identifier = hash($algo, $identifiedBy);
     
     $config = Configuration::forSymmetricSigner(
@@ -299,75 +360,103 @@ public function handle(Node $node, ?string $identifiedBy, string $algo = 'md5'):
     $builder = $config->builder(new TimestampDates())
         ->issuedBy(config('app.url'))                    // iss: Panel URL
         ->permittedFor($node->getConnectionAddress())     // aud: 节点地址
-        ->identifiedBy($identifier)                       // jti: 可重复的标识
+        ->identifiedBy($identifier)                       // jti: 标准声明
         ->withHeader('jti', $identifier)                  // 额外在 header 中设置
         ->issuedAt(CarbonImmutable::now())                // iat: 签发时间
         ->canOnlyBeUsedAfter(CarbonImmutable::now()->subMinutes(5)); // nbf: 5分钟前
 
+    if (isset($this->expiresAt)) {
+        $builder = $builder->expiresAt($this->expiresAt); // exp: 过期时间
+    }
+
     // ... 添加自定义 claims
 
     return $builder
-        ->withClaim('unique_id', Str::random())           // unique_id: 完全随机
+        ->withClaim('unique_id', Str::random())           // unique_id: 自定义随机字段
         ->getToken($config->signer(), $config->signingKey());
 }
 ```
 
-### 4.2 jti 与 unique_id 的语义边界
+### 4.2 jti 与 unique_id 的语义边界（基于代码证据）
 
-| 字段 | 来源 | 语义 | 用途 |
-|------|------|------|------|
-| **jti** | `hash($algo, $identifiedBy)` | 基于用户ID和服务器UUID的可重复哈希值 | JWT 标准声明，用于标识令牌主体，相同用户+服务器组合会生成相同的 jti |
-| **unique_id** | `Str::random()` | 完全随机的字符串 | 额外的随机性保证，确保即使 jti 相同，令牌也不会完全一致 |
+| 字段 | 代码来源 | 语义 | 代码证据 |
+|------|---------|------|---------|
+| **jti** | `identifiedBy($identifier)`，其中 `$identifier = hash($algo, $identifiedBy)` | 基于传入字符串的哈希值，相同输入会生成相同的 jti | `app/Services/Nodes/NodeJWTService.php:65: $identifier = hash($algo, $identifiedBy);` |
+| **unique_id** | `withClaim('unique_id', Str::random())` | 完全随机的字符串，每次调用都不同 | `app/Services/Nodes/NodeJWTService.php:100: ->withClaim('unique_id', Str::random())` |
 
-**关键结论**：
-- jti **不是** "单次使用" 标识，相同输入会生成相同 jti
-- unique_id **不是** JWT 标准声明，是 Pterodactyl 额外添加的随机字段
-- 两者结合提供了"可识别主体" + "随机唯一"的双重特性
-- 代码中**没有**任何基于 jti 或 unique_id 的"令牌已使用"校验逻辑
+**可被代码直接证明的结论**：
+1. jti 不是单次使用标识：相同的 `$identifiedBy` 输入会生成相同的 jti
+2. unique_id 不是 JWT 标准声明：它是通过 `withClaim()` 方法添加的自定义字段
+3. 代码中**没有**任何基于 jti 或 unique_id 的"令牌已使用"校验逻辑
+4. 代码中**没有**任何存储或验证 jti/unique_id 的数据库表或缓存逻辑
 
-### 4.3 JWT 载荷完整结构
+### 4.3 JWT 载荷结构（代码证据）
 
-标准 JWT 声明：
-- `iss`: Panel URL (签发者)
-- `aud`: 节点连接地址 (接收者)
-- `jti`: 基于输入的哈希标识
-- `iat`: 签发时间
-- `nbf`: 最早使用时间 (签发前5分钟)
-- `exp`: 过期时间 (通常15分钟)
+**文件上传令牌**（`FileUploadController.php:42-46`）:
+```php
+$token = $this->jwtService
+    ->setExpiresAt(CarbonImmutable::now()->addMinutes(15))
+    ->setUser($user)
+    ->setClaims(['server_uuid' => $server->uuid])
+    ->handle($server->node, $user->id . $server->uuid);
+```
 
-自定义 claims：
-- `user_uuid`: 用户 UUID
-- `user_id`: 用户 ID (已弃用，兼容旧版 Wings)
-- `server_uuid`: 服务器 UUID (仅上传时)
-- `file_path`: 文件路径 (仅下载时)
-- `unique_id`: 随机字符串
+**文件下载令牌**（`FileController.php:79-86`）:
+```php
+$token = $this->jwtService
+    ->setExpiresAt(CarbonImmutable::now()->addMinutes(15))
+    ->setUser($request->user())
+    ->setClaims([
+        'file_path' => rawurldecode($request->get('file')),
+        'server_uuid' => $server->uuid,
+    ])
+    ->handle($server->node, $request->user()->id . $server->uuid);
+```
+
+**标准 JWT 声明**（代码证据）：
+- `iss`: `config('app.url')` - Panel URL (签发者)
+- `aud`: `$node->getConnectionAddress()` - 节点连接地址 (接收者)
+- `jti`: `hash($algo, $identifiedBy)` - 基于输入的哈希标识
+- `iat`: `CarbonImmutable::now()` - 签发时间
+- `nbf`: `CarbonImmutable::now()->subMinutes(5)` - 最早使用时间
+- `exp`: `$this->expiresAt` - 过期时间（通常15分钟）
+
+**自定义 claims**（代码证据）：
+- `user_uuid`: `$this->user->uuid` - 用户 UUID
+- `user_id`: `$this->user->id` - 用户 ID（注释说明已弃用）
+- `server_uuid`: 仅上传/下载时设置
+- `file_path`: 仅下载时设置
+- `unique_id`: `Str::random()` - 随机字符串
 
 ---
 
 ## 五、文件上传真实机制：非分片，直连 Wings
 
-### 5.1 上传流程架构
+### 5.1 上传流程架构（代码证据）
 
 **重要更正**：文件上传**不存在**大文件分片实现。当前实现为 **"前端直连 Wings 的单段上传"**：
 
 ```
-1. 前端请求 Panel 获取签名上传 URL  (GET /api/client/servers/{uuid}/files/upload)
+1. 前端请求 Panel 获取签名上传 URL
+   (GET /api/client/servers/{uuid}/files/upload)
    ↓
 2. Panel 生成 JWT 签名的 Wings URL
+   ├─ 中间件链: ServerSubject → AuthenticateServerAccess → ResourceBelongsToServer
    ├─ 权限校验: UploadFileRequest::permission() → 'file.create'
-   └─ JWT 包含: server_uuid, user_uuid, 15分钟过期
+   └─ JWT 包含: server_uuid, user_uuid, exp=15分钟
    ↓
-3. 前端直接 POST 文件到 Wings  (multipart/form-data)
+3. 前端直接 POST 文件到 Wings
    ├─ URL: {node_address}/upload/file?token={jwt}
-   ├─ 参数: directory (目标目录)
-   └─ Body: files (文件内容)
+   ├─ Headers: Content-Type: multipart/form-data
+   ├─ Query: directory={target_directory}
+   └─ Body: files={file_content}
    ↓
 4. Wings 验证 JWT 并写入容器文件系统
    ↓
-5. 前端通过 axios 回调显示上传进度
+5. 前端通过 axios onUploadProgress 回调显示上传进度
 ```
 
-### 5.2 步骤详解
+### 5.2 步骤详解（代码证据）
 
 **步骤 1: 获取签名上传 URL**
 
@@ -440,7 +529,7 @@ const onFileSubmission = (files: FileList) => {
                         {
                             signal: controller.signal,
                             headers: { 'Content-Type': 'multipart/form-data' },
-                            params: { directory },  // 目标目录
+                            params: { directory },
                             onUploadProgress: (data) => onUploadProgress(data, file.name),
                         }
                     )
@@ -449,15 +538,17 @@ const onFileSubmission = (files: FileList) => {
     });
 
     Promise.all(uploads.map((fn) => fn()))
-        .then(() => mutate())  // 刷新文件列表
+        .then(() => mutate())
         .catch((error) => {
-            clearFileUploads();  // ⚠️ 失败时清空所有上传进度
+            clearFileUploads();
             clearAndAddHttpError(error);
         });
 };
 ```
 
-### 5.3 上传进度反馈
+> **代码证据说明**：axios `post` 直接发送完整的 `file` 对象，没有任何分片逻辑。`onUploadProgress` 是浏览器 XMLHttpRequest 的原生进度事件。
+
+### 5.3 上传进度反馈（代码证据）
 
 **状态管理**:
 **文件**: `resources/scripts/state/server/files.ts:4-79`
@@ -472,11 +563,11 @@ export interface FileUploadData {
 export interface ServerFileStore {
     uploads: Record<string, FileUploadData>;
     
-    pushFileUpload: Action<...>;
-    setUploadProgress: Action<...>;
-    clearFileUploads: Action<...>;
-    removeFileUpload: Action<...>;
-    cancelFileUpload: Action<...>;
+    pushFileUpload: Action<ServerFileStore, { name: string; data: FileUploadData }>;
+    setUploadProgress: Action<ServerFileStore, { name: string; loaded: number }>;
+    clearFileUploads: Action<ServerFileStore>;
+    removeFileUpload: Action<ServerFileStore, string>;
+    cancelFileUpload: Action<ServerFileStore, string>;
 }
 ```
 
@@ -489,12 +580,12 @@ const onUploadProgress = (data: AxiosProgressEvent, name: string) => {
 };
 ```
 
-**进度计算**:
-- `total`: 文件总大小 (来自 `file.size`)
-- `loaded`: 已上传字节数 (来自 axios `progressEvent.loaded`)
+**进度计算（代码证据）**:
+- `total`: `file.size` - 文件总大小
+- `loaded`: `AxiosProgressEvent.loaded` - 浏览器已发送字节数
 - 进度百分比: `(loaded / total) * 100`
 
-### 5.4 上传失败时的进度清空影响
+### 5.4 上传失败时的进度清空影响（代码证据）
 
 **文件**: `resources/scripts/components/server/files/UploadButton.tsx:95-100`
 
@@ -506,13 +597,6 @@ Promise.all(uploads.map((fn) => fn()))
         clearAndAddHttpError(error);
     });
 ```
-
-**对反馈语义的影响**:
-
-1. **全部或全无**：只要有一个文件上传失败，所有文件的进度状态都会被清除
-2. **用户无法获知部分成功**：多文件上传时，用户无法知道哪些文件已成功上传、哪些失败
-3. **进度丢失**：已上传的部分进度信息完全丢失，用户体验上表现为"突然消失"
-4. **重试成本**：用户需要重新选择所有文件并从头开始上传
 
 **状态清空实现**:
 **文件**: `resources/scripts/state/server/files.ts:48-52`
@@ -526,7 +610,16 @@ clearFileUploads: action((state) => {
 }),
 ```
 
-### 5.5 上传取消机制
+**对反馈语义的影响（可被代码证明）**：
+
+1. **全部或全无**：`Promise.all()` 的特性是只要有一个 Promise reject，整个 Promise 就 reject，因此只要有一个文件上传失败，就会进入 `catch` 块调用 `clearFileUploads()`
+2. **用户无法获知部分成功**：`clearFileUploads()` 会清空所有上传记录，包括已成功的
+3. **进度丢失**：所有 `loaded` 值被清空
+4. **重试成本**：用户需要重新选择所有文件
+
+### 5.5 上传取消机制（代码证据）
+
+**文件**: `resources/scripts/state/server/files.ts:70-78`
 
 ```typescript
 cancelFileUpload: action((state, payload) => {
@@ -539,16 +632,17 @@ cancelFileUpload: action((state, payload) => {
 
 ---
 
-## 六、对比：备份多段上传链路
+## 六、对比：备份多段上传链路（代码证据）
 
 **重要区分**：只有备份上传才实现了真正的多段 (multipart) 上传。
 
 ### 6.1 备份多段上传架构
 
-**文件**: `app/Http/Controllers/Api/Remote/Backups/BackupRemoteUploadController.php:16-134`
+**文件**: `app/Http/Controllers/Api/Remote\Backups\BackupRemoteUploadController.php:16-134`
 
 ```
 Wings 请求 Panel 获取多段上传信息
+   (GET /api/remote/backups/{backup}/upload?size={size})
    ↓
 Panel 调用 S3 CreateMultipartUpload API
    ↓
@@ -588,21 +682,22 @@ public function __invoke(Request $request, string $backup): JsonResponse
 }
 ```
 
-### 6.2 文件上传 vs 备份上传 对比
+### 6.2 文件上传 vs 备份上传 对比表
 
-| 特性 | 文件管理器上传 | 备份 S3 多段上传 |
-|------|--------------|-----------------|
-| **实现方式** | 单段 multipart/form-data | S3 Multipart Upload API |
-| **分片支持** | ❌ 无 | ✅ 有 (默认 5GB/片) |
+| 特性 | 文件管理器上传（代码证据） | 备份 S3 多段上传（代码证据） |
+|------|---------------------------|-----------------------------|
+| **实现方式** | `axios.post(url, { files: file })` 单段发送 | S3 `CreateMultipartUpload` + 多个 `UploadPart` |
+| **分片支持** | ❌ 无分片代码 | ✅ `for ($i = 0; $i < ($size / $maxPartSize); ++$i)` 循环生成多片 URL |
 | **数据流向** | 前端 → Wings | Wings → S3 (通过 presigned URL) |
-| **进度反馈** | axios onUploadProgress | 由 Wings 内部处理 |
+| **进度反馈** | `onUploadProgress` 浏览器原生事件 | 由 Wings 内部处理，无进度回调到 Panel |
 | **端点位置** | Wings `/upload/file` | S3 各分片 URL |
 | **认证方式** | JWT in query string | S3 presigned URL |
 | **Panel 角色** | 生成签名 URL | 生成 S3 presigned URL 列表 |
+| **分片大小** | 无 | 默认 5GB (`DEFAULT_MAX_PART_SIZE`) |
 
 ---
 
-## 七、文件下载流程
+## 七、文件下载流程（代码证据）
 
 **文件**: `app/Http/Controllers/Api/Client/Servers/FileController.php:77-100`
 
@@ -635,30 +730,30 @@ public function download(GetFileContentsRequest $request, Server $server): array
 
 ---
 
-## 八、设计亮点与权衡
+## 八、设计亮点与权衡（基于代码证据）
 
 ### 8.1 优点
 
 1. **流量卸载**: 大文件上传/下载直接走 Wings，不占用 Panel 带宽
 2. **分层权限**: 中间件粗粒度校验 + FormRequest 细粒度权限检查
-3. **实时进度**: 前端直连可获得精确的上传进度
+3. **实时进度**: 前端直连可获得精确的上传进度（浏览器原生 `progress` 事件）
 4. **可取消**: 基于 `AbortController` 支持上传取消
-5. **超时保护**: 压缩/解压操作设置 15 分钟长超时
+5. **超时保护**: 压缩/解压操作设置 15 分钟长超时（`DaemonFileRepository.php:212: 'timeout' => 60 * 15`）
 
-### 8.2 权衡点
+### 8.2 权衡点（代码证据）
 
-1. **跨域问题**: 前端直接请求 Wings 需要 CORS 配置
-2. **Token 时效**: 15 分钟过期，超大文件上传可能超时
-3. **单文件签名**: 每个文件单独请求签名 URL，可优化批量签名
-4. **失败处理粗糙**: 上传失败时清空所有进度，用户体验不佳
-5. **无断点续传**: 非分片上传，失败后需从头开始
+1. **跨域问题**: 前端直接请求 Wings 需要 CORS 配置（代码中未体现 Panel 端的 CORS 处理）
+2. **Token 时效**: 15 分钟过期，超大文件上传可能超时（`CarbonImmutable::now()->addMinutes(15)`）
+3. **单文件签名**: 每个文件单独请求签名 URL（`uploads.map((file) => getFileUploadUrl(uuid))`）
+4. **失败处理粗糙**: 上传失败时清空所有进度（`Promise.all()` + `clearFileUploads()`）
+5. **无断点续传**: 非分片上传，失败后需从头开始（无分片/断点相关代码）
 
-### 8.3 安全机制
+### 8.3 安全机制（代码证据）
 
-- **节点密钥认证**: Panel → Wings 内部通信使用对称密钥
-- **JWT 用户认证**: 上传/下载时验证用户身份和操作权限
-- **时间窗口**: `nbf` (not before) 防止令牌重放攻击
-- **随机因子**: `unique_id` 增加令牌不可预测性
+- **节点密钥认证**: Panel → Wings 内部通信使用 `$this->node->getDecryptedKey()` 作为 Bearer Token
+- **JWT 用户认证**: 上传/下载时 JWT 包含 `user_uuid` 和 `server_uuid`，Wings 可验证
+- **时间窗口**: `nbf` 设置为签发前 5 分钟（`canOnlyBeUsedAfter(CarbonImmutable::now()->subMinutes(5))`）
+- **随机因子**: `unique_id` 使用 `Str::random()` 增加令牌不可预测性
 - **权限分层**: 中间件 + FormRequest + Laravel Gate 三层校验
 
 ---
@@ -673,7 +768,10 @@ public function download(GetFileContentsRequest $request, Server $server): array
 | 文件上传控制器 | `app/Http/Controllers/Api/Client/Servers/FileUploadController.php` |
 | 备份多段上传控制器 | `app/Http/Controllers/Api/Remote/Backups/BackupRemoteUploadController.php` |
 | 服务器访问权限中间件 | `app/Http/Middleware/Api/Client/Server/AuthenticateServerAccess.php` |
+| 资源归属校验中间件 | `app/Http/Middleware/Api/Client/Server/ResourceBelongsToServer.php` |
+| 活动日志主体中间件 | `app/Http/Middleware/Activity/ServerSubject.php` |
 | 客户端 API 请求基类 | `app/Http/Requests/Api/Client/ClientApiRequest.php` |
+| 权限常量定义 | `app/Models/Permission.php` |
 | JWT 签名服务 | `app/Services/Nodes/NodeJWTService.php` |
 | 前端上传组件 | `resources/scripts/components/server/files/UploadButton.tsx` |
 | 前端上传状态 | `resources/scripts/state/server/files.ts` |
