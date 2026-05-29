@@ -592,22 +592,102 @@ public function index(ReportBackupCompleteRequest $request, string $backup): Jso
 | `bytes` | int | 成功时：备份文件大小 |
 | `completed_at` | datetime | 回写时间 |
 
-#### 9.3 备份任务链注意事项
+#### 9.3 备份操作的异常路径深度分析
 
-**重要**：备份任务在 `RunTaskJob` 中是**异步下发**的，`RunTaskJob` 只负责触发备份，不等待备份完成。
+备份操作是三种任务类型中代码路径最复杂的，因为 `InitiateBackupService::handle()` 内部串联了多个子步骤，每个子步骤可能抛出不同类型的异常。理解这些异常在 `RunTaskJob` 的 catch 块中如何被处理，是区分"下发失败"和"执行失败"的关键。
 
-```php
-// RunTaskJob:68-70
-case Task::ACTION_BACKUP:
-    $backupService->setIgnoredFiles(explode(PHP_EOL, $this->task->payload))->handle($server, null, true);
-    break;
+##### 9.3.1 备份调用的完整代码路径
+
+```
+RunTaskJob::handle()                          ← 外层 try-catch
+  │
+  ├─ backupService->setIgnoredFiles(...)->handle($server, null, true)
+  │    │
+  │    │  ──── InitiateBackupService::handle() 内部 ────
+  │    │
+  │    ├─ [步骤1] 频率限制检查
+  │    │   └─ 抛出 TooManyRequestsHttpException (extends HttpException)
+  │    │
+  │    ├─ [步骤2] 备份数量限制检查
+  │    │   ├─ 抛出 TooManyBackupsException (extends DisplayException extends Exception)
+  │    │   └─ 若 override=true → 删除最旧备份
+  │    │       └─ DeleteBackupService::handle()
+  │    │           ├─ 抛出 BackupLockedException (extends DisplayException)
+  │    │           └─ DaemonBackupRepository::delete() → 抛出 DaemonConnectionException
+  │    │
+  │    └─ [步骤3] 数据库事务内：
+  │        ├─ 创建 Backup 记录 (数据库操作)
+  │        └─ DaemonBackupRepository::backup()  ← 向 Wings 发起 HTTP POST
+  │            └─ 抛出 DaemonConnectionException (extends DisplayException extends Exception)
+  │
+  ├─ catch (\Exception $exception)             ← RunTaskJob 的 catch 块
+  │    └─ 判断是否 continue_on_failure + DaemonConnectionException
+  │         ├─ 是 → 吞掉异常，继续执行 queueNextTask()
+  │         └─ 否 → throw，触发 RunTaskJob::failed()
+  │
+  ├─ markTaskNotQueued()                       ← 正常路径
+  └─ queueNextTask()                           ← 正常路径
 ```
 
-这意味着：
-1. `RunTaskJob` 会立即完成，并触发下一个任务
-2. 备份的实际执行在 Wings 后台进行
-3. 备份结果通过独立的回调接口回写
-4. 备份失败**不会**影响任务链的执行（除非 Wings 连接失败）
+##### 9.3.2 "下发失败"的精确定义
+
+**下发失败** = 在 `RunTaskJob::handle()` 的 try 块中，调用备份服务时抛出了异常。
+
+这包含以下子场景：
+
+| 场景 | 异常类型 | 异常继承链 | 触发条件 |
+|------|----------|-----------|----------|
+| 备份频率超限 | `TooManyRequestsHttpException` | `HttpException` → `RuntimeException` → `Exception` | 在 `backups.throttles.period` 秒内创建备份数超过 `backups.throttles.limit` |
+| 备份数量超限 | `TooManyBackupsException` | `DisplayException` → `PterodactylException` → `Exception` | 成功备份数 ≥ `server.backup_limit` 且无旧备份可删 |
+| 备份数量超限(全锁定) | `TooManyBackupsException` | 同上 | 成功备份数 ≥ `server.backup_limit` 且所有备份都被锁定 |
+| 旧备份锁定 | `BackupLockedException` | `DisplayException` → `PterodactylException` → `Exception` | 删除旧备份时发现备份被锁定 |
+| Wings 连接失败(备份指令) | `DaemonConnectionException` | `DisplayException` → `PterodactylException` → `Exception` | Wings 不可达、超时、或返回非 2xx |
+| Wings 连接失败(删除旧备份) | `DaemonConnectionException` | 同上 | 删除旧备份时 Wings 不可达（404 除外） |
+| 数据库写入失败 | `QueryException` | `RuntimeException` → `Exception` | 创建 Backup 记录时数据库异常 |
+
+**关键代码**（`RunTaskJob.php:74-80`）：
+```php
+catch (\Exception $exception) {
+    if (!($this->task->continue_on_failure && $exception instanceof DaemonConnectionException)) {
+        throw $exception;
+    }
+}
+```
+
+##### 9.3.3 "执行失败"的精确定义
+
+**执行失败** = `RunTaskJob::handle()` 正常返回后，Wings 在后台执行备份过程中失败。
+
+```
+Wings 后台执行备份
+  │
+  ├─ 备份成功 → Wings 回调 POST /api/remote/backups/{uuid}/status
+  │              → BackupStatusController::index()
+  │              → backup.is_successful = true, completed_at = now()
+  │
+  └─ 备份失败 → Wings 回调 POST /api/remote/backups/{uuid}/status
+                 → BackupStatusController::index()
+                 → backup.is_successful = false, completed_at = now()
+                 → Activity Log: server:backup.fail
+```
+
+**下发失败与执行失败的本质区别**：
+
+| 维度 | 下发失败 | 执行失败 |
+|------|----------|----------|
+| 发生时机 | RunTaskJob 执行期间 | RunTaskJob 已完成后 |
+| 异常来源 | Panel 侧（PHP 代码） | Wings 侧（Go 代码） |
+| 是否影响任务链 | 受 `continue_on_failure` 控制 | **不影响**，任务链已继续 |
+| 记录方式 | Laravel 日志 / failed_jobs 表 | Activity Log (`server:backup.fail`) |
+| Backup 记录状态 | 可能未创建，或已创建但 `is_successful=false, completed_at=null` | 已创建且回写 `is_successful=false, completed_at=now()` |
+
+##### 9.3.4 中间状态：Backup 记录已创建但 Wings 未回调
+
+当 `DaemonBackupRepository::backup()` 的 HTTP 请求成功发出（Wings 返回 202），但 Wings 在后台执行备份过程中崩溃或失去连接时，会出现：
+- Backup 记录已存在（`is_successful=false, completed_at=null`）
+- Wings 永远不会回调 `BackupStatusController`
+
+这就是 `PruneOrphanedBackupsCommand` 存在的原因（`app/Console/Commands/Maintenance/PruneOrphanedBackupsCommand.php`），它会清理这种"悬挂"的备份记录。
 
 ---
 
@@ -725,17 +805,100 @@ Queue::failing(function (JobFailed $event) {
 });
 ```
 
-#### 10.4 备份失败的特殊情况
+#### 10.4 `continue_on_failure` 的精确作用范围
 
-备份失败有两个层面：
-1. **下发失败**：`RunTaskJob` 调用 `InitiateBackupService` 时失败
-   - 触发 `RunTaskJob::failed()`
-   - 终止任务链（除非 `continue_on_failure`）
-   
-2. **执行失败**：Wings 备份过程中失败
-   - 通过 `BackupStatusController` 回写失败状态
-   - 记录 `server:backup.fail` Activity Log
-   - **不影响** 任务链（因为 RunTaskJob 早已完成）
+`continue_on_failure` 是 Task 模型上的布尔字段，控制任务失败后任务链是否继续执行。但其作用范围非常**狭窄**，仅对一种特定的异常类型生效。
+
+##### 核心判断代码（RunTaskJob.php:74-80）
+
+```php
+catch (\Exception $exception) {
+    if (!($this->task->continue_on_failure && $exception instanceof DaemonConnectionException)) {
+        throw $exception;
+    }
+}
+```
+
+这个条件等价于：
+
+```
+continue_on_failure = true  AND  异常是 DaemonConnectionException
+    → 吞掉异常，执行 markTaskNotQueued() + queueNextTask()，任务链继续
+
+其他所有情况
+    → 抛出异常，触发 RunTaskJob::failed()，任务链终止
+```
+
+##### `continue_on_failure` 对各种异常的实际效果
+
+| 异常类型 | continue_on_failure=true | continue_on_failure=false |
+|----------|-------------------------|--------------------------|
+| `DaemonConnectionException`（Wings 连接失败） | **继续**执行任务链 | **终止**任务链 |
+| `TooManyBackupsException`（备份超限） | **终止**任务链 | **终止**任务链 |
+| `TooManyRequestsHttpException`（频率超限） | **终止**任务链 | **终止**任务链 |
+| `BackupLockedException`（旧备份被锁定） | **终止**任务链 | **终止**任务链 |
+| `QueryException`（数据库错误） | **终止**任务链 | **终止**任务链 |
+| `InvalidArgumentException`（无效 action） | **终止**任务链 | **终止**任务链 |
+| 任意 `\Exception` 子类（非 DaemonConnectionException） | **终止**任务链 | **终止**任务链 |
+
+**结论**：`continue_on_failure` **只对 DaemonConnectionException 生效**，即只有"与 Wings 守护进程的网络通信失败"这一种场景可以被容忍。所有业务逻辑异常（备份超限、频率超限、锁定等）无论 `continue_on_failure` 如何设置，都会终止任务链。
+
+##### 三种任务类型的 `continue_on_failure` 效果对比
+
+| 任务类型 | 可能抛出 DaemonConnectionException 的位置 | continue_on_failure 生效场景 |
+|----------|------------------------------------------|---------------------------|
+| `power` | `DaemonPowerRepository::send()` — Wings 连接失败 | Wings 不可达时继续执行后续任务 |
+| `command` | `DaemonCommandRepository::send()` — Wings 连接失败 | Wings 不可达时继续执行后续任务 |
+| `backup` | `DaemonBackupRepository::backup()` — Wings 连接失败 | Wings 不可达时继续执行后续任务 |
+| `backup` | `DaemonBackupRepository::delete()` — 删除旧备份时 Wings 不可达 | Wings 不可达时继续执行后续任务 |
+
+**注意**：备份操作有两处可能抛出 `DaemonConnectionException`：
+1. 删除旧备份时（`InitiateBackupService:106` → `DeleteBackupService:49` → `DaemonBackupRepository::delete()`）
+2. 发起备份指令时（`InitiateBackupService:120-122` → `DaemonBackupRepository::backup()`）
+
+这两处都被 `RunTaskJob` 的同一个 catch 块捕获，`continue_on_failure` 对两处都生效。
+
+##### 任务链是否继续执行的完整判断流程
+
+```
+RunTaskJob::handle() 执行任务动作
+  │
+  ├─ 无异常
+  │   └─ markTaskNotQueued() → queueNextTask() → 任务链继续 ✅
+  │
+  └─ 抛出异常
+      │
+      ├─ 异常是 DaemonConnectionException？
+      │   ├─ 否 → throw → RunTaskJob::failed() → 任务链终止 ❌
+      │   └─ 是
+      │       ├─ continue_on_failure = true？
+      │       │   ├─ 是 → 吞掉异常 → markTaskNotQueued() → queueNextTask() → 任务链继续 ✅
+      │       │   └─ 否 → throw → RunTaskJob::failed() → 任务链终止 ❌
+      │
+      └─ 特殊：服务器 status != null（被暂停/重装）
+          └─ 直接调用 failed()，不经过 catch 块 → 任务链终止 ❌
+              （continue_on_failure 无效）
+```
+
+**另一个绕过 `continue_on_failure` 的路径**：`RunTaskJob:53-57`，当服务器 status 不为 null 时，直接调用 `$this->failed()`，这完全在 try-catch 之外，`continue_on_failure` 无法介入。
+
+##### failed() 对任务链的影响
+
+**文件位置**：`app/Jobs/Schedule/RunTaskJob.php:89-93`
+
+```php
+public function failed(?\Exception $exception = null)
+{
+    $this->markTaskNotQueued();    // is_queued = false
+    $this->markScheduleComplete(); // is_processing = false, last_run_at = now()
+}
+```
+
+调用 `failed()` 后：
+1. 当前任务的 `is_queued` 被重置为 false
+2. **整个 Schedule** 被标记为完成（`is_processing = false`）
+3. 后续任务**不会被分发**，任务链彻底终止
+4. Schedule 的 `next_run_at` 在 `ProcessScheduleService` 中已经更新为下一次时间，所以下次 Cron 周期仍会触发
 
 ---
 
@@ -811,17 +974,19 @@ Queue::failing(function (JobFailed $event) {
 1. **分布式执行**：通过队列任务实现，支持横向扩展
 2. **防重叠**：`is_processing` 标志 + `withoutOverlapping()` 双重保障
 3. **任务链**：支持多任务按顺序执行，每个任务可设置延迟
-4. **容错**：支持单个任务失败后继续执行后续任务
+4. **有限容错**：`continue_on_failure` 允许在 Wings 不可达时继续执行后续任务，但仅限于网络通信失败这一种异常类型
 5. **状态一致性**：关键操作使用数据库事务保证
 
 ### 注意事项
 1. **精度限制**：每分钟检查一次，不支持秒级调度
 2. **结果回调差异**：
    - 电源/命令操作：无结果回调，Wings 执行结果不会回写到 Panel
-   - 备份操作：有独立的回调接口，备份完成后 Wings 会通过 `POST /api/remote/backups/{backup}/status` 回写状态
-3. **备份异步性**：备份任务触发后立即完成，不等待 Wings 备份完成，任务链继续执行
-4. **无内置失败通知**：需要自行扩展通知机制（可通过 ActivityLogged 事件或 Queue::failing 事件）
-5. **队列依赖**：必须运行队列 worker（`php artisan queue:work`）
-6. **时间同步**：服务器时间需准确，否则 Cron 计算会有偏差
-7. **任务上限**：每个 Schedule 最多 10 个任务（可通过 `PTERODACTYL_PER_SCHEDULE_TASK_LIMIT` 配置）
-8. **备份限制**：服务器 `backup_limit = 0` 时不能创建备份任务
+   - 备份操作：有独立的回调接口（`POST /api/remote/backups/{uuid}/status`），备份完成后 Wings 回写状态
+3. **备份异步性**：`DaemonBackupRepository::backup()` 只向 Wings 发起 HTTP POST 触发备份，不等待备份完成；`RunTaskJob` 触发成功后立即继续任务链
+4. **`continue_on_failure` 作用域极窄**：仅对 `DaemonConnectionException`（Wings 网络通信失败）生效；所有业务逻辑异常（备份超限、频率超限、锁定等）无论此标志如何都会终止任务链
+5. **服务器异常状态绕过 continue_on_failure**：当 `server.status != null`（被暂停/重装）时，直接调用 `failed()`，不经过 try-catch，`continue_on_failure` 无法介入
+6. **无内置失败通知**：需要自行扩展通知机制（可通过 ActivityLogged 事件或 Queue::failing 事件）
+7. **队列依赖**：必须运行队列 worker（`php artisan queue:work`）
+8. **备份悬挂风险**：若 Wings 在接受备份指令后崩溃，Backup 记录会处于 `is_successful=false, completed_at=null` 的悬挂状态，需 `PruneOrphanedBackupsCommand` 清理
+9. **任务上限**：每个 Schedule 最多 10 个任务（可通过 `PTERODACTYL_PER_SCHEDULE_TASK_LIMIT` 配置）
+10. **备份限制**：服务器 `backup_limit = 0` 时不能创建备份任务
