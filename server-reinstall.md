@@ -128,6 +128,159 @@ public function handle(Server $server): Server
 
 ---
 
+## 二、三种入口的完整中间件栈对比
+
+### 2.1 中间件栈的三层架构
+
+**全局中间件**（所有请求共享）：
+```
+TrustProxies → HandleCors → PreventRequestsDuringMaintenance → ValidatePostSize → TrimStrings → ConvertEmptyStringsToNull → SetSecurityHeaders
+```
+
+### 2.2 Application API 重装接口完整中间件栈
+
+```
+POST /api/application/servers/{server:id}/reinstall
+```
+
+**中间件执行顺序（从外到内）：
+
+| 层级 | 中间件 | 代码位置 | 检查内容 | 失败响应 |
+|------|---------|---------|----------|---------|
+| 1 全局 | TrustProxies | `Kernel.php:44 | 代理信任 | - |
+| 2 全局 | HandleCors | `Kernel.php:45 | CORS 策略 | 403 |
+| 3 全局 | PreventRequestsDuringMaintenance | `Kernel.php:46 | 维护模式 | 503 |
+| 4 全局 | ValidatePostSize | `Kernel.php:47 | POST 大小 | 413 |
+| 5 全局 | TrimStrings | `Kernel.php:48 | 字符串修剪 | - |
+| 6 全局 | ConvertEmptyStringsToNull | `Kernel.php:49 | 空值转换 | - |
+| 7 全局 | SetSecurityHeaders | `Kernel.php:50 | 安全头 | - |
+| 8 API 组 | EnsureStatefulRequests | `Kernel.php:71 | Session CSRF | 419 |
+| 9 API 组 | auth:sanctum | `Kernel.php:72 | 登录认证 | 401 |
+| 10 API 组 | IsValidJson | `Kernel.php:73 | JSON 格式 | 400 |
+| 11 API 组 | TrackAPIKey | `Kernel.php:74 | API Key 审计 | - |
+| 12 API 组 | RequireTwoFactorAuthentication | `Kernel.php:75 | 2FA 检查 | 403 |
+| 13 API 组 | AuthenticateIPAccess | `Kernel.php:76 | IP 白名单 | 403 |
+| 14 API 组 | RequireTwoFactorAuthentication | `RouteServiceProvider.php:50 | 再次 2FA 检查 | 403 |
+| 15 throttle:api.application | `RouteServiceProvider.php:51 | 速率限制 | 429 |
+| 16 application-api 组 | SubstituteBindings | `Kernel.php:79 | 路由模型绑定 | 404 |
+| 17 application-api 组 | AuthenticateApplicationUser | `Kernel.php:80 | root_admin 检查 | 403 |
+| 18 路由级 | ServerWriteRequest | `ServerWriteRequest.php:12 | 🔑 AdminAcl::WRITE | 403 |
+| 19 控制器 | 无状态检查 | - | **无任何状态校验！ | - |
+
+**⚠️ **关键发现**：Application API 重装接口**没有任何状态检查。只要是 root_admin 且有 WRITE 权限，**任何状态都可以重装，包括 `INSTALL_FAILED`。
+
+**AuthenticateApplicationUser 实现**：`app/Http/Middleware/Api/Application/AuthenticateApplicationUser.php:14-23`
+```php
+public function handle(Request $request, \Closure $next): mixed
+{
+    $user = $request->user();
+    if (!$user || !$user->root_admin) {  // ← 只检查 root_admin
+        throw new AccessDeniedHttpException('This account does not have permission to access the API.');
+    }
+    return $next($request);
+}
+```
+
+**ServerWriteRequest 实现**：`app/Http/Requests/Api/Application/Servers/ServerWriteRequest.php:10-12`
+```php
+protected ?string $resource = AdminAcl::RESOURCE_SERVERS;
+protected int $permission = AdminAcl::WRITE;
+```
+
+### 2.3 Client API 重装接口完整中间件栈
+
+```
+POST /api/client/servers/{server}/settings/reinstall
+```
+
+| 层级 | 中间件 | 代码位置 | 检查内容 | 失败响应 |
+|------|---------|---------|----------|---------|
+| 1-7 全局 | 同上 | - | 同上 | 同上 |
+| 8 API 组 | EnsureStatefulRequests | `Kernel.php:71 | Session CSRF | 419 |
+| 9 API 组 | auth:sanctum | `Kernel.php:72 | 登录认证 | 401 |
+| 10 API 组 | IsValidJson | `Kernel.php:73 | JSON 格式 | 400 |
+| 11 API 组 | TrackAPIKey | `Kernel.php:74 | API Key 审计 | - |
+| 12 API 组 | RequireTwoFactorAuthentication | `Kernel.php:75 | 2FA 检查 | 403 |
+| 13 API 组 | AuthenticateIPAccess | `Kernel.php:76 | IP 白名单 | 403 |
+| 14 API 组 | RequireTwoFactorAuthentication | `RouteServiceProvider.php:50 | 再次 2FA | 403 |
+| 15 throttle:api.client | `RouteServiceProvider.php:56 | 速率限制 | 429 |
+| 16 client-api 组 | SubstituteClientBindings | `Kernel.php:83 | UUID 路由绑定 | 404 |
+| 17 client-api 组 | RequireClientApiKey | `Kernel.php:84 | 禁止 Application Key | 403 |
+| 18 路由组 | ServerSubject | `api-client.php:60 | 活动日志上下文 | - |
+| 19 路由组 | AuthenticateServerAccess | `api-client.php:61 | 🔐 服务器状态检查 | 409 |
+| 20 路由组 | ResourceBelongsToServer | `api-client.php:62 | 资源归属校验 | 404 |
+| 21 请求 | ReinstallServerRequest | `ReinstallServerRequest.php:12 | 🔑 settings.reinstall 权限 | 403 |
+| 22 控制器 | SettingsController::reinstall | - | 业务逻辑 | - |
+
+**Client API 的**AuthenticateServerAccess** 是状态拦截的核心，它调用 `validateCurrentState()` → `isInstalled()`，导致 `INSTALL_FAILED` 被拦截。
+
+**RequireClientApiKey 实现**：`app/Http/Middleware/Api/Client/RequireClientApiKey.php:15-24`
+```php
+public function handle(Request $request, \Closure $next): mixed
+{
+    $token = $request->user()->currentAccessToken();
+    if ($token instanceof ApiKey && $token->key_type === ApiKey::TYPE_APPLICATION) {
+        throw new AccessDeniedHttpException('You are attempting to use an application API key on an endpoint that requires a client API key.');
+    }
+    return $next($request);
+}
+```
+
+**权限校验链**（用户必须有 `settings.reinstall 权限。**ServerPolicy** 处理：
+- 服务器所有者（owner_id == user.id）→ ✅ 通过
+- root_admin → ✅ 通过
+- 子用户有 `settings.reinstall` 权限 → ✅ 通过
+- 其他 → ❌ 403
+
+**ServerPolicy 实现**：`app/Policies/ServerPolicy.php:26-33`
+```php
+public function before(User $user, string $ability, Server $server): bool
+{
+    if ($user->root_admin || $server->owner_id === $user->id) {
+        return true;  // 所有者和管理员绕过权限检查
+    }
+    return $this->checkPermission($user, $server, $ability);  // 子用户权限检查
+}
+```
+
+### 2.4 Admin Web 重装入口完整中间件栈
+
+```
+POST /admin/servers/view/{server:id}/manage/reinstall
+```
+
+| 层级 | 中间件 | 代码位置 | 检查内容 | 失败响应 |
+|------|---------|---------|----------|---------|
+| 1-7 全局 | 同上 | - | 同上 | 同上 |
+| 8 web 组 | EncryptCookies | `Kernel.php:62 | Cookie 加密 | - |
+| 9 web 组 | AddQueuedCookiesToResponse | `Kernel.php:63 | Cookie 处理 | - |
+| 10 web 组 | StartSession | `Kernel.php:64 | Session 启动 | - |
+| 11 web 组 | ShareErrorsFromSession | `Kernel.php:65 | Session 错误 | - |
+| 12 web 组 | VerifyCsrfToken | `Kernel.php:66 | CSRF Token | 419 |
+| 13 web 组 | SubstituteBindings | `Kernel.php:67 | 路由绑定 | 404 |
+| 14 web 组 | LanguageMiddleware | `Kernel.php:68 | 语言设置 | - |
+| 15 admin 组 | auth.session | `RouteServiceProvider.php:43 | Session 认证 | 401 |
+| 16 admin 组 | RequireTwoFactorAuthentication | `RouteServiceProvider.php:43 | 2FA 检查 | 403 |
+| 17 admin 组 | AdminAuthenticate | `RouteServiceProvider.php:43 | root_admin 检查 | 403 |
+| 18 控制器 | ServersController::reinstallServer | - | **无状态检查！** | - |
+
+**AdminAuthenticate 实现**：`app/Http/Middleware/AdminAuthenticate.php:15-22`
+```php
+public function handle(Request $request, \Closure $next): mixed
+{
+    if (!$request->user() || !$request->user()->root_admin) {
+        throw new AccessDeniedHttpException();
+    }
+    return $next($request);
+}
+```
+
+⚠️ **关键发现**：Admin Web 重装接口**没有任何状态检查**。只要是 root_admin，**任何状态都可以重装**，包括 `INSTALL_FAILED`。
+
+**GET 管理页面（`ServerViewController::manage）虽然有拦截，但 POST 重装路由是独立路由，不经过该方法。
+
+---
+
 ## 三、Wings 通信层：DaemonServerRepository
 
 **文件**：`app/Repositories/Wings/DaemonServerRepository.php:95-107`
@@ -774,6 +927,29 @@ null（正常）             →    不变
 ---
 
 ## 十四、失败状态的真实流转差异：INSTALL_FAILED vs REINSTALL_FAILED
+
+### 14.0 三种入口的权限模型与边界总结
+
+在深入分析失败状态差异之前，先统一回顾三种重装入口的权限模型和边界检查：
+
+| 检查维度 | Application API | Client API | Admin Web |
+|---------|----------------|------------|-----------|
+| **身份认证** | `auth:sanctum` + `AuthenticateApplicationUser`（root_admin） | `auth:sanctum` + `RequireClientApiKey`（禁止 Application Key） | `auth.session` + `AdminAuthenticate`（root_admin） |
+| **2FA 检查** | ✅ 两次（API 组 + Route 组） | ✅ 两次（API 组 + Route 组） | ✅ 一次（Route 组） |
+| **IP 白名单** | ✅ `AuthenticateIPAccess` | ✅ `AuthenticateIPAccess` | ❌ 无 |
+| **速率限制** | ✅ `throttle:api.application` | ✅ `throttle:api.client` | ❌ 无 |
+| **CSRF 保护** | ✅ `EnsureStatefulRequests` | ✅ `EnsureStatefulRequests` | ✅ `VerifyCsrfToken`（web 组） |
+| **服务器归属** | ❌ 无（管理员可操作所有服务器） | ✅ 所有者/子用户/管理员 | ❌ 无（管理员可操作所有服务器） |
+| **子用户权限** | ❌ 无（管理员接口） | ✅ `ServerPolicy` + `settings.reinstall` | ❌ 无（管理员接口） |
+| **服务器状态** | ❌ **无任何状态检查！** | ✅ `validateCurrentState()`（拦截 INSTALL_FAILED） | ❌ **无任何状态检查！** |
+| **资源归属** | ❌ 无 | ✅ `ResourceBelongsToServer` | ❌ 无 |
+| **API Key 审计** | ✅ `TrackAPIKey` | ✅ `TrackAPIKey` | ❌ 无 |
+
+**⚠️ 统一边界结论**：
+- **Client API** 是最严格的入口，有 11 层检查，包括状态检查和子用户权限
+- **Application API** 和 **Admin Web** 是管理员后门，**故意跳过了状态检查**，允许管理员在任何状态下触发重装
+- 这是设计意图，不是 bug——管理员需要有能力"抢救"处于失败状态的服务器
+- 但 UI 层的提示语"cannot be recovered"与实际能力不符，造成了误解
 
 ### 14.1 isInstalled() 的不对称判断
 
