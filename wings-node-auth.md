@@ -12,7 +12,7 @@ Wings（原 Daemon）与 Panel 的认证体系采用**双轨制认证**：
 
 ### 2.1 节点创建时的持久凭据生成
 
-**核心代码**：`app/Services/Nodes/NodeCreationService.php:25-32**
+**核心代码**：`app/Services/Nodes/NodeCreationService.php:25-32`
 
 ```php
 public function handle(array $data): Node
@@ -67,9 +67,19 @@ public function __invoke(Request $request, Node $node): JsonResponse
 cd /etc/pterodactyl && sudo wings configure --panel-url <panel_url> --token <deployment_token> --node <node_id>
 ```
 
-### 2.3 节点配置获取
+### 2.3 节点配置获取（首次接入）
 
-**核心代码**：`app/Http/Controllers/Api/Application/Nodes/NodeConfigurationController.php:17-20**
+> **⚠️ 重要修正**：节点配置获取**不是**通过 Remote API 进行的，也不存在所谓的"daemon.configuration"例外路由。
+
+节点配置有两个获取入口：
+
+**1. 管理后台（需要管理员登录）**：
+- 路由：`admin.nodes.view.configuration` (`routes/admin.php:155`)
+- 控制器：`app/Http/Controllers/Admin/Nodes/NodeViewController.php:60-63`
+
+**2. Application API（需要 Application API Key）**：
+- 路由：`/api/application/nodes/{node}/configuration` (`routes/api-application.php:38`)
+- 控制器：`app/Http/Controllers/Api/Application/Nodes/NodeConfigurationController.php:17-20`
 
 ```php
 public function __invoke(GetNodeRequest $request, Node $node): JsonResponse
@@ -78,7 +88,7 @@ public function __invoke(GetNodeRequest $request, Node $node): JsonResponse
 }
 ```
 
-**配置输出**（含解密后的完整凭据：`app/Models/Node.php:142-168`
+**配置输出（含解密后的完整凭据）**：`app/Models/Node.php:142-168`
 
 ```php
 public function getConfiguration(): array
@@ -95,6 +105,12 @@ public function getConfiguration(): array
     ];
 }
 ```
+
+**首次接入流程**：
+1. 管理员在 Panel 创建节点 → 生成 `daemon_token_id` + `daemon_token`
+2. 管理员通过管理后台或 Application API 获取节点配置（含明文 token）
+3. 将配置复制到 Wings 服务器的 `/etc/pterodactyl/config.yml`
+4. Wings 启动后，使用配置中的 token 与 Panel 通信
 
 ---
 
@@ -116,7 +132,7 @@ public function handle(Request $request, \Closure $next): mixed
     }
 
     $parts = explode('.', $bearer);
-    if (count($parts) !== 2 || empty($parts[0]) || empty($parts[1]))) {
+    if (count($parts) !== 2 || empty($parts[0]) || empty($parts[1])) {
         throw new BadRequestHttpException('The Authorization header provided was not in a valid format.');
     }
 
@@ -125,7 +141,7 @@ public function handle(Request $request, \Closure $next): mixed
             'daemon_token_id' => $parts[0],
         ]);
 
-        if (hash_equals((string) $this->encrypter->decrypt($node->daemon_token), $parts[1]))) {
+        if (hash_equals((string) $this->encrypter->decrypt($node->daemon_token), $parts[1])) {
             $request->attributes->set('node', $node);
             return $next($request);
         }
@@ -142,8 +158,11 @@ public function handle(Request $request, \Closure $next): mixed
 Authorization: Bearer <daemon_token_id>.<decrypted_daemon_token>
 ```
 
-**例外路由**（无需认证的路由：
-- `daemon.configuration` - 节点配置获取（用于首次接入）
+> **⚠️ 关键发现**：中间件中的例外路由 `daemon.configuration` **实际上永远不会匹配**！
+>
+> 原因：`routes/api-remote.php` 中的所有路由都**没有设置路由名称**（没有 `->name()` 调用），所以 `$request->route()->getName()` 返回 `null`，`$this->except` 中的例外路由永远不会被命中。
+>
+> 结论：**所有 `/api/remote/*` 路由都需要认证，没有例外！**
 
 ### 3.2 路由组配置
 
@@ -165,21 +184,26 @@ Route::middleware('daemon')
 ],
 ```
 
-### 3.3 Remote API 端点
+### 3.3 Remote API 真实端点集合
 
-**核心代码**：`routes/api-remote.php`
+> **⚠️ 修正**：之前列出的路由名称都是错误的，实际上 `api-remote.php` 中的路由都没有设置名称。以下是真实的端点：
 
-| 端点 | 方法 | 用途 |
-|------|------|------|
-| `/api/remote/sftp/auth` | POST | SFTP 认证 |
-| `/api/remote/servers` | GET | 获取节点服务器列表 |
-| `/api/remote/servers/reset` | POST | 重置服务器状态 |
-| `/api/remote/servers/{uuid}` | GET | 获取单个服务器配置 |
-| `/api/remote/servers/{uuid}/install` | GET/POST | 服务器安装 |
-| `/api/remote/servers/{uuid}/transfer/*` | POST | 服务器迁移 |
-| `/api/remote/backups/*` | GET/POST | 备份操作 |
-| `/api/remote/activity` | POST | 活动日志上报 |
-| `/api/remote/eggs/install` | POST | Egg 安装脚本 |
+**路由文件**：`routes/api-remote.php`
+
+| 端点 | 方法 | 控制器 | 用途 |
+|------|------|--------|------|
+| `/api/remote/sftp/auth` | POST | `SftpAuthenticationController::__invoke` | SFTP 认证 |
+| `/api/remote/servers` | GET | `ServerDetailsController::list` | 获取节点服务器列表 |
+| `/api/remote/servers/reset` | POST | `ServerDetailsController::resetState` | 重置服务器状态 |
+| `/api/remote/activity` | POST | `ActivityProcessingController::__invoke` | 活动日志上报 |
+| `/api/remote/servers/{uuid}` | GET | `ServerDetailsController::__invoke` | 获取单个服务器配置 |
+| `/api/remote/servers/{uuid}/install` | GET | `ServerInstallController::index` | 获取服务器安装配置 |
+| `/api/remote/servers/{uuid}/install` | POST | `ServerInstallController::store` | 上报服务器安装状态 |
+| `/api/remote/servers/{uuid}/transfer/failure` | POST | `ServerTransferController::failure` | 服务器迁移失败 |
+| `/api/remote/servers/{uuid}/transfer/success` | POST | `ServerTransferController::success` | 服务器迁移成功 |
+| `/api/remote/backups/{backup}` | GET | `BackupRemoteUploadController::__invoke` | 备份下载重定向 |
+| `/api/remote/backups/{backup}` | POST | `BackupStatusController::index` | 备份完成上报 |
+| `/api/remote/backups/{backup}/restore` | POST | `BackupStatusController::restore` | 备份恢复完成上报 |
 
 ### 3.4 凭据重置
 
@@ -190,7 +214,7 @@ public function handle(Node $node, array $data, bool $resetToken = false): Node
 {
     if ($resetToken) {
         $data['daemon_token'] = $this->encrypter->encrypt(Str::random(Node::DAEMON_TOKEN_LENGTH));
-        $data['daemon_token_id'] = Str::random(Node::DAEMON_TOKEN_ID_LENGTH));
+        $data['daemon_token_id'] = Str::random(Node::DAEMON_TOKEN_ID_LENGTH);
     }
     // ...
 }
@@ -233,10 +257,10 @@ public function handle(Node $node, array $data, bool $resetToken = false): Node
 ```
 
 **心跳频率**：每 10 秒
-**目标端点**：Wings `/api/system`
-**认证方式**：直接使用解密后的 daemon_token 作为 Bearer Token
+**目标端点**：Wings `/api/system`（注意：这是 Panel 前端直接访问 Wings，不经过 Panel 后端）
+**认证方式**：直接使用解密后的 `daemon_token` 作为 Bearer Token
 
-### 4.2 后端系统信息获取
+### 4.2 后端系统信息获取（节点详情页）
 
 **核心代码**：`app/Http/Controllers/Admin/Nodes/SystemInformationController.php:26-39`
 
@@ -265,15 +289,35 @@ public function getSystemInformation(?int $version = null): array
     try {
         $response = $this->getHttpClient()->get('/api/system' . (!is_null($version) ? '?v=' . $version : ''));
     } catch (TransferException $exception) {
-        throw new DaemonConnectionException($exception));
+        throw new DaemonConnectionException($exception);
     }
-    return json_decode($response->getBody()->__toString(), true));
+    return json_decode($response->getBody()->__toString(), true);
 }
 ```
 
-### 4.3 版本兼容性校验
+**前端刷新**：`resources/views/admin/nodes/view/index.blade.php:154-168`
 
-**核心代码**：`app/Services/Helpers/SoftwareVersionService.php:74-81`
+```javascript
+(function getInformation() {
+    $.ajax({
+        method: 'GET',
+        url: '/admin/nodes/view/{{ $node->id }}/system-information',
+        timeout: 5000,
+    }).done(function (data) {
+        $('[data-attr="info-version"]').html(escapeHtml(data.version));
+        $('[data-attr="info-system"]').html(...);
+        $('[data-attr="info-cpus"]').html(data.system.cpus);
+    }).always(function() {
+        setTimeout(getInformation, 10000);
+    });
+})();
+```
+
+### 4.3 版本比较结果的消费路径
+
+> **⚠️ 关键发现**：`isLatestDaemon()` 方法**没有在节点心跳展示中被消费**！
+
+**版本比较方法定义**：`app/Services/Helpers/SoftwareVersionService.php:74-81`
 
 ```php
 public function isLatestDaemon(string $version): bool
@@ -285,7 +329,30 @@ public function isLatestDaemon(string $version): bool
 }
 ```
 
-**版本获取**：`app/Services/Helpers/SoftwareVersionService.php:38-41`
+**实际消费情况**：
+
+| 位置 | 消费方式 |
+|------|----------|
+| `app/Console/Commands/InfoCommand.php:32` | CLI 命令中显示 Panel 版本信息（只调用 `isLatestPanel()`） |
+| `resources/views/admin/index.blade.php:19,29` | 管理首页显示 Panel 版本状态（只调用 `isLatestPanel()`） |
+| `resources/views/admin/nodes/view/index.blade.php:42` | 节点详情页只显示最新版本号（调用 `getDaemon()`，不调用 `isLatestDaemon()`） |
+
+**节点详情页展示**：`resources/views/admin/nodes/view/index.blade.php:42`
+
+```html
+<td>Daemon Version</td>
+<td><code data-attr="info-version"><i class="fa fa-refresh fa-fw fa-spin"></i></code> (Latest: <code>{{ $version->getDaemon() }}</code>)</td>
+```
+
+**版本数据流程**：
+1. 后端 `SystemInformationController` → 从 Wings 获取 `version` 字段
+2. 前端 AJAX 获取 → 直接替换 `[data-attr="info-version"]` 的 HTML
+3. 页面渲染 → 显示当前版本 + `$version->getDaemon()`（最新版本号）
+4. **没有进行版本比较**，也没有根据版本是否最新显示不同状态
+
+### 4.4 版本获取机制
+
+**核心代码**：`app/Services/Helpers/SoftwareVersionService.php:38-41`
 
 ```php
 public function getDaemon(): string
@@ -296,14 +363,11 @@ public function getDaemon(): string
 
 **缓存机制**：缓存 60 分钟，从 CDN 获取最新版本信息
 
-**前端展示**：`resources/views/admin/nodes/view/index.blade.php:42`
+**遥测服务使用 v2 版本**：`app/Services/Telemetry/TelemetryCollectionService.php:61`
 
-```html
-<td>Daemon Version</td>
-<td><code data-attr="info-version"><i class="fa fa-refresh fa-fw fa-spin"></i></code> (Latest: <code>{{ $version->getDaemon() }}</code></td>
+```php
+$info = $this->daemonConfigurationRepository->setNode($node)->getSystemInformation(2);
 ```
-
-**前端自动刷新**：每 10 秒调用一次 `/admin/nodes/view/{node}/system-information
 
 ---
 
@@ -321,33 +385,38 @@ public function handle(Node $node, ?string $identifiedBy, string $algo = 'md5'):
 
     $builder = $config->builder(new TimestampDates())
         ->issuedBy(config('app.url'))
-        ->permittedFor($node->getConnectionAddress()))
+        ->permittedFor($node->getConnectionAddress())
         ->identifiedBy($identifier)
         ->withHeader('jti', $identifier)
         ->issuedAt(CarbonImmutable::now())
         ->canOnlyBeUsedAfter(CarbonImmutable::now()->subMinutes(5));
 
     if (isset($this->expiresAt)) {
-        $builder = $builder->expiresAt($this->expiresAt));
+        $builder = $builder->expiresAt($this->expiresAt);
     }
 
     if (!empty($this->subject)) {
-        $builder = $builder->relatedTo($this->subject))->withHeader('sub', $this->subject));
+        $builder = $builder->relatedTo($this->subject)->withHeader('sub', $this->subject);
     }
 
     foreach ($this->claims as $key => $value) {
-        $builder = $builder->withClaim($key, $value));
+        $builder = $builder->withClaim($key, $value);
     }
 
     if (!is_null($this->user)) {
         $builder = $builder
             ->withClaim('user_uuid', $this->user->uuid)
-            ->withClaim('user_id', $this->user->id); //  // 向后兼容，1.11 后移除
+            // The "user_id" claim is deprecated and should not be referenced — it remains
+            // here solely to ensure older versions of Wings are unaffected when the Panel
+            // is updated.
+            //
+            // This claim will be removed in Panel@1.11 or later.
+            ->withClaim('user_id', $this->user->id);
     }
 
     return $builder
         ->withClaim('unique_id', Str::random())
-        ->getToken($config->signer(), $config->signingKey()));
+        ->getToken($config->signer(), $config->signingKey());
 }
 ```
 
@@ -372,19 +441,34 @@ public function __invoke(ClientApiRequest $request, Server $server): JsonRespons
 {
     $user = $request->user();
     if ($user->cannot(Permission::ACTION_WEBSOCKET_CONNECT, $server)) {
-        throw new HttpForbiddenException('You do not have permission to connect to this server\'s websocket.'));
+        throw new HttpForbiddenException('You do not have permission to connect to this server\'s websocket.');
     }
 
     $permissions = $this->permissionsService->handle($server, $user);
 
+    $node = $server->node;
+    if (!is_null($server->transfer)) {
+        // Check if the user has permissions to receive transfer logs.
+        if (!in_array('admin.websocket.transfer', $permissions)) {
+            throw new HttpForbiddenException('You do not have permission to view server transfer logs.');
+        }
+
+        // Redirect the websocket request to the new node if the server has been archived.
+        if ($server->transfer->archived) {
+            $node = $server->transfer->newNode;
+        }
+    }
+
     $token = $this->jwtService
         ->setExpiresAt(CarbonImmutable::now()->addMinutes(10))
-        ->setUser($request->user()))
+        ->setUser($request->user())
         ->setClaims([
             'server_uuid' => $server->uuid,
             'permissions' => $permissions,
         ])
         ->handle($node, $user->id . $server->uuid);
+
+    $socket = str_replace(['https://', 'http://'], ['wss://', 'ws://'], $node->getConnectionAddress());
 
     return new JsonResponse([
         'data' => [
@@ -402,10 +486,10 @@ public function __invoke(ClientApiRequest $request, Server $server): JsonRespons
 
 | 场景 | 代码位置 | 用途 |
 |------|----------|------|
-| 文件下载 | `app/Http/Controllers/Api/Client/Servers/FileController.php | 生成文件下载签名 |
-| 文件上传 | `app/Http/Controllers/Api/Client/Servers/FileUploadController.php | 生成上传签名 |
-| 备份下载 | `app/Services/Backups/DownloadLinkService.php | 备份下载链接 |
-| 服务器迁移 | `app/Http/Controllers/Admin/Servers/ServerTransferController.php | 迁移认证 |
+| 文件下载 | `app/Http/Controllers/Api/Client/Servers/FileController.php` | 生成文件下载签名 |
+| 文件上传 | `app/Http/Controllers/Api/Client/Servers/FileUploadController.php` | 生成上传签名 |
+| 备份下载 | `app/Services/Backups/DownloadLinkService.php` | 备份下载链接 |
+| 服务器迁移 | `app/Http/Controllers/Admin/Servers/ServerTransferController.php` | 迁移认证 |
 
 ---
 
@@ -413,7 +497,7 @@ public function __invoke(ClientApiRequest $request, Server $server): JsonRespons
 
 ### 6.1 向后兼容设计
 
-**NodeJWTService.php:91-96`
+**NodeJWTService.php:91-96**
 
 ```php
 // The "user_id" claim is deprecated and should not be referenced — it remains
@@ -426,7 +510,7 @@ public function __invoke(ClientApiRequest $request, Server $server): JsonRespons
 
 ### 6.2 系统信息版本化
 
-**DaemonConfigurationRepository.php:21-24`
+**DaemonConfigurationRepository.php:21-24**
 
 ```php
 public function getSystemInformation(?int $version = null): array
@@ -435,7 +519,7 @@ public function getSystemInformation(?int $version = null): array
 }
 ```
 
-**遥测服务使用 v2 版本：`app/Services/Telemetry/TelemetryCollectionService.php:61`
+**遥测服务使用 v2 版本**：`app/Services/Telemetry/TelemetryCollectionService.php:61`
 
 ```php
 $info = $this->daemonConfigurationRepository->setNode($node)->getSystemInformation(2);
@@ -478,26 +562,41 @@ Wings 首次接入流程:
 │  Admin  │          │  Panel  │
 └────┬────┘          └────┬────┘
      │  1. 创建节点        │
-     │──────────────────────>│
-     │                       │ 生成 daemon_token_id(16)
-     │                       │ 生成 daemon_token(64)
+     │────────────────────>│
+     │                     │ 生成 daemon_token_id(16)
+     │                     │ 生成 daemon_token(64)
      │  2. 获取配置       │
-     │<──────────────────────│
-     │                       │ 返回含解密后token
+     │────────────────────>│ GET /admin/nodes/view/{id}/configuration
+     │                     │ 或 GET /api/application/nodes/{id}/configuration
+     │  返回含解密token    │
+     │<────────────────────│
+     │
+     │  3. 复制配置到 Wings 服务器
+     │  ==================> /etc/pterodactyl/config.yml
      │
      │
-Wings 日常通信:
+Wings 日常通信 (Wings → Panel):
 ┌─────────┐          ┌─────────┐
 │  Wings  │          │  Panel  │
 └────┬────┘          └────┬────┘
      │  Bearer <id>.<token> │
-     │──────────────────────>│
-     │                       │ DaemonAuthenticate 验证
-     │                       │ 1. 拆分 token
-     │                       │ 2. 根据 id 查节点
-     │                       │ 3. 解密 token 比对
+     │────────────────────>│ POST /api/remote/activity
+     │                     │ DaemonAuthenticate 验证
+     │                     │ 1. 拆分 token
+     │                     │ 2. 根据 id 查节点
+     │                     │ 3. 解密 token 比对
      │  返回数据             │
-     │<──────────────────────│
+     │<────────────────────│
+     │
+     │
+前端心跳 (Browser → Wings):
+┌──────────┐          ┌─────────┐
+│ Browser  │          │  Wings  │
+└────┬─────┘          └────┬────┘
+     │  Bearer <daemon_token> │
+     │────────────────────>│ GET /api/system
+     │  返回版本/系统信息      │
+     │<────────────────────│
      │
      │
 用户 Websocket 连接:
@@ -505,23 +604,34 @@ Wings 日常通信:
 │  User   │          │  Panel  │          │  Wings  │
 └────┬────┘          └────┬────┘          └────┬────┘
      │  请求 Websocket       │                       │
-     │──────────────────────>│                       │
+     │────────────────────>│                       │
      │                       │ 1. 检查权限            │
-     │                       │ 2. 生成 JWT(10min)│
+     │                       │ 2. 生成 JWT(10min) │
      │  返回 JWT + socket │
-     │<──────────────────────│                       │
+     │<────────────────────│                       │
      │                                               │
      │  WSS 连接 + JWT                           │
-     │──────────────────────────────────────────────>│
+     │───────────────────────────────────────────>│
      │                                               │ 验证 JWT 签名
      │                                               │ 检查权限声明
      │  建立连接                                       │
-     │<──────────────────────────────────────────────│
+     │<───────────────────────────────────────────│
 ```
 
 ---
 
-## 9. 关键文件索引
+## 9. 关键代码勘误表
+
+| 原分析描述 | 实际情况 | 影响 |
+|-----------|----------|------|
+| `daemon.configuration` 是 Remote API 的例外路由，无需认证 | 例外路由名称不匹配任何实际路由，所有 `/api/remote/*` 都需要认证 | 首次接入必须通过管理后台或 Application API 获取配置 |
+| 节点配置获取通过 Remote API 进行 | 节点配置通过 Admin 后台或 Application API 获取，不属于 Remote API | Wings 无法主动"拉取"配置，必须管理员预先写入 |
+| `isLatestDaemon()` 在节点心跳展示中被消费 | 该方法只在 CLI 命令中使用，前端展示只显示版本号，不进行比较 | 版本比较逻辑实际上未被前端使用 |
+| api-remote.php 中的路由有名称 | 所有路由都没有设置 `->name()`，`$route->getName()` 返回 `null` | 中间件例外路由机制无法生效 |
+
+---
+
+## 10. 关键文件索引
 
 | 文件路径 | 主要职责 |
 |---------|----------|
@@ -530,11 +640,13 @@ Wings 日常通信:
 | `app/Services/Nodes/NodeUpdateService.php` | 节点更新，凭据重置 |
 | `app/Http/Middleware/Api/Daemon/DaemonAuthenticate.php` | Wings API 认证中间件 |
 | `app/Http/Controllers/Admin/NodeAutoDeployController.php` | 自动部署 Token 生成 |
-| `app/Http/Controllers/Api/Application/Nodes/NodeConfigurationController.php` | 节点配置输出 |
-| `app/Http/Controllers/Admin/Nodes/SystemInformationController.php` | 系统信息获取 |
+| `app/Http/Controllers/Api/Application/Nodes/NodeConfigurationController.php` | 节点配置输出（Application API） |
+| `app/Http/Controllers/Admin/Nodes/SystemInformationController.php` | 系统信息获取（管理后台） |
+| `app/Http/Controllers/Admin/Nodes/NodeViewController.php` | 节点视图控制器 |
 | `app/Models/Node.php` | 节点模型，凭据解密 |
 | `app/Services/Helpers/SoftwareVersionService.php` | 版本兼容性检查 |
 | `app/Repositories/Wings/DaemonRepository.php` | Wings API 客户端基类 |
 | `app/Repositories/Wings/DaemonConfigurationRepository.php` | Wings 配置/系统信息 |
-| `routes/api-remote.php` | Wings Remote API 路由 |
+| `routes/api-remote.php` | Wings Remote API 路由（均无名称） |
 | `routes/api-application.php` | Application API 路由 |
+| `routes/admin.php` | 管理后台路由 |
