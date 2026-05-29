@@ -789,13 +789,18 @@ const handleDaemonErrorOutput = (line: string) =>
 
 | 字段 | 位置 | 定义 | 设置时机 | 证据等级 |
 |------|------|------|----------|----------|
-| **`is_transferring`** | 后端 API 返回 (`ServerTransformer.php:81`) | `!is_null($server->transfer)` | 只要 transfer 记录存在即为 `true` | 「代码可直接证明」 |
+| **`is_transferring`** | 后端 API 返回 (`ServerTransformer.php:81`) | `!is_null($server->transfer)`，但 `$server->transfer` 关系有 `whereNull('successful')` 过滤 → **实际逻辑：successful 为 null 时为 true，successful 为 true/false 时为 false** | Panel 设置 `successful = true` 或 `successful = false` 后立即变为 `false` | 「代码可直接证明」 |
 | **`archived`** | `server_transfer` 表 | 源节点是否已完成归档 | 源节点归档完成后设置 | 「基于跨服务推断」（Panel 代码只读不写） |
-| **`successful`** | `server_transfer` 表 | 迁移是否成功 | Panel 收到目标节点 success 回调后设置 `true` | 「代码可直接证明」 |
+| **`successful`** | `server_transfer` 表 | 迁移是否成功 | Panel 收到目标节点 success 回调后设置 `true`，收到 failure 回调后设置 `false` | 「代码可直接证明」 |
 
-> **重要区分**:
-> - **后端 `is_transferring`**（API 返回）: 由 `ServerTransformer.php:81` 计算，`= !is_null($server->transfer)`「代码可直接证明」
-> - **前端 `isTransferring`**（React State）: 由 `TransferListener.tsx:13` 根据 `transfer status` 事件设置，与后端字段是两个独立概念「代码可直接证明」
+> **核心修正：`is_transferring` 与 `successful` 的关系过滤**
+> - `Server.php:352` 中 `transfer()` 关系定义：`$this->hasOne(ServerTransfer::class)->whereNull('successful')->orderByDesc('id')`「代码可直接证明」
+> - 由于 `whereNull('successful')` 过滤条件存在，当 `successful` 被设置为 `true` 或 `false` 时，`$server->transfer` 关系返回 `null`
+> - 因此：`is_transferring = !is_null($server->transfer)` 在 `successful = true` 后**立即变为 false**，无需等待 transfer 记录被清理
+
+> **重要区分（前端 vs 后端）**:
+> - **后端 `is_transferring`**（API 返回字段）: 由 `ServerTransformer.php:81` 计算，`= !is_null($server->transfer)`，受 `whereNull('successful')` 关系过滤影响「代码可直接证明」
+> - **前端 `isTransferring`**（React State）: 由 `TransferListener.tsx:11-28` 根据 `transfer status` WebSocket 事件设置，与后端字段是两个独立概念，有不同的变化时机「代码可直接证明」
 
 ---
 
@@ -857,7 +862,9 @@ const handleDaemonErrorOutput = (line: string) =>
     ├─ Panel 收到目标节点 success 回调  「代码可直接证明」
     ├─ 更新: node_id → 目标节点 ID
     ├─ 更新: successful = true  「代码可直接证明：Remote/ServerTransferController.php:93」
-    ├─ 后端 is_transferring: 仍为 true（transfer 记录还在）
+    ├─ **关键修正**: is_transferring: **立即变为 false**  「代码可直接证明」
+    │   因为 transfer 关系有 whereNull('successful') 过滤，successful=true 后 $server->transfer 返回 null
+    ├─ 此时 transfer 记录仍存在于数据库中，但不再被 $server->transfer 关系返回
     ├─ archived: true
     └─ successful: true
 
@@ -869,18 +876,147 @@ const handleDaemonErrorOutput = (line: string) =>
     ├─ Panel: node_id 已更新 → Token 指向目标节点  「代码可直接证明」
     ├─ 重连后连接到目标节点
     ├─ TransferListener: getServer(uuid) 刷新服务器信息  「代码可直接证明」
+    ├─ 刷新后后端 is_transferring 仍为 false（因为 successful=true）
     ├─ archived: true
     └─ successful: true
 
-  阶段 9: 最终状态（transfer 记录被清理后）
-    ├─ transfer 记录: 不存在（或被软删除）
-    ├─ is_transferring: false  「代码可直接证明」
+  阶段 9: 最终状态
+    ├─ transfer 记录: 仍存在于数据库中（可能被软删除或保留）
+    ├─ is_transferring: false（只要 successful 非 null，就不会变） 「代码可直接证明」
     └─ 服务器已在目标节点正常运行
 ```
 
 ---
 
-### 9.3 WebsocketController 中的 Node 路由逻辑
+### 9.3 前端 isTransferring 与后端 is_transferring 的区别与联动边界
+
+#### 两者定义与设置源对比
+
+| 维度 | 前端 `isTransferring`（React State） | 后端 `is_transferring`（API 字段） |
+|------|-----------------------------------|-----------------------------------|
+| **定义位置** | `TransferListener.tsx:11-28` | `ServerTransformer.php:81` + `Server.php:352` |
+| **设置源** | WebSocket `transfer status` 事件 | 数据库查询 + Eloquent 关系过滤 |
+| **设置逻辑** | 直接根据事件字符串匹配 | `!is_null($server->transfer)` 受 `whereNull('successful')` 过滤 |
+| **变化时机** | 收到 WebSocket 事件时立即变化 | `successful` 字段被设置为 true/false 时立即变化 |
+
+---
+
+#### 前端 isTransferring 设置逻辑详解「代码可直接证明」
+
+**文件**: `TransferListener.tsx:11-28`
+```typescript
+useWebsocketEvent(SocketEvent.TRANSFER_STATUS, (status: string) => {
+    // pending / processing → 立即设置为 true（不等待后端）
+    if (status === 'pending' || status === 'processing') {
+        setServerFromState((s) => ({ ...s, isTransferring: true }));
+        return;
+    }
+
+    // failed → 立即设置为 false（不等待后端）
+    if (status === 'failed') {
+        setServerFromState((s) => ({ ...s, isTransferring: false }));
+        return;
+    }
+
+    // completed → 不直接设置状态，而是刷新服务器信息
+    if (status !== 'completed') {
+        return;
+    }
+
+    // 从后端获取最新的 is_transferring 值
+    getServer(uuid).catch((error) => console.error(error));
+});
+```
+
+**前端状态变化时机**：
+| WebSocket 事件 | 前端 isTransferring 变化 | 是否等待后端 |
+|---------------|------------------------|-------------|
+| `pending` / `processing` | 立即 → `true` | 否（乐观设置） |
+| `starting` / `success` | 无变化（不匹配任何 case） | - |
+| `failed` | 立即 → `false` | 否（乐观设置） |
+| `completed` | 通过 `getServer(uuid)` 从后端获取最新值 | 是 |
+
+---
+
+#### 后端 is_transferring 设置逻辑详解「代码可直接证明」
+
+**两步计算**：
+1. **Eloquent 关系层** (`Server.php:352`):
+   ```php
+   public function transfer(): HasOne
+   {
+       return $this->hasOne(ServerTransfer::class)
+           ->whereNull('successful')  // 关键过滤条件
+           ->orderByDesc('id');
+   }
+   ```
+
+2. **Transformer 层** (`ServerTransformer.php:81`):
+   ```php
+   'is_transferring' => !is_null($server->transfer),
+   ```
+
+**后端状态变化时机**：
+| 数据库状态 | 后端 is_transferring 值 |
+|-----------|------------------------|
+| transfer 记录不存在 | `false` |
+| transfer 存在 + `successful` 为 `null` | `true` |
+| transfer 存在 + `successful` 为 `true` | `false`（因为 whereNull 过滤） |
+| transfer 存在 + `successful` 为 `false` | `false`（因为 whereNull 过滤） |
+
+---
+
+#### 前后端状态联动时序
+
+```
+时序: 迁移成功场景
+───────────────────────────────────────────────────────────────────────
+
+  1. 收到 success 事件
+     │
+     ├─ 前端: 无变化（success 不匹配任何 case）
+     └─ 后端: 仍为 true（successful 仍为 null）
+
+  2. 目标节点回调 Panel success
+     │
+     ├─ Panel: 设置 successful = true
+     ├─ 后端: is_transferring 立即变为 false（whereNull 过滤生效）
+     └─ 前端: 仍为 true（尚未收到 completed 事件）
+
+  3. 收到 completed 事件
+     │
+     ├─ 前端: 触发 getServer(uuid) 刷新
+     ├─ 后端: 返回 is_transferring = false
+     └─ 前端: isTransferring 同步为 false
+
+  注意: 步骤 2 到 3 之间，前后端状态不一致，
+        前端 isTransferring 仍为 true，但后端 is_transferring 已为 false
+```
+
+**关键不一致点**：
+- Panel 设置 `successful=true` 后，**后端 `is_transferring` 立即变为 false**
+- 但前端 `isTransferring` 要等到**收到 completed 事件并刷新**后才变为 false
+- 中间存在短暂的状态不一致窗口
+
+---
+
+#### 设计意图分析
+
+1. **前端乐观更新**：
+   - `pending`/`processing`/`failed` 直接更新前端状态
+   - 无需等待后端响应，用户体验更即时
+
+2. **后端关系过滤**：
+   - `whereNull('successful')` 确保只有**进行中**的迁移才会被 `$server->transfer` 返回
+   - 成功或失败的迁移记录不会影响当前状态判断
+
+3. **completed 事件触发刷新**：
+   - 不直接设置状态，而是强制从后端获取最新数据
+   - 确保前端最终与后端状态一致
+
+---
+
+### 9.4 WebsocketController 中的 Node 路由逻辑
 
 **文件**: `WebsocketController.php:42-53`
 
@@ -913,7 +1049,7 @@ if (!is_null($server->transfer)) {
 
 ---
 
-### 9.4 迁移流程与 WebSocket 重连时序（修正版）
+### 9.5 迁移流程与 WebSocket 重连时序（修正版）
 
 **重要修正**: 之前的时序图错误地将 `completed` 事件标注为"Panel 通知客户端"，实际所有 `transfer status` 事件均由 Wings 推送。
 
@@ -1011,7 +1147,7 @@ Source Node Wings              Panel              Target Node Wings       Browse
 
 ---
 
-### 9.5 WebsocketHandler 重连逻辑详解
+### 9.6 WebsocketHandler 重连逻辑详解
 
 **文件**: `WebsocketHandler.tsx:65-77`
 
@@ -1044,7 +1180,7 @@ socket.on('transfer status', (status: string) => {
 
 ---
 
-### 9.6 迁移失败场景
+### 9.7 迁移失败场景
 
 ```
 Source/Target Node Wings        Panel              Browser
@@ -1062,6 +1198,7 @@ Source/Target Node Wings        Panel              Browser
      |                           |                    |   │ 可能已被清理或标记
      |                           |                    |   │ → 连接回原节点
      |                           |                    |
+     |                           |                    |
      | push: transfer status     |                    |
      |   args: ["failure"]       |                    |
      | [基于跨服务推断]           |                    |
@@ -1078,11 +1215,12 @@ Source/Target Node Wings        Panel              Browser
 **失败回调证据链**:
 - 目标节点或源节点失败 → 回调 Panel `/api/remote/servers/{uuid}/transfer/failure` 「代码可直接证明」
 - Panel 设置 `successful = false` 「代码可直接证明：`Remote/ServerTransferController.php:121`」
+- **关键**: `successful = false` 后，`is_transferring 立即变为 false（因为 `whereNull('successful')` 过滤）「代码可直接证明」
 - 清理新分配的端口等资源
 
 ---
 
-### 9.7 Console 组件的迁移感知
+### 9.8 Console 组件的迁移感知
 
 **文件**: `Console.tsx:80-87, 180-184`
 
@@ -1113,7 +1251,7 @@ if (connected && instance) {
 
 ---
 
-### 9.8 迁移权限要求
+### 9.9 迁移权限要求
 
 迁移期间获取 WebSocket Token 需要额外权限：
 
