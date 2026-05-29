@@ -945,7 +945,7 @@ ProcessRunnableCommand::processSchedule()
                  │     3. 触发 JobFailed 事件
                  │
                  └─ server.status != null
-                     → $this->failed() → Laravel 框架不额外调用 failed()（已手动调用）
+                     → $this->failed() → handle() 正常返回 → 不写 failed_jobs（框架视为"成功"）
 ```
 
 **关键特征**：
@@ -988,7 +988,7 @@ ScheduleController::execute()
                  │   → 最终由 Laravel 全局异常处理器返回 HTTP 500 错误给前端
                  │
                  └─ server.status != null
-                     → $this->failed() → 已调用，无需再次调用
+                     → $this->failed() → handle() 正常返回 → 无异常冒泡，不返回 HTTP 错误
 ```
 
 **关键特征**：
@@ -1008,16 +1008,45 @@ ScheduleController::execute()
 | only_when_online + offline/stopping | `ProcessScheduleService:53` | 两种路径都有 | ❌ 不写入 | ❌ 无（静默返回） |
 | only_when_online + 非 DaemonConnectionException | `ProcessScheduleService:62` | 两种路径都有 | ❌ 不写入 | ❌ 无（静默返回） |
 | only_when_online + DaemonConnectionException | `ProcessScheduleService:64` | 两种路径都有 | ❌ 不写入 | ❌ 无（静默返回） |
-| server.status != null | `RunTaskJob:54` | 两种路径都有 | 队列路径：✅ 写入 | 手动路径：❌ |
+| server.status != null | `RunTaskJob:54` | 两种路径都有 | ❌ 不写入 | ❌ 无（静默返回） |
 | 任务执行抛异常（队列） | Laravel 框架自动 | 仅队列路径 | ✅ 写入 | ❌ 无（已解耦） |
 | 任务执行抛异常（手动） | `ProcessScheduleService:80` | 仅手动路径 | ❌ 不写入 | ✅ HTTP 500 |
 | schedule 非激活 | `RunTaskJob:42-43` | 两种路径都有 | ❌ 不写入（不算失败） | ❌ 无（正常结束） |
 
 **关键发现**：
 1. `ProcessScheduleService` 中的 3 处 `$job->failed()` 调用发生在 **Job 分发之前**，此时 Job 尚未进入队列，因此 `failed_jobs` 表不会被写入
-2. `RunTaskJob:54` 的 `$this->failed()` 调用发生在 Job **已分发之后**，但 `failed()` 是手动调用而非框架触发——队列路径下框架还会再次尝试调用 `failed()`（幂等，无副作用）
-3. **只有队列路径中由 Laravel 框架自动触发的 `failed()` 才会写入 `failed_jobs` 表**
+2. `RunTaskJob:54` 的 `$this->failed()` 调用虽然发生在 Job **已分发之后**，但 `handle()` 方法随后 `return` 了——**没有抛出异常**。Laravel 队列框架只在 `handle()` 抛出异常且重试耗尽时才写入 `failed_jobs` 表，所以这里也**不会写入**。队列框架视此 Job 为"正常完成"
+3. **只有队列路径中由 Laravel 框架自动触发的 `failed()` 才会写入 `failed_jobs` 表**，且其触发前提是 `handle()` 抛出了异常
 4. 手动路径中的 `failed()` 永远不会导致 `failed_jobs` 写入
+5. **手动执行与队列执行的失败落盘规则是一致的**：凡是 `$this->failed()` 手动调用后 `handle()` 正常返回的场景，两种路径都不写 `failed_jobs`；唯有 `handle()` 抛出异常经队列框架捕获时才写 `failed_jobs`，而手动路径中该异常会冒泡到 HTTP 层而非 `failed_jobs`
+
+##### `server.status != null` 分支的精确行为分析
+
+**代码路径**（`RunTaskJob.php:53-57`）：
+
+```php
+if (!is_null($server->status)) {
+    $this->failed();    // ← 手动调用 failed()，重置 is_queued 和 is_processing
+    return;             // ← handle() 正常返回，无异常抛出
+}
+```
+
+**队列路径下的 Laravel 框架视角**：
+1. `handle()` 被调用
+2. `failed()` 被手动调用（业务层标记失败）
+3. `handle()` 正常返回（从框架视角看，Job "执行成功"）
+4. 队列框架从队列中删除此 Job（视为已完成）
+5. **不写入 `failed_jobs` 表**（因为没有异常被抛出）
+
+**手动路径下的 Laravel 框架视角**：
+1. `dispatchNow()` 在当前请求进程中同步调用 `handle()`
+2. `failed()` 被手动调用（业务层标记失败）
+3. `handle()` 正常返回
+4. `ProcessScheduleService` 中无异常可捕获，继续执行
+5. **不写入 `failed_jobs` 表**（未进入队列）
+6. **不返回 HTTP 错误**（`handle()` 正常返回，无异常冒泡到 HTTP 层）
+
+**两种路径的共性**：`server.status != null` 分支在两种执行方式下的失败记录行为**完全一致**——都是静默失败，不写 `failed_jobs`，不记录日志，不返回错误。
 
 ##### 10.5.5 `failed_jobs` 表的使用范围
 
@@ -1042,10 +1071,11 @@ ScheduleController::execute()
 - `uuid`: 唯一标识符
 
 **不写入 `failed_jobs` 的场景**：
-1. 手动执行路径（`dispatchNow`）
-2. `ProcessScheduleService` 中分发前的 `failed()` 调用
-3. `continue_on_failure` 生效时（异常被吞掉，不抛出）
-4. schedule 非激活导致的提前返回
+1. 手动执行路径（`dispatchNow`）—— Job 从未进入队列
+2. `ProcessScheduleService` 中分发前的 `failed()` 调用 —— Job 尚未分发，且 `handle()` 未抛异常
+3. `RunTaskJob:54` 中 `server.status != null` 触发的 `failed()` 调用 —— `handle()` 随后 `return`，未抛异常
+4. `continue_on_failure` 生效时 —— 异常被吞掉，`handle()` 正常执行完毕
+5. schedule 非激活导致的提前返回 —— `handle()` 正常执行完毕
 
 ##### 10.5.6 两种路径的监控方式对比
 
@@ -1063,9 +1093,11 @@ ScheduleController::execute()
 
 1. **队列路径的静默失败**：`ProcessScheduleService` 中 `only_when_online` 检查失败时，直接调用 `$job->failed()` 然后 `return`，没有任何日志记录。这种"本应执行但被跳过"的情况在系统中不留痕迹。
 
-2. **队列路径的 Job 执行失败**：虽然写入 `failed_jobs` 表，但**没有 Activity Log 记录**，也没有通知。管理员必须主动查询 `failed_jobs` 表才能发现。
+2. **server.status 非空的静默失败**：`RunTaskJob:53-57` 中 `server.status != null` 时，调用 `$this->failed()` 后 `return`，`handle()` 正常返回。队列框架视 Job 为"正常完成"，不写 `failed_jobs`；手动路径也不抛异常，不返回 HTTP 错误。两种路径下都无任何记录。
 
-3. **手动路径的 `failed()` 调用**：`ProcessScheduleService:80` 手动调用 `$job->failed($exception)` 后又 `throw $exception`，`failed()` 方法本身不记录任何日志，异常信息仅通过后续的 throw 传递到 HTTP 层。
+3. **队列路径的 Job 执行失败**：虽然写入 `failed_jobs` 表，但**没有 Activity Log 记录**，也没有通知。管理员必须主动查询 `failed_jobs` 表才能发现。
+
+4. **手动路径的 `failed()` 调用**：`ProcessScheduleService:80` 手动调用 `$job->failed($exception)` 后又 `throw $exception`，`failed()` 方法本身不记录任何日志，异常信息仅通过后续的 throw 传递到 HTTP 层。
 
 ---
 
@@ -1157,8 +1189,7 @@ ScheduleController::execute()
 8. **备份悬挂风险**：若 Wings 在接受备份指令后崩溃，Backup 记录会处于 `is_successful=false, completed_at=null` 的悬挂状态，需 `PruneOrphanedBackupsCommand` 清理
 9. **任务上限**：每个 Schedule 最多 10 个任务（可通过 `PTERODACTYL_PER_SCHEDULE_TASK_LIMIT` 配置）
 10. **备份限制**：服务器 `backup_limit = 0` 时不能创建备份任务
-11. **手动执行与队列执行的失败记录不对称**：
-    - 队列路径（定时调度）：失败写入 `failed_jobs` 表，但前端无感知；可通过 `queue:retry` 重试
-    - 手动路径（用户触发）：失败不写 `failed_jobs`，但前端收到 HTTP 500 错误；无法通过 `queue:retry` 重试
+11. **手动执行与队列执行的失败落盘规则一致**：两种路径下，`failed_jobs` 的写入只取决于一个条件——`handle()` 是否抛出异常。手动调用 `failed()` 后 `handle()` 正常返回的场景（`server.status` 非空、`only_when_online` 跳过、schedule 非激活），两种路径都不写 `failed_jobs`；`handle()` 抛出异常的场景，队列路径写 `failed_jobs`，手动路径返回 HTTP 500
 12. **`dispatchNow` 不会自动调用 `failed()`**：手动执行路径依赖 `ProcessScheduleService:73-83` 的显式 `failed()` 补调（修复 issue #2550）
 13. **分发前的 `failed()` 调用无 `failed_jobs` 记录**：`ProcessScheduleService` 中 `only_when_online` 检查失败时，Job 尚未分发，`failed()` 调用不会写入 `failed_jobs` 表，也不记录日志，形成监控盲区
+14. **`server.status` 非空的静默失败**：`RunTaskJob:53-57` 中 `$this->failed()` 后 `return`，`handle()` 正常返回，队列框架视为"成功"，不写 `failed_jobs`；手动路径也不返回 HTTP 错误——两种路径下都无任何记录，是最大的监控盲区
