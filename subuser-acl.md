@@ -162,9 +162,107 @@ public function handle(Server $server, User $user): array
 ```
 
 **权限层级**：
-- `root_admin` → 拥有所有权限（`['*']`） + 3 个管理员专属权限
-- `owner_id`（服务器所有者）→ 拥有所有权限（`['*']`）
+- `root_admin` → 拥有所有权限（`['*']`） + 3 个管理员专属权限（`admin.websocket.errors`、`admin.websocket.install`、`admin.websocket.transfer`）
+- `owner_id`（服务器所有者）→ 拥有所有权限（`['*']`），**但不含** `admin.websocket.*` 管理员专属权限
 - `subuser`（子用户）→ 仅拥有分配的具体权限数组
+
+> **Owner 与 Admin 的权限差异**：虽然 `ServerPolicy::before()` 对 owner 和 root_admin 一视同仁地放行，但在 `GetUserPermissionsService` 返回的权限集合中，owner 只得到 `['*']`，而 root_admin 额外拥有 `admin.websocket.errors`、`admin.websocket.install`、`admin.websocket.transfer`。这导致 **owner 在特定场景下不如 root_admin**，详见下方 transfer 场景分析。
+
+### 1.4 Owner 权限在 Transfer 场景下的限制
+
+当服务器正在被迁移（transfer）时，owner 的权限会受到两层限制，这是代码中一个容易被忽略的细节。
+
+#### 限制层一：中间件阻断非特权路由
+
+`AuthenticateServerAccess` 中间件调用 `Server::validateCurrentState()`，当 `!is_null($this->transfer)` 时会抛出 `ServerStateConflictException`。
+
+**中间件放行规则** (`app/Http/Middleware/Api/Client/Server/AuthenticateServerAccess.php:49-61`):
+```php
+try {
+    $server->validateCurrentState();
+} catch (ServerStateConflictException $exception) {
+    // 1. 查看服务器信息 → 始终放行
+    if (!$request->routeIs('api:client:server.view')) {
+        // 2. 查看资源使用 → 仅对 suspended/maintenance 放行
+        if (($server->isSuspended() || $server->node->isUnderMaintenance())
+            && !$request->routeIs('api:client:server.resources')) {
+            throw $exception;
+        }
+        // 3. WebSocket → 仅 root_admin 放行
+        if (!$user->root_admin || !$request->routeIs($this->except)) {
+            throw $exception;
+        }
+    }
+}
+```
+
+**Transfer 状态下的路由访问矩阵**：
+
+| 路由 | owner | subuser | root_admin |
+|------|-------|---------|------------|
+| `api:client:server.view`（查看服务器信息） | ✅ | ✅ | ✅ |
+| `api:client:server.resources`（资源使用） | ❌ | ❌ | ❌ |
+| `api:client:server.ws`（WebSocket） | ❌ | ❌ | ✅ |
+| 其他所有路由 | ❌ | ❌ | ❌ |
+
+> **关键结论**：服务器处于 transfer 状态时，**owner 与 subuser 的访问权限几乎相同**——都只能查看服务器基本信息。owner 的 `['*']` 权限在此场景下不起作用，因为中间件层面的状态检查先于权限校验执行。
+
+#### 限制层二：WebSocket 控制器的 transfer 权限检查
+
+即使 WebSocket 路由被放行（root_admin 通过中间件），`WebsocketController` 还有自己的 transfer 检查。
+
+**Transfer 场景下的 WebSocket 逻辑** (`app/Http/Controllers/Api/Client/Servers/WebsocketController.php:42-53`):
+```php
+$node = $server->node;
+if (!is_null($server->transfer)) {
+    // 检查是否有 admin.websocket.transfer 权限
+    if (!in_array('admin.websocket.transfer', $permissions)) {
+        throw new HttpForbiddenException(
+            'You do not have permission to view server transfer logs.'
+        );
+    }
+    // 如果已归档，重定向到新节点
+    if ($server->transfer->archived) {
+        $node = $server->transfer->newNode;
+    }
+}
+```
+
+**`admin.websocket.transfer` 权限归属**：
+
+| 用户身份 | `GetUserPermissionsService` 返回 | 含 `admin.websocket.transfer`？ |
+|----------|----------------------------------|-------------------------------|
+| root_admin | `['*', 'admin.websocket.errors', 'admin.websocket.install', 'admin.websocket.transfer']` | ✅ |
+| owner | `['*']` | ❌ |
+| subuser | 具体权限数组（不含 admin 前缀权限） | ❌ |
+
+> **这意味着**：即使中间件为 root_admin 放行了 WebSocket 路由，`WebsocketController` 的 `in_array('admin.websocket.transfer', $permissions)` 检查也对 owner 返回 false——因为 owner 的权限数组是 `['*']`，其中不包含字面字符串 `'admin.websocket.transfer'`。`in_array` 是严格字符串匹配，`'*'` 通配符在数组搜索中不具备通配语义。
+
+#### 完整 Transfer 场景权限流程
+
+```
+服务器处于 transfer 状态
+    ↓
+请求任意路由（非 server.view）
+    ↓
+AuthenticateServerAccess 中间件
+    → validateCurrentState() 抛出 ServerStateConflictException
+    → owner/subuser: 异常未被捕获 → 409 Conflict
+    → root_admin + WebSocket: 进入 except 放行 → 继续到控制器
+    ↓
+WebsocketController（仅 root_admin 到达）
+    → 检查 in_array('admin.websocket.transfer', $permissions)
+    → root_admin: ['*', 'admin.websocket.transfer'] → true → ✅
+    → 如果 transfer.archived: 重定向到 newNode 的 WebSocket
+```
+
+#### 总结
+
+**owner 并非"全能"**：在 transfer 场景中，owner 受到两层限制：
+1. 中间件层面：`validateCurrentState()` 不区分 owner 和 subuser，owner 同样被阻断
+2. 权限集合层面：owner 只有 `['*']`，不含 `admin.websocket.transfer`，无法通过 `in_array` 检查
+
+这是设计意图——transfer 是管理员操作，owner 不应干预迁移过程。
 
 ---
 
@@ -435,9 +533,9 @@ Route::group([
 });
 ```
 
-### 3.3 中间件层：服务器访问认证
+### 3.3 中间件层：服务器访问认证与状态保护
 
-`AuthenticateServerAccess` 中间件执行第一道防线，确保用户至少能"看到"该服务器。
+`AuthenticateServerAccess` 中间件执行第一道防线，包含身份认证和服务器状态保护两层逻辑。
 
 **核心校验逻辑** (`app/Http/Middleware/Api/Client/Server/AuthenticateServerAccess.php:29-67`):
 ```php
@@ -446,25 +544,67 @@ public function handle(Request $request, \Closure $next): mixed
     $user = $request->user();
     $server = $request->route()->parameter('server');
 
-    // 基础访问校验：所有者、管理员、或子用户
+    // 第一层：身份认证 — 所有者、管理员、或子用户
     if ($user->id !== $server->owner_id && !$user->root_admin) {
         if (!$server->subusers->contains('user_id', $user->id)) {
             throw new NotFoundHttpException(); // 无权限返回 404，避免泄露服务器存在
         }
     }
 
-    // 服务器状态校验（暂停、安装中等）
+    // 第二层：状态保护 — 服务器不可用时阻断请求
     try {
         $server->validateCurrentState();
     } catch (ServerStateConflictException $exception) {
-        // 对特定路由放行（如查看服务器信息、资源使用）
+        // 以下情况允许放行：
+        // 1. 查看服务器信息 → 始终放行（所有状态都可查看）
+        // 2. 查看资源使用 → 仅 suspended/maintenance 时放行
+        // 3. WebSocket → 仅 root_admin 放行（transfer 时监控迁移进度）
+        if (!$request->routeIs('api:client:server.view')) {
+            if (($server->isSuspended() || $server->node->isUnderMaintenance())
+                && !$request->routeIs('api:client:server.resources')) {
+                throw $exception;
+            }
+            if (!$user->root_admin || !$request->routeIs($this->except)) {
+                throw $exception;
+            }
+        }
     }
 
     return $next($request);
 }
 ```
 
-> **安全设计**：无权限访问时返回 `404 Not Found` 而非 `403 Forbidden`，避免攻击者通过响应状态差异探测服务器存在。
+**`validateCurrentState()` 触发条件** (`app/Models/Server.php:390-401`):
+```php
+public function validateCurrentState()
+{
+    if (
+        $this->isSuspended()
+        || $this->node->isUnderMaintenance()
+        || !$this->isInstalled()
+        || $this->status === self::STATUS_RESTORING_BACKUP
+        || !is_null($this->transfer)
+    ) {
+        throw new ServerStateConflictException($this);
+    }
+}
+```
+
+**状态保护与路由放行矩阵**：
+
+| 服务器状态 | server.view | server.resources | server.ws | 其他路由 |
+|-----------|:-----------:|:----------------:|:---------:|:-------:|
+| 正常 | ✅ 所有用户 | ✅ 所有用户 | ✅ 所有用户 | ✅ 所有用户 |
+| suspended | ✅ 所有用户 | ✅ 所有用户 | ❌ | ❌ |
+| maintenance | ✅ 所有用户 | ✅ 所有用户 | ❌ | ❌ |
+| installing | ✅ 所有用户 | ❌ | ❌ | ❌ |
+| restoring_backup | ✅ 所有用户 | ❌ | ❌ | ❌ |
+| transfer | ✅ 所有用户 | ❌ | ✅ 仅 root_admin | ❌ |
+
+> **安全设计**：
+> - 无权限访问时返回 `404 Not Found` 而非 `403 Forbidden`，避免攻击者通过响应状态差异探测服务器存在
+> - 状态保护**不区分 owner 和 subuser**——owner 在 suspended/transfer 等状态下同样受限制
+> - 只有 `root_admin` 在 transfer 时能访问 WebSocket，用于监控迁移进度
 
 ### 3.4 请求类层：具体权限校验
 
@@ -507,6 +647,102 @@ class SendCommandRequest extends ClientApiRequest
         return ['command' => 'required|string|min:1'];
     }
 }
+```
+
+### 3.4.1 Power 请求的动态权限映射
+
+与大多数请求类静态返回一个权限常量不同，`SendPowerRequest` 根据 `signal` 字段**动态映射**到不同的权限位。这是代码中唯一一个 `permission()` 返回值依赖请求体的请求类。
+
+**动态权限映射逻辑** (`app/Http/Requests/Api/Client/Servers/SendPowerRequest.php:8-37`):
+```php
+class SendPowerRequest extends ClientApiRequest
+{
+    public function permission(): string
+    {
+        switch ($this->input('signal')) {
+            case 'start':
+                return Permission::ACTION_CONTROL_START;      // control.start
+            case 'stop':
+            case 'kill':
+                return Permission::ACTION_CONTROL_STOP;       // control.stop
+            case 'restart':
+                return Permission::ACTION_CONTROL_RESTART;    // control.restart
+        }
+
+        return '__invalid';  // 不匹配任何权限，必然校验失败
+    }
+
+    public function rules(): array
+    {
+        return [
+            'signal' => 'required|string|in:start,stop,restart,kill',
+        ];
+    }
+}
+```
+
+**Signal → 权限映射表**：
+
+| signal 值 | 映射权限 | 说明 |
+|-----------|---------|------|
+| `start` | `control.start` | 启动服务器 |
+| `stop` | `control.stop` | 正常停止服务器 |
+| `kill` | `control.stop` | 强制杀进程（复用 stop 权限） |
+| `restart` | `control.restart` | 重启服务器 |
+| 其他任何值 | `__invalid` | 必然失败，兜底保护 |
+
+**保护逻辑分析**：
+
+1. **`kill` 复用 `control.stop`**：强制终止服务器进程和正常停止共享同一个权限位。这意味着拥有 `control.stop` 权限的子用户既能优雅停止也能强制杀死服务器。这是一个有意的设计简化——kill 是 stop 的应急手段，不应拆分为独立权限。
+
+2. **`__invalid` 兜底保护**：当 `signal` 值不匹配任何合法选项时，`permission()` 返回 `'__invalid'`。由于没有任何用户（包括 owner）的权限数组包含这个字符串，`ServerPolicy::checkPermission()` 的 `in_array('__invalid', $subuser->permissions)` 必然返回 false。即使 owner 通过 `ServerPolicy::before()` 放行，这也是一层额外保险。
+
+   > **注意**：`rules()` 中的 `'signal' => 'required|string|in:start,stop,restart,kill'` 验证规则会在 `authorize()` 之前执行。如果 signal 值不合法，请求在验证阶段就会被拒绝（422），根本不会到达 `permission()` 方法。因此 `__invalid` 兜底在正常流程中不会被触发，但作为防御性编程仍有价值。
+
+3. **验证与授权的执行顺序**：Laravel 的 FormRequest 默认先执行 `authorize()`，再执行 `rules()`。但此处 `permission()` 依赖 `$this->input('signal')`，该值在 `authorize()` 阶段已经可用（从请求体中读取），因此动态映射能正常工作。
+
+**Power 控制器逻辑** (`app/Http/Controllers/Api/Client/Servers/PowerController.php:25-34`):
+```php
+public function index(SendPowerRequest $request, Server $server): Response
+{
+    $this->repository->setServer($server)->send(
+        $request->input('signal')
+    );
+
+    Activity::event(strtolower("server:power.{$request->input('signal')}"))->log();
+
+    return $this->returnNoContent();
+}
+```
+
+**完整 Power 请求校验流程**：
+```
+POST /api/client/servers/{server}/power
+    Body: {"signal": "restart"}
+
+1. SubstituteClientBindings::handle()
+   → 绑定 server 对象
+
+2. AuthenticateServerAccess::handle()
+   → 身份认证 + 状态保护
+   → 注意：suspended/transfer 等状态下 power 请求被阻断
+
+3. SendPowerRequest::authorize()
+   → ClientApiRequest::authorize()
+      → 调用 $this->permission()
+         → 根据 input('signal')='restart' 返回 'control.restart'
+      → 调用 $user->can('control.restart', $server)
+         → ServerPolicy::before()
+             → admin/owner: true
+             → subuser: in_array('control.restart', $subuser->permissions)
+
+4. SendPowerRequest::rules()  [验证阶段]
+   → 'signal' => 'required|string|in:start,stop,restart,kill'
+   → 验证通过
+
+5. PowerController::index()
+   → DaemonPowerRepository::send('restart')
+   → 记录活动日志 server:power.restart
 ```
 
 ### 3.5 策略层：ServerPolicy 权限判定
@@ -835,7 +1071,7 @@ POST /api/client/servers/{server}/command
 
 3. SendCommandRequest::authorize()  [extends ClientApiRequest]
    → ClientApiRequest::authorize()
-      → 检查是否有 permission() 方法
+      → 检查是否有 permission() 方法 → 有（'control.console'）
       → 调用 $user->can('control.console', $server)
          → ServerPolicy::before($user, 'control.console', $server)
              → 用户不是 admin/owner
@@ -901,7 +1137,7 @@ POST /api/client/servers/{server}/users/{user}
 
 ## 六、安全设计亮点
 
-1. **最小权限原则**：权限粒度细（40 个权限位，可精确控制每个操作
+1. **最小权限原则**：权限粒度细（40 个权限位），可精确控制每个操作
 2. **权限不升级原则**：不能分配超出自身权限范围的权限
 3. **白名单过滤**：权限分配时只保留系统定义的有效权限
 4. **强制基础权限**：所有子用户默认拥有 `websocket.connect` 权限
@@ -911,6 +1147,9 @@ POST /api/client/servers/{server}/users/{user}
 8. **主动撤销**：权限降级时立即通知节点断开连接
 9. **事务一致性**：权限更新和撤销任务在同一事务中
 10. **任务重试**：节点通知失败时指数退避重试
+11. **Owner 非全能**：transfer 场景下 owner 同样受状态保护限制，管理员专属权限不会赋予 owner
+12. **动态权限映射**：Power 请求根据 signal 动态映射权限，kill 复用 stop 权限避免权限膨胀
+13. **兜底保护**：`__invalid` 权限字符串确保非法 signal 不可能通过任何策略检查
 
 ---
 
@@ -921,20 +1160,24 @@ POST /api/client/servers/{server}/users/{user}
 | 权限常量定义（40 个） | `app/Models/Permission.php:18-66` |
 | 权限结构定义 | `app/Models/Permission.php:101-209` |
 | Subuser 模型 | `app/Models/Subuser.php` |
+| 服务器状态校验 | `app/Models/Server.php:390-401` |
 | 权限获取服务 | `app/Services/Servers/GetUserPermissionsService.php` |
 | 子用户创建服务 | `app/Services/Subusers/SubuserCreationService.php` |
 | 权限过滤与注入方法 | `app/Http/Controllers/Api/Client/Servers/SubuserController.php:154-168` |
-| 服务器访问中间件 | `app/Http/Middleware/Api/Client/Server/AuthenticateServerAccess.php` |
+| 服务器访问中间件（含状态保护） | `app/Http/Middleware/Api/Client/Server/AuthenticateServerAccess.php` |
 | 模型绑定中间件 | `app/Http/Middleware/Api/Client/SubstituteClientBindings.php` |
 | API 请求基类 | `app/Http/Requests/Api/Client/ClientApiRequest.php` |
+| Power 请求（动态权限映射） | `app/Http/Requests/Api/Client/Servers/SendPowerRequest.php` |
 | 子用户请求基类 | `app/Http/Requests/Api/Client/Servers/Subusers/SubuserRequest.php` |
 | 服务器授权策略 | `app/Policies/ServerPolicy.php` |
-| WebSocket 控制器 | `app/Http/Controllers/Api/Client/Servers/WebsocketController.php` |
+| WebSocket 控制器（含 transfer 检查） | `app/Http/Controllers/Api/Client/Servers/WebsocketController.php` |
+| Power 控制器 | `app/Http/Controllers/Api/Client/Servers/PowerController.php` |
 | 子用户控制器 | `app/Http/Controllers/Api/Client/Servers/SubuserController.php` |
 | JWT 服务 | `app/Services/Nodes/NodeJWTService.php` |
 | 撤销任务 | `app/Jobs/RevokeSftpAccessJob.php` |
 | 撤销监听器 | `app/Listeners/RevocationListener.php` |
 | Wings 撤销仓库 | `app/Repositories/Wings/DaemonRevocationRepository.php` |
 | 子用户观察者 | `app/Observers/SubuserObserver.php` |
+| 状态冲突异常 | `app/Exceptions/Http/Server/ServerStateConflictException.php` |
 | 数据库迁移 | `database/migrations/2020_03_22_163911_merge_permissions_table_into_subusers.php` |
 | 路由配置 | `routes/api-client.php:123-129` |
