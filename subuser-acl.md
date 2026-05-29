@@ -689,17 +689,29 @@ class SendPowerRequest extends ClientApiRequest
 | `stop` | `control.stop` | 正常停止服务器 |
 | `kill` | `control.stop` | 强制杀进程（复用 stop 权限） |
 | `restart` | `control.restart` | 重启服务器 |
-| 其他任何值 | `__invalid` | 必然失败，兜底保护 |
+| 其他任何值 | `__invalid` | 对 subuser 必然失败（403），对 owner/root_admin 由验证拦截（422） |
 
 **保护逻辑分析**：
 
 1. **`kill` 复用 `control.stop`**：强制终止服务器进程和正常停止共享同一个权限位。这意味着拥有 `control.stop` 权限的子用户既能优雅停止也能强制杀死服务器。这是一个有意的设计简化——kill 是 stop 的应急手段，不应拆分为独立权限。
 
-2. **`__invalid` 兜底保护**：当 `signal` 值不匹配任何合法选项时，`permission()` 返回 `'__invalid'`。由于没有任何用户（包括 owner）的权限数组包含这个字符串，`ServerPolicy::checkPermission()` 的 `in_array('__invalid', $subuser->permissions)` 必然返回 false。即使 owner 通过 `ServerPolicy::before()` 放行，这也是一层额外保险。
+2. **`__invalid` 兜底保护**：当 `signal` 值不匹配任何合法选项时，`permission()` 返回 `'__invalid'`。这个字符串不存在于任何用户的权限数组中，因此 `ServerPolicy::checkPermission()` 会返回 false。
 
-   > **注意**：`rules()` 中的 `'signal' => 'required|string|in:start,stop,restart,kill'` 验证规则会在 `authorize()` 之前执行。如果 signal 值不合法，请求在验证阶段就会被拒绝（422），根本不会到达 `permission()` 方法。因此 `__invalid` 兜底在正常流程中不会被触发，但作为防御性编程仍有价值。
+   > **关键细节**：`__invalid` 兜底**仅对 subuser 有效**。对 owner 和 root_admin，由于 `ServerPolicy::before()` 直接返回 true 跳过了 `checkPermission()`，所以即使 permission() 返回 `__invalid`，authorize() 也会通过。对 subuser 来说，`checkPermission()` 会执行 `in_array('__invalid', $subuser->permissions)`，必然返回 false → 403 Forbidden。
 
-3. **验证与授权的执行顺序**：Laravel 的 FormRequest 默认先执行 `authorize()`，再执行 `rules()`。但此处 `permission()` 依赖 `$this->input('signal')`，该值在 `authorize()` 阶段已经可用（从请求体中读取），因此动态映射能正常工作。
+3. **验证与授权的执行顺序**：Laravel 的 FormRequest **先执行 `authorize()`，再执行 `rules()` 验证**。这导致非法 signal 对不同身份的用户产生不同的响应：
+
+   | 用户身份 | authorize() 结果 | 是否执行 rules() | 最终响应 |
+   |----------|-----------------|-----------------|---------|
+   | root_admin | 通过（before 返回 true） | 是 → 验证失败 | 422 Unprocessable Entity |
+   | owner | 通过（before 返回 true） | 是 → 验证失败 | 422 Unprocessable Entity |
+   | subuser | 失败（`__invalid` 不在权限数组） | 否 | 403 Forbidden |
+
+   > **测试验证**：`PowerControllerTest` 证实了这一行为：
+   > - `testInvalidPowerSignalResultsInError()`：owner 发送无效 signal → 422
+   > - `invalidPermissionDataProvider`：subuser 发送 'random' → 403
+
+4. **动态权限映射的可行性**：虽然 `authorize()` 先执行，但 `permission()` 依赖的 `$this->input('signal')` 在 authorize 阶段已经可用（从原始请求体读取，不需要经过验证），因此动态映射能正常工作。
 
 **Power 控制器逻辑** (`app/Http/Controllers/Api/Client/Servers/PowerController.php:25-34`):
 ```php
@@ -727,22 +739,38 @@ POST /api/client/servers/{server}/power
    → 身份认证 + 状态保护
    → 注意：suspended/transfer 等状态下 power 请求被阻断
 
-3. SendPowerRequest::authorize()
+3. SendPowerRequest::authorize()  [授权阶段]
    → ClientApiRequest::authorize()
       → 调用 $this->permission()
          → 根据 input('signal')='restart' 返回 'control.restart'
       → 调用 $user->can('control.restart', $server)
          → ServerPolicy::before()
-             → admin/owner: true
-             → subuser: in_array('control.restart', $subuser->permissions)
+             → admin/owner: 直接返回 true ✅
+             → subuser: 调用 checkPermission() → in_array() 检查
 
 4. SendPowerRequest::rules()  [验证阶段]
+   → 仅当 authorize() 通过时执行
    → 'signal' => 'required|string|in:start,stop,restart,kill'
-   → 验证通过
+   → 验证失败返回 422，验证通过继续到控制器
 
 5. PowerController::index()
    → DaemonPowerRepository::send('restart')
    → 记录活动日志 server:power.restart
+```
+
+**非法 signal 的分支流程（以 signal="invalid" 为例）**：
+```
+signal = "invalid"
+    ↓
+3. SendPowerRequest::authorize()
+   → permission() 返回 '__invalid'
+   → $user->can('__invalid', $server)
+      → admin/owner: ServerPolicy::before() 返回 true ✅
+         → 继续到第 4 步验证
+         → rules() 验证失败 → 422 Unprocessable Entity
+      → subuser: ServerPolicy::before() → checkPermission()
+         → in_array('__invalid', $subuser->permissions) → false ❌
+         → 403 Forbidden，不会执行到第 4 步
 ```
 
 ### 3.5 策略层：ServerPolicy 权限判定
@@ -1149,7 +1177,8 @@ POST /api/client/servers/{server}/users/{user}
 10. **任务重试**：节点通知失败时指数退避重试
 11. **Owner 非全能**：transfer 场景下 owner 同样受状态保护限制，管理员专属权限不会赋予 owner
 12. **动态权限映射**：Power 请求根据 signal 动态映射权限，kill 复用 stop 权限避免权限膨胀
-13. **兜底保护**：`__invalid` 权限字符串确保非法 signal 不可能通过任何策略检查
+13. **分阶段防护**：非法 signal 采用"授权阶段拦截 + 验证阶段兜底"双层策略：subuser 在 authorize() 阶段被 `__invalid` 拦截（403），owner/root_admin 则由 rules() 验证拦截（422）
+14. **执行顺序一致性**：Laravel FormRequest 统一先 authorize() 后 rules()，动态权限映射依赖原始请求输入而非验证后数据，确保行为可预测
 
 ---
 
