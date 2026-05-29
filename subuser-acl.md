@@ -1,6 +1,6 @@
 # Subuser ACL 权限校验与服务端控制实现分析
 
-本文档深入分析 Pterodactyl Panel 中 Subuser（子用户）ACL 系统的实现机制，包括细粒度权限位配置、API 层逐请求校验流程，以及权限变更实时生效的原理。
+本文档深入分析 Pterodactyl Panel 中 Subuser（子用户）ACL 系统的实现机制，包括细粒度权限位配置、API 层逐请求校验流程、权限分配过滤规则，以及权限变更实时生效的原理。
 
 ---
 
@@ -8,17 +8,89 @@
 
 ### 1.1 权限位定义
 
-权限定义集中在 `app/Models/Permission.php` 中，采用「类别.动作」的命名方式，共 11 个权限类别、45 个具体权限位。
+权限定义集中在 `app/Models/Permission.php` 中，采用「类别.动作」的命名方式，共 11 个权限类别、**40 个具体权限位**。
 
-**权限常量定义示例** (`app/Models/Permission.php:18-66`):
+**权限常量定义** (`app/Models/Permission.php:18-66`):
 ```php
+// websocket - 1个
 public const ACTION_WEBSOCKET_CONNECT = 'websocket.connect';
+
+// control - 4个
 public const ACTION_CONTROL_CONSOLE = 'control.console';
 public const ACTION_CONTROL_START = 'control.start';
 public const ACTION_CONTROL_STOP = 'control.stop';
 public const ACTION_CONTROL_RESTART = 'control.restart';
-// ... 共 45 个权限常量
+
+// database - 5个
+public const ACTION_DATABASE_READ = 'database.read';
+public const ACTION_DATABASE_CREATE = 'database.create';
+public const ACTION_DATABASE_UPDATE = 'database.update';
+public const ACTION_DATABASE_DELETE = 'database.delete';
+public const ACTION_DATABASE_VIEW_PASSWORD = 'database.view_password';
+
+// schedule - 4个
+public const ACTION_SCHEDULE_READ = 'schedule.read';
+public const ACTION_SCHEDULE_CREATE = 'schedule.create';
+public const ACTION_SCHEDULE_UPDATE = 'schedule.update';
+public const ACTION_SCHEDULE_DELETE = 'schedule.delete';
+
+// user - 4个
+public const ACTION_USER_READ = 'user.read';
+public const ACTION_USER_CREATE = 'user.create';
+public const ACTION_USER_UPDATE = 'user.update';
+public const ACTION_USER_DELETE = 'user.delete';
+
+// backup - 5个
+public const ACTION_BACKUP_READ = 'backup.read';
+public const ACTION_BACKUP_CREATE = 'backup.create';
+public const ACTION_BACKUP_DELETE = 'backup.delete';
+public const ACTION_BACKUP_DOWNLOAD = 'backup.download';
+public const ACTION_BACKUP_RESTORE = 'backup.restore';
+
+// allocation - 4个
+public const ACTION_ALLOCATION_READ = 'allocation.read';
+public const ACTION_ALLOCATION_CREATE = 'allocation.create';
+public const ACTION_ALLOCATION_UPDATE = 'allocation.update';
+public const ACTION_ALLOCATION_DELETE = 'allocation.delete';
+
+// file - 7个
+public const ACTION_FILE_READ = 'file.read';
+public const ACTION_FILE_READ_CONTENT = 'file.read-content';
+public const ACTION_FILE_CREATE = 'file.create';
+public const ACTION_FILE_UPDATE = 'file.update';
+public const ACTION_FILE_DELETE = 'file.delete';
+public const ACTION_FILE_ARCHIVE = 'file.archive';
+public const ACTION_FILE_SFTP = 'file.sftp';
+
+// startup - 3个
+public const ACTION_STARTUP_READ = 'startup.read';
+public const ACTION_STARTUP_UPDATE = 'startup.update';
+public const ACTION_STARTUP_DOCKER_IMAGE = 'startup.docker-image';
+
+// settings - 2个
+public const ACTION_SETTINGS_RENAME = 'settings.rename';
+public const ACTION_SETTINGS_REINSTALL = 'settings.reinstall';
+
+// activity - 1个
+public const ACTION_ACTIVITY_READ = 'activity.read';
 ```
+
+**权限类别统计表**：
+
+| 类别 | 权限数 | 权限列表 |
+|------|--------|----------|
+| websocket | 1 | connect |
+| control | 4 | console, start, stop, restart |
+| user | 4 | read, create, update, delete |
+| file | 7 | read, read-content, create, update, delete, archive, sftp |
+| backup | 5 | read, create, delete, download, restore |
+| allocation | 4 | read, create, update, delete |
+| startup | 3 | read, update, docker-image |
+| database | 5 | read, create, update, delete, view_password |
+| schedule | 4 | read, create, update, delete |
+| settings | 2 | rename, reinstall |
+| activity | 1 | read |
+| **合计** | **40** | |
 
 **权限类别结构** (`app/Models/Permission.php:101-209`):
 ```php
@@ -54,6 +126,7 @@ protected $casts = [
 ```
 
 **subusers 表结构**：
+
 | 字段 | 类型 | 说明 |
 |------|------|------|
 | id | INT | 主键 |
@@ -89,17 +162,192 @@ public function handle(Server $server, User $user): array
 ```
 
 **权限层级**：
-- `root_admin` → 拥有所有权限 + 管理员专属权限
+- `root_admin` → 拥有所有权限（`['*']`） + 3 个管理员专属权限
 - `owner_id`（服务器所有者）→ 拥有所有权限（`['*']`）
 - `subuser`（子用户）→ 仅拥有分配的具体权限数组
 
 ---
 
-## 二、API 层逐请求校验机制
+## 二、权限分配时的默认注入与过滤规则
+
+在创建或更新子用户权限时，系统会通过 `getDefaultPermissions()` 方法对用户提交的权限进行严格的过滤和处理。
+
+### 2.1 权限处理流程总览
+
+```
+用户提交权限数组
+    ↓
+[白名单过滤] 只保留系统定义的有效权限
+    ↓
+[强制注入] 自动添加 websocket.connect 权限
+    ↓
+[去重处理] 移除重复的权限项
+    ↓
+最终保存到数据库
+```
+
+### 2.2 核心实现代码
+
+**权限过滤与注入逻辑** (`app/Http/Controllers/Api/Client/Servers/SubuserController.php:154-168`):
+```php
+protected function getDefaultPermissions(Request $request): array
+{
+    // 1. 生成系统允许的权限白名单
+    $allowed = Permission::permissions()
+        ->map(function ($value, $prefix) {
+            return array_map(function ($value) use ($prefix) {
+                return "$prefix.$value";
+            }, array_keys($value['keys']));
+        })
+        ->flatten()
+        ->all();
+
+    // 2. 白名单过滤：只保留用户提交中存在于白名单的权限
+    $cleaned = array_intersect($request->input('permissions') ?? [], $allowed);
+
+    // 3. 强制注入 websocket.connect 并去重
+    return array_unique(array_merge($cleaned, [Permission::ACTION_WEBSOCKET_CONNECT]));
+}
+```
+
+### 2.3 三步处理详解
+
+#### 第一步：生成权限白名单
+
+通过 `Permission::permissions()` 读取 `$permissions` 配置数组，动态生成所有合法权限的完整列表。
+
+**白名单生成逻辑**：
+```php
+$allowed = Permission::permissions()
+    ->map(function ($value, $prefix) {
+        // 对每个类别（如 websocket），拼接类别名与权限名
+        return array_map(function ($value) use ($prefix) {
+            return "$prefix.$value";  // 如 "websocket.connect"
+        }, array_keys($value['keys']));  // 取 keys 数组的键名
+    })
+    ->flatten()  // 将二维数组扁平化为一维
+    ->all();
+```
+
+**白名单内容示例**（共 40 项）：
+```
+[
+    "websocket.connect",
+    "control.console",
+    "control.start",
+    "control.stop",
+    "control.restart",
+    "user.read",
+    "user.create",
+    "user.update",
+    "user.delete",
+    // ... 其余 31 个权限
+]
+```
+
+**设计意图**：
+- 防御性编程：防止用户提交不存在的权限字符串
+- 动态生成：无需手动维护白名单，新增权限时自动生效
+- 与配置保持一致：白名单直接来源于 `$permissions` 定义
+
+#### 第二步：白名单过滤
+
+使用 `array_intersect()` 对用户提交的权限进行过滤。
+
+```php
+$cleaned = array_intersect($request->input('permissions') ?? [], $allowed);
+```
+
+**过滤规则**：
+- 用户提交的权限必须**完全匹配**白名单中的字符串
+- 不区分大小写？不，PHP `array_intersect` 是区分大小写的
+- 不存在于白名单的权限会被**静默移除**，不报错
+- 如果用户提交空数组，`$cleaned` 也为空数组
+
+**示例**：
+```
+用户提交: ["control.console", "file.read", "invalid.permission", "websocket.connect"]
+白名单:   ["websocket.connect", "control.console", "file.read", ...]
+过滤后:   ["control.console", "file.read", "websocket.connect"]
+```
+
+**安全意义**：
+- 防止注入恶意权限字符串
+- 防止越权访问未定义的权限
+- 防止拼写错误导致的权限异常
+
+#### 第三步：强制注入 websocket.connect
+
+无论用户提交什么权限，系统都会**强制注入** `websocket.connect` 权限。
+
+```php
+return array_unique(array_merge($cleaned, [Permission::ACTION_WEBSOCKET_CONNECT]));
+```
+
+**注入逻辑**：
+- 使用 `array_merge()` 将过滤后的权限与 `['websocket.connect']` 合并
+- 使用 `array_unique()` 去重（防止用户已提交该权限）
+
+**设计考量**：
+1. **WebSocket 是基础功能**：子用户至少需要能查看控制台输出
+2. **简化权限配置**：用户无需手动勾选这个基础权限
+3. **前端依赖**：前端 UI 默认需要 WebSocket 连接才能正常工作
+4. **历史迁移**：数据库迁移时也会默认注入该权限（见 `2020_03_22_163911_merge_permissions_table_into_subusers.php:92`）
+
+**副作用**：
+- 即使用户提交空权限数组，最终也至少有 `websocket.connect`
+- 无法创建"完全无权限"的子用户（至少能连接 WebSocket）
+
+### 2.4 与其他校验的配合
+
+`getDefaultPermissions()` 是**最后一道防线**，在此之前还有两层校验：
+
+**校验顺序**：
+```
+1. SubuserRequest::authorize()
+   → 禁止用户编辑自己
+   → validatePermissionsCanBeAssigned()：不能分配超出自身权限的权限
+
+2. ClientApiRequest::authorize()
+   → 校验当前用户有 user.create 或 user.update 权限
+
+3. SubuserController::getDefaultPermissions()  ← 本方法
+   → 白名单过滤
+   → 强制注入 websocket.connect
+   → 去重
+```
+
+### 2.5 使用场景
+
+该方法在三个地方被调用：
+
+1. **创建子用户** (`store()` 方法第 69 行)
+2. **更新子用户权限** (`update()` 方法第 93、113 行)
+   - 调用两次：一次用于比较新旧权限，一次用于实际更新
+3. **权限变更检测** (`update()` 方法第 93-97 行)
+   - 排序后比较，决定是否执行数据库更新和撤销任务
+
+**权限比较逻辑** (`SubuserController.php:93-97`):
+```php
+$permissions = $this->getDefaultPermissions($request);
+$current = $subuser->permissions;
+
+sort($permissions);
+sort($current);
+
+// 只有权限真正变化时才执行更新和撤销
+if ($permissions !== $current) {
+    // ... 执行更新
+}
+```
+
+---
+
+## 三、API 层逐请求校验机制
 
 API 请求的权限校验是一个多层防御体系，涉及路由中间件、表单请求类、策略类等多个环节。
 
-### 2.1 校验流程总览
+### 3.1 校验流程总览
 
 ```
 HTTP 请求
@@ -125,7 +373,7 @@ HTTP 请求
 控制器执行业务逻辑
 ```
 
-### 2.2 路由层：模型绑定与参数校验
+### 3.2 路由层：模型绑定与参数校验
 
 `SubstituteClientBindings` 中间件重写了 Laravel 的模型绑定逻辑，确保路由参数始终在正确的上下文中解析。
 
@@ -174,7 +422,7 @@ Route::group([
 });
 ```
 
-### 2.3 中间件层：服务器访问认证
+### 3.3 中间件层：服务器访问认证
 
 `AuthenticateServerAccess` 中间件执行第一道防线，确保用户至少能"看到"该服务器。
 
@@ -205,7 +453,7 @@ public function handle(Request $request, \Closure $next): mixed
 
 > **安全设计**：无权限访问时返回 `404 Not Found` 而非 `403 Forbidden`，避免攻击者通过响应状态差异探测服务器存在。
 
-### 2.4 请求类层：具体权限校验
+### 3.4 请求类层：具体权限校验
 
 每个 API 端点对应一个 `FormRequest` 类，通过实现 `permission()` 方法声明所需权限。
 
@@ -248,7 +496,7 @@ class SendCommandRequest extends ClientApiRequest
 }
 ```
 
-### 2.5 策略层：ServerPolicy 权限判定
+### 3.5 策略层：ServerPolicy 权限判定
 
 Laravel 的授权策略 `ServerPolicy` 实现最终的权限比对逻辑。
 
@@ -285,7 +533,7 @@ class ServerPolicy
 
 > **技术细节**：`__call` 魔术方法是 Laravel 授权系统的一个"hack"。因为 Laravel 会优先检查策略类是否存在与权限名对应的方法，如果不存在就不会调用 `before()`。通过 `__call` 捕获所有方法调用，确保 `before()` 始终被执行。
 
-### 2.6 业务层：子用户权限分配限制
+### 3.6 业务层：子用户权限分配限制
 
 在创建或更新子用户时，还需校验「分配者不能分配超出自身权限范围的权限」。
 
@@ -322,11 +570,11 @@ if ($user instanceof User) {
 
 ---
 
-## 三、权限变更实时生效机制
+## 四、权限变更实时生效机制
 
 权限变更的实时生效通过"数据库实时读取 + JWT 短期有效 + 主动撤销通知"三层机制实现。
 
-### 3.1 数据库层面：无缓存，实时读取
+### 4.1 数据库层面：无缓存，实时读取
 
 权限数据直接存储在 `subusers.permissions` JSON 字段中，**每次请求都从数据库实时读取**，没有额外的缓存层。
 
@@ -343,14 +591,14 @@ API 请求
 - 无需额外的缓存失效逻辑
 - 牺牲了极少量的性能，换取了一致性和实现简洁性
 
-### 3.2 API 请求层面：逐请求校验
+### 4.2 API 请求层面：逐请求校验
 
-如第二节所述，每个 API 请求都会经过完整的校验流程：
+如第三节所述，每个 API 请求都会经过完整的校验流程：
 - `AuthenticateServerAccess` 中间件检查子用户身份
 - `ClientApiRequest::authorize()` 调用 `ServerPolicy` 检查具体权限
 - 所有校验都基于当前数据库状态
 
-### 3.3 WebSocket 层面：JWT 短期有效性
+### 4.3 WebSocket 层面：JWT 短期有效性
 
 WebSocket 连接使用短期 JWT，确保权限变更能在短时间内生效。
 
@@ -404,7 +652,7 @@ public function handle(Node $node, ?string $identifiedBy, string $algo = 'md5'):
 4. Wings 节点验证 JWT 签名和权限
 5. JWT 过期后前端需重新获取（携带最新权限）
 
-### 3.4 主动撤销：权限降级实时通知
+### 4.4 主动撤销：权限降级实时通知
 
 当权限被**降级**（移除权限或删除子用户）时，系统会主动通知 Wings 节点断开用户连接。
 
@@ -485,7 +733,7 @@ public function deauthorize(string $user, array $servers = []): void
 }
 ```
 
-### 3.5 权限变更生效时间总结
+### 4.5 权限变更生效时间总结
 
 | 场景 | 生效机制 | 生效延迟 |
 |------|----------|----------|
@@ -496,9 +744,9 @@ public function deauthorize(string $user, array $servers = []): void
 
 ---
 
-## 四、关键数据结构与调用关系
+## 五、关键数据结构与调用关系
 
-### 4.1 核心类关系图
+### 5.1 核心类关系图
 
 ```
 User (1) ─── (N) Subuser (N) ─── (1) Server
@@ -509,7 +757,7 @@ User (1) ─── (N) Subuser (N) ─── (1) Server
 Permission 类（仅常量定义，无数据库表）
     ├─ ACTION_WEBSOCKET_CONNECT = 'websocket.connect'
     ├─ ACTION_CONTROL_CONSOLE = 'control.console'
-    └─ ...
+    └─ ... (共 40 个常量)
 
 GetUserPermissionsService
     └─ handle(Server, User) → array
@@ -528,9 +776,15 @@ SubuserRequest (extends ClientApiRequest)
     │   ├─ 禁止用户编辑自己
     │   └─ validatePermissionsCanBeAssigned()
     └─ validatePermissionsCanBeAssigned(array) → void
+
+SubuserController
+    └─ getDefaultPermissions(Request) → array
+        ├─ 生成权限白名单
+        ├─ 白名单过滤
+        └─ 强制注入 websocket.connect
 ```
 
-### 4.2 权限校验完整调用链示例
+### 5.2 权限校验完整调用链示例
 
 **场景**：子用户发送控制台命令
 
@@ -560,7 +814,7 @@ POST /api/client/servers/{server}/command
    → 执行命令发送逻辑
 ```
 
-### 4.3 权限变更完整调用链示例
+### 5.3 权限变更完整调用链示例
 
 **场景**：服务器所有者更新子用户权限
 
@@ -586,6 +840,11 @@ POST /api/client/servers/{server}/users/{user}
             → $user->can('user.update', $server) → true（所有者）
 
 4. SubuserController::update()
+   → getDefaultPermissions() 处理权限
+      a. 生成白名单（40 个权限）
+      b. array_intersect 过滤无效权限
+      c. 强制注入 websocket.connect
+      d. array_unique 去重
    → 排序新旧权限并比较
    → 权限不同，执行事务：
       a. 更新 subusers.permissions 字段
@@ -604,28 +863,31 @@ POST /api/client/servers/{server}/users/{user}
 
 ---
 
-## 五、安全设计亮点
+## 六、安全设计亮点
 
-1. **最小权限原则**：权限粒度细，可精确控制每个操作
+1. **最小权限原则**：权限粒度细（40 个），可精确控制每个操作
 2. **权限不升级原则**：不能分配超出自身权限范围的权限
-3. **隐身安全**：无权限访问返回 404，避免信息泄露
-4. **自保护机制**：禁止用户修改自己的权限
-5. **JWT 短期有效**：WebSocket 权限最多 10 分钟后失效
-6. **主动撤销**：权限降级时立即通知节点断开连接
-7. **事务一致性**：权限更新和撤销任务在同一事务中
-8. **任务重试**：节点通知失败时指数退避重试
+3. **白名单过滤**：权限分配时只保留系统定义的有效权限
+4. **强制基础权限**：所有子用户默认拥有 `websocket.connect` 权限
+5. **隐身安全**：无权限访问返回 404，避免信息泄露
+6. **自保护机制**：禁止用户修改自己的权限
+7. **JWT 短期有效**：WebSocket 权限最多 10 分钟后失效
+8. **主动撤销**：权限降级时立即通知节点断开连接
+9. **事务一致性**：权限更新和撤销任务在同一事务中
+10. **任务重试**：节点通知失败时指数退避重试
 
 ---
 
-## 六、代码索引
+## 七、代码索引
 
 | 功能模块 | 文件路径 |
 |----------|----------|
-| 权限常量定义 | `app/Models/Permission.php:18-66` |
+| 权限常量定义（40 个） | `app/Models/Permission.php:18-66` |
 | 权限结构定义 | `app/Models/Permission.php:101-209` |
 | Subuser 模型 | `app/Models/Subuser.php` |
 | 权限获取服务 | `app/Services/Servers/GetUserPermissionsService.php` |
 | 子用户创建服务 | `app/Services/Subusers/SubuserCreationService.php` |
+| 权限过滤与注入方法 | `app/Http/Controllers/Api/Client/Servers/SubuserController.php:154-168` |
 | 服务器访问中间件 | `app/Http/Middleware/Api/Client/Server/AuthenticateServerAccess.php` |
 | 模型绑定中间件 | `app/Http/Middleware/Api/Client/SubstituteClientBindings.php` |
 | API 请求基类 | `app/Http/Requests/Api/Client/ClientApiRequest.php` |
