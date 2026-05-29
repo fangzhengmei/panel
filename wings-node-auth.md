@@ -47,6 +47,8 @@ public function __invoke(Request $request, Node $node): JsonResponse
         ->where('r_nodes', 1)
         ->first();
 
+    // We couldn't find a key that exists for this user with only permission for
+    // reading nodes. Go ahead and create it now.
     if (!$key) {
         $key = $this->keyCreationService->setKeyType(ApiKey::TYPE_APPLICATION)->handle([
             'user_id' => $request->user()->id,
@@ -61,12 +63,6 @@ public function __invoke(Request $request, Node $node): JsonResponse
     ]);
 }
 ```
-
-**Deployment Token 权限范围**：
-- 类型：`ApiKey::TYPE_APPLICATION`（Application API Key）
-- 权限：`['r_nodes' => 1]` — 仅节点读取权限
-- 权限级别：`AdminAcl::READ = 1`（二进制位运算检查）
-- 其他资源权限：默认 0（无权限）
 
 **权限系统说明**（`app/Services/Acl/Api/AdminAcl.php:19-22`）：
 ```php
@@ -93,7 +89,64 @@ public const WRITE = 2;  // 写入权限
 | `r_database_hosts` | 数据库主机 | 数据库服务器权限 |
 | `r_server_databases` | 服务器数据库 | 游戏数据库权限 |
 
-### 2.3 自动配置命令与配置写入关联
+### 2.3 Deployment Token 权限边界（含复用场景）
+
+> **⚠️ 关键安全发现**：Deployment Token 的权限边界取决于"新建"还是"复用"。
+
+**场景 A：新建 API Key（无符合条件的旧 key）**
+
+当用户没有 `r_nodes = 1` 的 Application API Key 时，会新建一个：
+```php
+$key = $this->keyCreationService->setKeyType(ApiKey::TYPE_APPLICATION)->handle(
+    [/* ... */],
+    ['r_nodes' => 1]  // 只设置 r_nodes = 1
+);
+```
+
+**新建 key 的权限边界**：
+- 类型：`ApiKey::TYPE_APPLICATION`
+- `r_nodes = 1`（节点读取权限）
+- 其他所有资源权限：默认 0（无权限）
+- ✅ 符合"仅节点读取权限"的设计意图
+
+---
+
+**场景 B：复用旧 API Key（已有符合条件的旧 key）**
+
+查询条件只检查 `r_nodes = 1`，**不检查其他权限字段**：
+```php
+$key = ApiKey::query()
+    ->where('user_id', $request->user()->id)
+    ->where('key_type', ApiKey::TYPE_APPLICATION)
+    ->where('r_nodes', 1)  // 只检查 r_nodes = 1
+    ->first();
+```
+
+**复用场景的真实权限边界**：
+
+如果用户已有一个 Application API Key：
+| 权限字段 | 值 | 实际权限 | 查询是否检查 |
+|---------|----|----------|-------------|
+| `r_nodes` | 1 | 节点读取 | ✅ 检查 |
+| `r_servers` | 3 | 服务器读写 | ❌ 不检查 |
+| `r_users` | 3 | 用户读写 | ❌ 不检查 |
+| `r_allocations` | 2 | 分配写入 | ❌ 不检查 |
+| 其他字段 | 非 0 | 对应权限 | ❌ 不检查 |
+
+**复用场景的安全隐患**：
+- 返回的 deployment token 可能拥有远超"仅节点读取"的权限
+- 代码注释声称"only permission for reading nodes"，但实际实现未保证
+- 恶意用户如果已有高权限 API Key，可通过此接口获取一个看起来是"仅节点读取"的 token
+
+---
+
+**Deployment Token 权限总结**：
+| 场景 | 类型 | `r_nodes` | 其他权限 | 设计意图 | 实际情况 |
+|------|------|-----------|----------|----------|----------|
+| 新建 | Application API Key | = 1 | 均为 0 | ✅ 仅节点读取 | ✅ 符合预期 |
+| 复用 | Application API Key | = 1 | 可能 > 0 | ❌ 仅节点读取 | ⚠️ 可能有额外权限 |
+
+### 2.4 自动配置命令与配置写入关联
 
 **自动配置命令**（`resources/views/admin/nodes/view/configuration.blade.php:76`）：
 ```bash
@@ -116,19 +169,28 @@ cd /etc/pterodactyl && sudo wings configure --panel-url {{ config('app.url') }} 
 3. Panel 返回包含解密后持久凭据的配置
 4. Wings 将配置写入 `/etc/pterodactyl/config.yml`
 
-### 2.4 节点配置获取接口
+### 2.5 节点配置获取链路（两种方式）
 
-> **⚠️ 重要修正**：节点配置获取**不是**通过 Remote API 进行的，也不存在所谓的"daemon.configuration"例外路由。
+> **⚠️ 重要澄清**：节点配置获取有**两种并列方式**，不存在"必须人工预先获取"与"可自动拉取"的冲突。
+>
+> - **方式一**：管理员手动复制配置（人工方式）
+> - **方式二**：Wings 通过 deployment token 自动拉取（自动方式）
+
+---
+
+**配置获取接口总览**：
 
 节点配置有两个获取入口：
 
-**1. 管理后台（需要管理员登录）**：
+**1. 管理后台（需要管理员登录，用于方式一）**：
 - 路由：`admin.nodes.view.configuration` (`routes/admin.php:155`)
 - 控制器：`app/Http/Controllers/Admin/Nodes/NodeViewController.php:60-63`
+- 页面：直接显示 YAML 配置，供管理员复制
 
-**2. Application API（需要 Application API Key）**：
+**2. Application API（需要 Application API Key，用于方式二）**：
 - 路由：`/api/application/nodes/{node}/configuration` (`routes/api-application.php:38`)
 - 控制器：`app/Http/Controllers/Api/Application/Nodes/NodeConfigurationController.php:17-20`
+- 用途：Wings 通过 deployment token 调用此接口拉取配置
 
 ```php
 public function __invoke(GetNodeRequest $request, Node $node): JsonResponse
@@ -141,6 +203,21 @@ public function __invoke(GetNodeRequest $request, Node $node): JsonResponse
 - Request 类：`GetNodeRequest` extends `GetNodesRequest`
 - 资源：`AdminAcl::RESOURCE_NODES`
 - 权限：`AdminAcl::READ`（即 `r_nodes >= 1`）
+
+---
+
+**两种配置获取方式对比**：
+
+| 维度 | 方式一：人工复制 | 方式二：自动拉取 |
+|------|-----------------|-----------------|
+| 访问入口 | 管理后台页面 | Application API |
+| 认证方式 | Session 登录 | Application API Key（deployment token） |
+| 操作主体 | 管理员 | Wings 程序 |
+| 输出格式 | YAML（页面渲染） | JSON（API 返回） |
+| 配置处理 | 管理员复制 → 手动粘贴 | Wings 自动写入 config.yml |
+| 是否需要预先获取配置内容 | ✅ 是 | ❌ 否，只需要获取 deployment token |
+
+---
 
 **配置输出（含解密后的完整凭据）**：`app/Models/Node.php:142-168`
 
@@ -160,7 +237,7 @@ public function getConfiguration(): array
 }
 ```
 
-**首次接入完整流程**：
+**首次接入完整流程（方式二：自动拉取）**：
 ```
 ┌─────────┐          ┌─────────┐          ┌─────────┐
 │  Admin  │          │  Panel  │          │  Wings  │
@@ -169,33 +246,65 @@ public function getConfiguration(): array
      │────────────────────>│                       │
      │                     │ 生成 daemon_token_id  │
      │                     │ 生成 daemon_token     │
-     │  2. 点击"自动部署"  │                       │
-     │────────────────────>│                       │
-     │                     │ 生成/复用 API Key     │
-     │                     │ r_nodes = 1           │
+     │  2. 点击"Generate Token"按钮                │
+     │────────────────────>│ POST /admin/nodes/view/{id}/settings/token
+     │                     │                       │
+     │                     │ 查询是否有 r_nodes=1 的 key
+     │                     │ 有 → 复用；无 → 新建
      │  返回 deployment_token │                   │
      │<────────────────────│                       │
      │                                             │
      │  3. 运行自动配置命令                         │
      │  =========================================>│
      │                                             │
-     │                                             │ 4. 请求节点配置
+     │                                             │ 4. 拉取节点配置
      │                                             │ GET /api/application/nodes/{id}/configuration
      │                                             │ Authorization: Bearer <deployment_token>
      │                                             │───────────────────────────────────────────────>│
      │                                             │                                               │
-     │                                             │ 验证 Application API Key                      │
-     │                                             │ - 检查 root_admin                             │
-     │                                             │ - 检查 r_nodes >= 1                           │
-     │                                             │ 返回配置（含 daemon_token）                   │
+     │                                             │ 认证流程：                                     │
+     │                                             │ 1. AuthenticateApplicationUser:               │
+     │                                             │    检查 user.root_admin = true                │
+     │                                             │ 2. GetNodeRequest.authorize():                │
+     │                                             │    AdminAcl::check(key, RESOURCE_NODES, READ) │
+     │                                             │    r_nodes & READ = 1 & 1 = 1 → 通过          │
+     │                                             │ 返回 JSON 配置（含 daemon_token）             │
      │                                             │<───────────────────────────────────────────────│
      │                                             │
-     │                                             │ 5. 写入 config.yml
-     │                                             │ token_id: <daemon_token_id>
-     │                                             │ token: <daemon_token>
+     │                                             │ 5. 写入 /etc/pterodactyl/config.yml
+     │                                             │    token_id: <daemon_token_id>
+     │                                             │    token: <daemon_token>
      │                                             │
      │                                             │ 6. 启动 Wings
-     │                                             │ 使用持久凭据通信
+     │                                             │    使用持久凭据通信
+```
+
+---
+
+**首次接入完整流程（方式一：人工复制）**：
+```
+┌─────────┐          ┌─────────┐          ┌─────────┐
+│  Admin  │          │  Panel  │          │  Wings  │
+└────┬────┘          └────┬────┘          └────┬────┘
+     │  1. 创建节点        │                       │
+     │────────────────────>│                       │
+     │                     │ 生成 daemon_token_id  │
+     │                     │ 生成 daemon_token     │
+     │  2. 访问配置页面     │                       │
+     │────────────────────>│ GET /admin/nodes/view/{id}/configuration
+     │                     │                       │
+     │                     │ 调用 $node->getYamlConfiguration()
+     │                     │ 渲染 YAML 到页面
+     │  页面显示 YAML 配置   │                       │
+     │<────────────────────│                       │
+     │                                             │
+     │  3. 手动复制 YAML                         │
+     │  =========================================>│
+     │                                             │
+     │  4. 粘贴到 /etc/pterodactyl/config.yml       │
+     │                                             │
+     │  5. 启动 Wings                               │
+     │                                             │    使用持久凭据通信
 ```
 
 ---
@@ -799,11 +908,14 @@ Wings 日常通信 (Wings → Panel):
 | 原分析描述 | 实际情况 | 影响 |
 |-----------|----------|------|
 | `daemon.configuration` 是 Remote API 的例外路由，Wings 可无需认证获取配置 | 例外路由名称不匹配任何实际路由，所有 `/api/remote/*` 都需要认证 | 首次接入必须通过 Application API 或管理后台获取配置 |
-| 节点配置获取通过 Remote API 进行 | 节点配置通过 Admin 后台或 Application API 获取，不属于 Remote API | Wings 无法主动"拉取"配置，必须通过管理员预先获取 |
+| 节点配置获取通过 Remote API 进行 | 节点配置通过 Admin 后台或 Application API 获取，不属于 Remote API | 节点配置不是通过 Remote API 提供的 |
+| 节点配置必须人工预先获取 | 有两种方式：① 人工复制配置；② 通过 deployment token 自动拉取 | 两种方式并列，不存在冲突 |
+| Wings 无法主动拉取配置 | Wings 可以通过 deployment token 调用 Application API 拉取配置 | 自动化部署不需要人工复制配置内容 |
 | `isLatestDaemon()` 在节点心跳展示中被消费 | 该方法**定义但未被调用**，前端展示只显示版本号，不进行比较 | 版本比较逻辑实际上是死代码 |
 | `isLatestDaemon()` 在 CLI 命令中使用 | CLI 命令只调用 `isLatestPanel()`，不调用 `isLatestDaemon()` | Wings 版本没有自动更新提示 |
 | api-remote.php 中的路由有名称 | 所有路由都没有设置 `->name()`，`$route->getName()` 返回 `null` | 中间件例外路由机制无法生效 |
-| Deployment Token 权限只有节点读取权限 | ✅ 正确，`r_nodes = 1`，使用位运算检查权限 | 遵循最小权限原则 |
+| Deployment Token 权限只有节点读取权限 | 新建时只有 `r_nodes = 1`；复用时只检查 `r_nodes = 1`，其他权限可能 > 0 | 复用场景存在权限扩大的安全隐患 |
+| 复用旧 key 时会确保只有节点读取权限 | 查询只检查 `r_nodes = 1`，不检查其他权限字段 | 代码注释与实际实现不一致 |
 
 ---
 
