@@ -264,7 +264,7 @@ send(event: string, payload?: string | string[]) {
 | `SocketEvent.STATUS` | `status` | `offline`\|`starting`\|`stopping`\|`running` | 服务器状态变更 | `WebsocketHandler.tsx:44` |
 | `SocketEvent.STATS` | `stats` | JSON string | 资源统计数据 | `StatGraphs.tsx:52` |
 | `SocketEvent.TRANSFER_LOGS` | `transfer logs` | log line | 迁移日志 | `Console.tsx:174` |
-| `SocketEvent.TRANSFER_STATUS` | `transfer status` | `pending`\|`processing`\|`failed`\|`completed` | 迁移状态 | `TransferListener.tsx:11` |
+| `SocketEvent.TRANSFER_STATUS` | `transfer status` | `starting`\|`pending`\|`processing`\|`success`\|`completed`\|`failed`\|`failure` | 迁移状态 | `WebsocketHandler.tsx:65`, `TransferListener.tsx:11`, `Console.tsx:175` |
 | `SocketEvent.DAEMON_MESSAGE` | `daemon message` | message | 守护进程消息 | `Console.tsx:176` |
 | `SocketEvent.DAEMON_ERROR` | `daemon error` | error message | 守护进程错误 | `Console.tsx:177`, `WebsocketHandler.tsx:46` |
 | `SocketEvent.BACKUP_COMPLETED` | `backup completed` | 无 | 备份完成 | - |
@@ -284,6 +284,58 @@ send(event: string, payload?: string | string[]) {
         rx_bytes: number;           // 网络接收总量（字节）
     }
 }
+```
+
+### 4.5 TRANSFER STATUS 事件状态全集
+
+`transfer status` 事件的参数是一个字符串，Wings 在服务器迁移流程的不同阶段推送不同状态。前端有三个组件分别监听该事件，各自处理不同状态：
+
+#### 状态枚举与分发处理
+
+| 状态值 | 触发时机 | WebsocketHandler | TransferListener | Console |
+|--------|----------|-----------------|------------------|---------|
+| `starting` | 源节点开始将服务器归档时推送 | **忽略** (return) | 未匹配 | 未匹配 |
+| `pending` | 迁移请求已创建，等待源节点处理 | 触发重连 | `isTransferring = true` | 未匹配 |
+| `processing` | 源节点正在执行归档操作 | 触发重连 | `isTransferring = true` | 未匹配 |
+| `success` | 目标节点通知 Panel 迁移成功后推送 | **忽略** (return) | 未匹配 | 未匹配 |
+| `completed` | Panel 确认迁移完成，服务器信息已更新 | 触发重连 | 刷新服务器信息 | 未匹配 |
+| `failed` | 迁移失败（Panel 端确认） | 触发重连 | `isTransferring = false` | 未匹配 |
+| `failure` | 迁移失败（Wings/节点端推送） | 触发重连 | 未匹配 | 终端显示 "Transfer has failed." |
+
+#### starting 与 success 的语义
+
+**`starting`** — 由**源节点 Wings**推送：
+- 源节点开始对服务器进行归档（archive）操作时发送
+- 标志着迁移流程从"准备阶段"进入"执行阶段"
+- WebsocketHandler 中直接 `return` 忽略，因为此时连接仍然指向源节点，无需重连
+- 归档完成后，源节点会将 `server_transfer.archived` 标记为 `true`
+
+**`success`** — 由**目标节点 Wings**推送：
+- 目标节点成功接收并解压服务器数据后发送
+- 标志着迁移在 Wings 层面已成功，但 Panel 端的数据库更新可能尚未完成
+- WebsocketHandler 中直接 `return` 忽略，因为后续会有 `completed` 事件触发最终重连
+- Panel 收到目标节点通知后更新数据库（`successful = true`，切换 `node_id`）
+
+#### 多组件监听分工
+
+```
+Wings 推送 transfer status 事件
+        │
+        ▼
+   EventEmitter 广播
+        │
+        ├─→ WebsocketHandler.tsx:65-77
+        │     - starting/success → 忽略 (连接仍有效，无需操作)
+        │     - 其他状态 → 关闭连接 + 重新连接到新节点
+        │
+        ├─→ TransferListener.tsx:11-28
+        │     - pending/processing → isTransferring = true
+        │     - failed → isTransferring = false
+        │     - completed → 刷新服务器信息 (getServer)
+        │
+        └─→ Console.tsx:175 (handleTransferStatus)
+              - failure → 终端显示 "Transfer has failed."
+              - 其他状态 → 无处理 (switch 无匹配 case)
 ```
 
 ## 5. JWT 验证后的共用连接机制
@@ -684,7 +736,216 @@ const handleDaemonErrorOutput = (line: string) =>
     );
 ```
 
-## 9. 连接复用架构总结
+## 9. 服务器迁移与 WebSocket 重连机制
+
+### 9.1 迁移场景下 WebSocket 连接的切换需求
+
+服务器迁移时，服务器从源节点（Source Node）转移到目标节点（Target Node）。WebSocket 连接始终连接到某一个 Node，因此迁移过程中需要：
+- 在源节点归档完成后，切换连接到目标节点
+- 确保 Token 签发指向正确的 Node（源节点归档前 vs 归档后）
+
+### 9.2 WebsocketController 中的 Node 路由逻辑
+
+**文件**: `WebsocketController.php:42-53`
+
+```php
+$node = $server->node;
+if (!is_null($server->transfer)) {
+    // 需要管理员权限才能在迁移期间获取 WebSocket Token
+    if (!in_array('admin.websocket.transfer', $permissions)) {
+        throw new HttpForbiddenException('...');
+    }
+
+    // 关键：归档完成后，Token 指向目标节点
+    if ($server->transfer->archived) {
+        $node = $server->transfer->newNode;
+    }
+}
+```
+
+**路由逻辑**:
+- `transfer` 为 `null` → 正常情况，连接到服务器当前 Node
+- `transfer` 存在 + `archived == false` → 迁移进行中但未归档，Token 指向**源节点**
+- `transfer` 存在 + `archived == true` → 源节点已归档，Token 指向**目标节点**
+
+### 9.3 迁移流程与 WebSocket 重连时序
+
+```
+Source Node Wings              Panel              Target Node Wings       Browser (WebSocket)
+     |                           |                       |                       |
+     | 1. 管理员发起迁移请求     |                       |                       |
+     |                           |  创建 ServerTransfer  |                       |
+     |                           |  archived = false     |                       |
+     |<-- notify(transfer) ------|                       |                       |
+     |                           |                       |                       |
+     | 2. 源节点开始归档         |                       |                       |
+     | push: transfer status     |                       |                       |
+     |   args: ["starting"]      |                       |                       |
+     |-------------------------------------------------->|                       |
+     |                           |                       |  收到 starting        |
+     |                           |                       |  WebsocketHandler:    |
+     |                           |                       |  return (忽略)        |
+     |                           |                       |  仍在源节点，连接有效 |
+     |                           |                       |                       |
+     | 3. 源节点归档进行中       |                       |                       |
+     | push: transfer status     |                       |                       |
+     |   args: ["processing"]    |                       |                       |
+     |-------------------------------------------------->|                       |
+     |                           |                       |  触发重连！           |
+     |                           |                       |  socket.close()       |
+     |                           |                       |  setInstance(null)    |
+     |                           |                       |  connect(uuid)        |
+     |                           |                       |    │                  |
+     |                           |                       |    │ GET /websocket   |
+     |                           |                       |    │ Panel 此时       |
+     |                           |                       |    │ archived仍=false |
+     |                           |                       |    │ → Token指向源节点 |
+     |                           |                       |    │                  |
+     |                           |                       |    ├── 重新连接源节点 |
+     |                           |                       |    └── 恢复日志接收  |
+     |                           |                       |                       |
+     | 4. 源节点完成归档         |                       |                       |
+     |    设置 archived = true   |                       |                       |
+     |                           |                       |                       |
+     | 5. 源节点传输数据到目标   |                       |                       |
+     |---------------------------|---------------------->|                       |
+     |                           |                       |                       |
+     | 6. 目标节点接收完成       |                       |                       |
+     |    push: transfer status  |                       |                       |
+     |      args: ["success"]    |                       |                       |
+     |                           |                       |---------------------->|
+     |                           |                       |  收到 success         |
+     |                           |                       |  WebsocketHandler:    |
+     |                           |                       |  return (忽略)        |
+     |                           |                       |  等待 completed       |
+     |                           |                       |                       |
+     | 7. 目标节点通知 Panel     |                       |                       |
+     |                           |<----------------------|                       |
+     |                           | POST /api/remote/     |                       |
+     |                           |   servers/{uuid}/     |                       |
+     |                           |   transfer/success    |                       |
+     |                           |                       |                       |
+     |                           | 更新数据库：          |                       |
+     |                           | - node_id → new_node  |                       |
+     |                           | - successful = true   |                       |
+     |                           |                       |                       |
+     | 8. Panel 通知客户端       |                       |                       |
+     |   push: transfer status   |                       |                       |
+     |     args: ["completed"]   |                       |                       |
+     |-------------------------------------------------->|                       |
+     |                           |                       |  触发重连！           |
+     |                           |                       |  socket.close()       |
+     |                           |                       |  setInstance(null)    |
+     |                           |                       |  connect(uuid)        |
+     |                           |                       |    │                  |
+     |                           |                       |    │ GET /websocket   |
+     |                           |                       |    │ Panel 此时       |
+     |                           |                       |    │ node_id已更新    |
+     |                           |                       |    │ → Token指向目标  |
+     |                           |                       |    │                  |
+     |                           |                       |    ├── 连接目标节点   |
+     |                           |                       |    └── 接收目标节点日志|
+```
+
+### 9.4 WebsocketHandler 重连逻辑详解
+
+**文件**: `WebsocketHandler.tsx:65-77`
+
+```typescript
+socket.on('transfer status', (status: string) => {
+    // starting 和 success 不会触发重连
+    // - starting: 源节点刚开始归档，当前连接仍指向源节点，连接有效
+    // - success: 目标节点完成接收，但 Panel 可能尚未更新 node_id
+    //           等 completed 事件时再重连，确保 Panel 已切换节点
+    if (status === 'starting' || status === 'success') {
+        return;
+    }
+
+    // 其他状态（pending/processing/completed/failed/failure）触发重连
+    socket.close();                    // 关闭当前连接
+    setError('connecting');            // 显示连接中提示
+    setConnectionState(false);         // 标记连接断开
+    setInstance(null);                 // 清除 Socket 实例
+    connect(uuid);                     // 重新获取 Token 并连接
+});
+```
+
+**重连后的 Node 路由关键点**:
+- `connect(uuid)` 会重新调用 `getWebsocketToken(uuid)`
+- Panel 根据当前 `server_transfer.archived` 状态决定签发 Token 到哪个 Node
+- 归档前: Token 指向源节点 → 重连仍连源节点
+- 归档后: Token 指向目标节点 → 重连连到目标节点
+
+### 9.5 迁移失败场景
+
+```
+Source/Target Node Wings        Panel              Browser
+     |                           |                    |
+     | push: transfer status     |                    |
+     |   args: ["failed"]        |                    |
+     |------------------------------------------------->|
+     |                           |                    | 触发重连
+     |                           |                    | socket.close()
+     |                           |                    | connect(uuid)
+     |                           |                    |
+     |                           |                    | 重新获取Token
+     |                           |                    | 迁移已失败，transfer记录
+     |                           |                    | 可能已被清除或标记
+     |                           |                    | → 连接回原节点
+     |                           |                    |
+     | push: transfer status     |                    |
+     |   args: ["failure"]       |                    |
+     |------------------------------------------------->|
+     |                           |                    | 触发重连 (同上)
+     |                           |                    | Console 终端显示:
+     |                           |                    | "Transfer has failed."
+     |                           |                    | TransferListener:
+     |                           |                    | isTransferring = false
+```
+
+### 9.6 Console 组件的迁移感知
+
+**文件**: `Console.tsx:80-87, 175, 182`
+
+Console 组件对迁移的处理体现在两方面：
+
+1. **迁移失败终端提示** (`Console.tsx:80-87`):
+```typescript
+const handleTransferStatus = (status: string) => {
+    switch (status) {
+        case 'failure':
+            terminal.writeln(TERMINAL_PRELUDE + 'Transfer has failed.\u001b[0m');
+            return;
+    }
+};
+```
+
+2. **迁移期间不清空终端** (`Console.tsx:180-184`):
+```typescript
+if (connected && instance) {
+    if (!isTransferring) {
+        terminal.clear();    // 非迁移时：重连清空终端
+    }
+    // 迁移时：保留终端历史，避免丢失迁移日志
+}
+```
+
+### 9.7 迁移权限要求
+
+迁移期间获取 WebSocket Token 需要额外权限：
+
+**文件**: `WebsocketController.php:44-46`
+```php
+if (!in_array('admin.websocket.transfer', $permissions)) {
+    throw new HttpForbiddenException('You do not have permission to view server transfer logs.');
+}
+```
+
+- 普通用户在迁移期间**无法获取** WebSocket Token
+- 仅管理员（`root_admin`）拥有 `admin.websocket.transfer` 权限
+- 这意味着迁移期间只有管理员能在控制台看到迁移日志
+
+## 10. 连接复用架构总结
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
@@ -724,18 +985,22 @@ const handleDaemonErrorOutput = (line: string) =>
 └───────────────────────────────────────────────────┘
 ```
 
-## 10. 核心文件索引
+## 11. 核心文件索引
 
 | 文件路径 | 功能 |
 |---------|------|
-| `app/Http/Controllers/Api/Client/Servers/WebsocketController.php` | Token 签发控制器 |
+| `app/Http/Controllers/Api/Client/Servers/WebsocketController.php` | Token 签发控制器（含迁移 Node 路由） |
 | `app/Services/Nodes/NodeJWTService.php` | JWT 生成服务 |
 | `app/Services/Servers/GetUserPermissionsService.php` | 用户权限获取 |
 | `app/Models/Permission.php` | 权限常量定义 |
+| `app/Models/ServerTransfer.php` | 服务器迁移模型 |
+| `app/Http/Controllers/Api/Remote/Servers/ServerTransferController.php` | 迁移成功/失败回调（Wings→Panel） |
+| `app/Http/Controllers/Admin/Servers/ServerTransferController.php` | 管理员发起迁移 |
+| `app/Repositories/Wings/DaTransferRepository.php` | Panel→源节点通知迁移 |
 | `resources/scripts/plugins/Websocket.ts` | WebSocket 客户端封装 |
-| `resources/scripts/components/server/WebsocketHandler.tsx` | WebSocket 连接管理 |
+| `resources/scripts/components/server/WebsocketHandler.tsx` | WebSocket 连接管理（含迁移重连） |
 | `resources/scripts/api/server/getWebsocketToken.ts` | Token 获取 API |
-| `resources/scripts/components/server/console/Console.tsx` | 控制台组件 (日志订阅、命令发送) |
+| `resources/scripts/components/server/console/Console.tsx` | 控制台组件（日志订阅、命令发送、迁移感知） |
 | `resources/scripts/components/server/console/PowerButtons.tsx` | 电源按钮组件 |
 | `resources/scripts/components/server/console/StatGraphs.tsx` | 统计图表组件 |
 | `resources/scripts/components/server/events.ts` | Socket 事件常量 |
@@ -743,4 +1008,5 @@ const handleDaemonErrorOutput = (line: string) =>
 | `resources/scripts/state/server/socket.ts` | Socket 状态管理 |
 | `resources/scripts/components/server/InstallListener.tsx` | 安装事件监听 |
 | `resources/scripts/components/server/TransferListener.tsx` | 迁移事件监听 |
+| `resources/scripts/components/server/ConflictStateRenderer.tsx` | 冲突状态渲染（含迁移中提示） |
 | `routes/api-client.php` | API 路由定义 |
