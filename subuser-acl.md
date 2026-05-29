@@ -300,22 +300,24 @@ return array_unique(array_merge($cleaned, [Permission::ACTION_WEBSOCKET_CONNECT]
 
 ### 2.4 与其他校验的配合
 
-`getDefaultPermissions()` 是**最后一道防线**，在此之前还有两层校验：
+`getDefaultPermissions()` 是**最后一道防线**，在此之前还有三层校验：
 
-**校验顺序**：
+**完整校验顺序**：
 ```
-1. SubuserRequest::authorize()
+1. ClientApiRequest::authorize()  [通过 SubuserRequest::authorize() 调用
+   → 校验当前用户有 user.create 或 user.update 权限（通过 $user->can()）
+
+2. SubuserRequest::authorize()
    → 禁止用户编辑自己
    → validatePermissionsCanBeAssigned()：不能分配超出自身权限的权限
-
-2. ClientApiRequest::authorize()
-   → 校验当前用户有 user.create 或 user.update 权限
 
 3. SubuserController::getDefaultPermissions()  ← 本方法
    → 白名单过滤
    → 强制注入 websocket.connect
    → 去重
 ```
+
+> **真实调用顺序**：`SubuserRequest::authorize()` 首先调用 `parent::authorize()`（即 `ClientApiRequest::authorize()`），通过后才执行自己的校验逻辑，最后才到控制器的 `getDefaultPermissions()`。
 
 ### 2.5 使用场景
 
@@ -356,22 +358,33 @@ HTTP 请求
     → 绑定 server 参数（支持 uuid/uuidShort/identifier）
     → 绑定 user 参数（限定属于该服务器的子用户）
     ↓
-[中间件层] AuthenticateServerAccess 中间件
+[中间层] AuthenticateServerAccess 中间件
     → 验证服务器存在且状态正常
     → 验证用户是所有者/管理员/子用户（否则 404）
     ↓
-[请求类层] ClientApiRequest::authorize()
-    → 调用 ServerPolicy 校验具体权限
+[请求类层] 具体请求类::authorize()  [如 UpdateSubuserRequest]
     ↓
-[策略层] ServerPolicy::before()
-    → 管理员/所有者直接放行
-    → 子用户检查权限数组
-    ↓
-[业务逻辑层] SubuserRequest::validatePermissionsCanBeAssigned()
-    → 创建/更新时校验「不能分配超出自身权限范围的权限」
+[子类调用链]
+    1. SubuserRequest::authorize()
+       → 调用 parent::authorize() → ClientApiRequest::authorize()
+       ↓
+    2. ClientApiRequest::authorize()
+       → 检查是否有 permission() 方法
+       → 调用 $user->can(permission(), $server)
+       ↓
+    3. [策略层] ServerPolicy::before()
+       → 管理员/所有者直接放行
+       → 子用户检查 in_array(permission, subuser->permissions)
+       ↓
+    4. 返回 SubuserRequest::authorize() 继续执行
+       → 禁止用户编辑自己
+       → POST + 有 permissions 字段时
+           → validatePermissionsCanBeAssigned()：不能分配超出自身权限的权限
     ↓
 控制器执行业务逻辑
 ```
+
+> **关键顺序说明**：`validatePermissionsCanBeAssigned()` 不是独立的业务逻辑层，而是在请求类 `authorize()` 方法内部，且在 `parent::authorize()` 校验通过后才执行。
 
 ### 3.2 路由层：模型绑定与参数校验
 
@@ -533,11 +546,39 @@ class ServerPolicy
 
 > **技术细节**：`__call` 魔术方法是 Laravel 授权系统的一个"hack"。因为 Laravel 会优先检查策略类是否存在与权限名对应的方法，如果不存在就不会调用 `before()`。通过 `__call` 捕获所有方法调用，确保 `before()` 始终被执行。
 
-### 3.6 业务层：子用户权限分配限制
+### 3.6 请求类层：子用户权限分配的额外校验
 
-在创建或更新子用户时，还需校验「分配者不能分配超出自身权限范围的权限」。
+在 `SubuserRequest::authorize()` 中，`parent::authorize()` 校验通过后，还会执行额外的业务规则校验。
 
-**校验逻辑** (`app/Http/Requests/Api/Client/Servers/Subusers/SubuserRequest.php:52-71`):
+**真实执行顺序** (`app/Http/Requests/Api/Client/Servers/Subusers/SubuserRequest.php:21-44`):
+```php
+public function authorize(): bool
+{
+    // 第一步：先调用父类校验具体权限（如 user.create / user.update）
+    if (!parent::authorize()) {
+        return false;
+    }
+
+    // 第二步：自保护机制 - 禁止用户编辑自己的权限
+    $user = $this->route()->parameter('user');
+    if ($user instanceof User) {
+        if ($user->uuid === $this->user()->uuid) {
+            return false;
+        }
+    }
+
+    // 第三步：权限分配限制（仅 POST 且有 permissions 字段时执行）
+    if ($this->method() === Request::METHOD_POST && $this->has('permissions')) {
+        $this->validatePermissionsCanBeAssigned(
+            $this->input('permissions') ?? []
+        );
+    }
+
+    return true;
+}
+```
+
+**权限分配限制逻辑** (`app/Http/Requests/Api/Client/Servers/Subusers/SubuserRequest.php:52-71`):
 ```php
 protected function validatePermissionsCanBeAssigned(array $permissions)
 {
@@ -557,16 +598,7 @@ protected function validatePermissionsCanBeAssigned(array $permissions)
 }
 ```
 
-**自保护机制** (`app/Http/Requests/Api/Client/Servers/Subusers/SubuserRequest.php:27-33`):
-```php
-$user = $this->route()->parameter('user');
-// 禁止用户编辑自己的权限
-if ($user instanceof User) {
-    if ($user->uuid === $this->user()->uuid) {
-        return false;
-    }
-}
-```
+> **执行条件**：`validatePermissionsCanBeAssigned()` 仅在 `POST` 方法且请求包含 `permissions` 字段时执行。由于创建（`POST /users`）和更新（`POST /users/{user}`）子用户都是 POST 请求，因此这两个操作都会触发权限分配限制校验。
 
 ---
 
@@ -773,8 +805,10 @@ ClientApiRequest
 
 SubuserRequest (extends ClientApiRequest)
     ├─ authorize() → bool
-    │   ├─ 禁止用户编辑自己
-    │   └─ validatePermissionsCanBeAssigned()
+    │   ├─ 调用 parent::authorize()  [第一步]
+    │   ├─ 禁止用户编辑自己          [第二步]
+    │   └─ POST + 有 permissions 时
+    │       └─ validatePermissionsCanBeAssigned()  [第三步]
     └─ validatePermissionsCanBeAssigned(array) → void
 
 SubuserController
@@ -827,17 +861,17 @@ POST /api/client/servers/{server}/users/{user}
    → 绑定 user 对象（限定为该服务器子用户）
 
 2. AuthenticateServerAccess::handle()
-   → 检查用户是所有者
+   → 检查用户是所有者/管理员/子用户
 
 3. UpdateSubuserRequest::authorize()  [extends SubuserRequest]
    → SubuserRequest::authorize()
-      → 禁止编辑自己：通过（目标用户不是自己）
-      → POST 请求有 permissions 字段
-         → validatePermissionsCanBeAssigned()
-             → 用户是所有者，无需校验
-      → 调用 parent::authorize()
+      → 调用 parent::authorize()  [第一步]
          → ClientApiRequest::authorize()
             → $user->can('user.update', $server) → true（所有者）
+      → 禁止编辑自己：通过（目标用户不是自己） [第二步]
+      → POST 请求有 permissions 字段 [第三步]
+         → validatePermissionsCanBeAssigned()
+             → 用户是所有者，无需校验
 
 4. SubuserController::update()
    → getDefaultPermissions() 处理权限
@@ -861,11 +895,13 @@ POST /api/client/servers/{server}/users/{user}
    → 后续连接需要重新获取 JWT（携带新权限）
 ```
 
+> **关键调用顺序修正**：`parent::authorize()` 是第一步调用，只有通过后才会执行后续校验。
+
 ---
 
 ## 六、安全设计亮点
 
-1. **最小权限原则**：权限粒度细（40 个），可精确控制每个操作
+1. **最小权限原则**：权限粒度细（40 个权限位，可精确控制每个操作
 2. **权限不升级原则**：不能分配超出自身权限范围的权限
 3. **白名单过滤**：权限分配时只保留系统定义的有效权限
 4. **强制基础权限**：所有子用户默认拥有 `websocket.connect` 权限
