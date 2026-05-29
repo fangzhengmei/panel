@@ -173,12 +173,15 @@ public function authorize(): bool
    ↓
 2. 路由匹配，进入中间件链
    ├─ ServerSubject: 设置 LogTarget::actor 和 LogTarget::subject
-   ├─ AuthenticateServerAccess: 验证服务器存在、用户权限、服务器状态
+   ├─ AuthenticateServerAccess: 验证服务器存在、用户身份归属（所有者/管理员/子用户）、服务器状态
    └─ ResourceBelongsToServer: 无额外路由参数，直接通过
    ↓
 3. FormRequest 权限校验
    └─ ListFilesRequest::permission() → Permission::ACTION_FILE_READ → 'file.read'
-      └─ $user->can('file.read', $server) → Laravel Gate 校验
+      └─ $user->can('file.read', $server)
+         ├─ 所有者: $server->owner_id === $user->id → 直接放行
+         ├─ 管理员: $user->root_admin === true → 直接放行
+         └─ 子用户: in_array('file.read', $subuser->permissions) → 逐项检查
    ↓
 4. FileController::directory() 执行
    └─ DaemonFileRepository::setServer($server)->getDirectory()
@@ -318,7 +321,177 @@ public const ACTION_FILE_ARCHIVE = 'file.archive';
 public const ACTION_FILE_SFTP = 'file.sftp';
 ```
 
-### 3.3 FileController 控制器
+**权限语义定义**
+**文件**: `app/Models/Permission.php:129-140`
+
+```php
+'file' => [
+    'keys' => [
+        'create'       => 'Allows a user to create additional files and folders via the Panel or direct upload.',
+        'read'         => 'Allows a user to view the contents of a directory, but not view the contents of or download files.',
+        'read-content' => 'Allows a user to view the contents of a given file. This will also allow the user to download files.',
+        'update'       => 'Allows a user to update the contents of an existing file or directory.',
+        'delete'       => 'Allows a user to delete files or directories.',
+        'archive'      => 'Allows a user to archive the contents of a directory as well as decompress existing archives on the system.',
+        'sftp'         => 'Allows a user to connect to SFTP and manage server files using the other assigned file permissions.',
+    ],
+],
+```
+
+### 3.3 权限判定的完整路径：从权限字符串到最终放行
+
+#### 3.3.1 判定入口
+
+权限字符串本身只是标识，最终是否放行由 `ServerPolicy` 决定。
+
+**Gate 注册**
+**文件**: `app/Providers/AuthServiceProvider.php:16-18`
+
+```php
+protected $policies = [
+    Server::class => ServerPolicy::class,
+];
+```
+
+当 `$user->can('file.read', $server)` 被调用时，Laravel 自动路由到 `ServerPolicy`。
+
+#### 3.3.2 ServerPolicy 核心逻辑
+
+**文件**: `app/Policies/ServerPolicy.php:8-44`
+
+```php
+class ServerPolicy
+{
+    protected function checkPermission(User $user, Server $server, string $permission): bool
+    {
+        $subuser = $server->subusers->where('user_id', $user->id)->first();
+        if (!$subuser || empty($permission)) {
+            return false;
+        }
+
+        return in_array($permission, $subuser->permissions);
+    }
+
+    public function before(User $user, string $ability, Server $server): bool
+    {
+        if ($user->root_admin || $server->owner_id === $user->id) {
+            return true;
+        }
+
+        return $this->checkPermission($user, $server, $ability);
+    }
+
+    public function __call(string $name, mixed $arguments)
+    {
+        // do nothing
+    }
+}
+```
+
+#### 3.3.3 三种用户身份的判定路径
+
+**路径 1: 所有者（Owner）**
+
+```
+$user->can('file.read', $server)
+  → ServerPolicy::before()
+  → $server->owner_id === $user->id  → true
+  → 直接放行，跳过所有权限检查
+```
+
+代码证据：`ServerPolicy.php:28: if ($user->root_admin || $server->owner_id === $user->id) { return true; }`
+
+**路径 2: 管理员（Root Admin）**
+
+```
+$user->can('file.read', $server)
+  → ServerPolicy::before()
+  → $user->root_admin === true  → true
+  → 直接放行，跳过所有权限检查
+```
+
+代码证据：同上，`$user->root_admin` 与 `$server->owner_id === $user->id` 在同一个 `if` 条件中。
+
+**路径 3: 子用户（Subuser）**
+
+```
+$user->can('file.read', $server)
+  → ServerPolicy::before()
+  → $user->root_admin === false && $server->owner_id !== $user->id
+  → 进入 checkPermission()
+  → $subuser = $server->subusers->where('user_id', $user->id)->first()
+  → if (!$subuser) → false（不是子用户，直接拒绝）
+  → in_array('file.read', $subuser->permissions)  → true/false
+```
+
+代码证据：
+- `ServerPolicy.php:15: $subuser = $server->subusers->where('user_id', $user->id)->first();`
+- `ServerPolicy.php:16-17: if (!$subuser || empty($permission)) { return false; }`
+- `ServerPolicy.php:20: return in_array($permission, $subuser->permissions);`
+
+#### 3.3.4 子用户权限的存储方式
+
+**数据库表结构**:
+**文件**: `database/schema/mysql-schema.sql:586-598`
+
+```sql
+CREATE TABLE `subusers` (
+  `id` int(10) unsigned NOT NULL AUTO_INCREMENT,
+  `user_id` int(10) unsigned NOT NULL,
+  `server_id` int(10) unsigned NOT NULL,
+  `permissions` longtext ... CHECK (json_valid(`permissions`)),
+  ...
+);
+```
+
+`permissions` 列是 JSON 类型，存储权限字符串数组。例如：
+
+```json
+["file.read", "file.read-content", "file.create"]
+```
+
+**模型 cast**:
+**文件**: `app/Models/Subuser.php:45-49`
+
+```php
+protected $casts = [
+    'user_id' => 'int',
+    'server_id' => 'int',
+    'permissions' => 'array',
+];
+```
+
+#### 3.3.5 权限字符串映射到最终放行的完整对照
+
+| 用户身份 | 权限字符串的作用 | 放行条件 | 代码证据 |
+|---------|----------------|---------|---------|
+| **所有者** | **完全忽略**，不参与判定 | 只需 `$server->owner_id === $user->id` | `ServerPolicy.php:28` |
+| **管理员** | **完全忽略**，不参与判定 | 只需 `$user->root_admin === true` | `ServerPolicy.php:28` |
+| **子用户** | **是唯一判定依据** | `in_array($permission, $subuser->permissions)` 为 `true` | `ServerPolicy.php:20` |
+| **其他用户** | 无需检查，直接拒绝 | 不可能通过（不是所有者/管理员/子用户） | `ServerPolicy.php:16-17` + `AuthenticateServerAccess.php:42-46` |
+
+> **关键结论（代码证据）**：所有者和管理员在 `ServerPolicy::before()` 中**直接返回 `true`**，不进入 `checkPermission()`。这意味着他们不受任何权限字符串约束，拥有服务器的全部操作权限。权限字符串**仅对子用户生效**。
+
+#### 3.3.6 中间件与 Policy 的职责边界
+
+```
+请求进入
+  ↓
+AuthenticateServerAccess 中间件（粗粒度）
+  ├─ 服务器是否存在？
+  ├─ 用户是否为所有者/管理员/子用户？ ← 仅判断身份归属，不判断权限
+  └─ 服务器状态是否正常？
+  ↓
+ClientApiRequest::authorize() → ServerPolicy（细粒度）
+  ├─ 所有者/管理员 → 直接放行
+  └─ 子用户 → 检查具体权限字符串
+```
+
+代码证据：
+- 中间件层：`AuthenticateServerAccess.php:42: if (!$server->subusers->contains('user_id', $user->id))` — 只检查是否为子用户，不检查权限内容
+- Policy 层：`ServerPolicy.php:20: return in_array($permission, $subuser->permissions)` — 检查具体权限
+
+### 3.4 FileController 控制器
 
 **文件**: `app/Http/Controllers/Api/Client/Servers/FileController.php:26-265`
 
@@ -342,7 +515,7 @@ public function directory(ListFilesRequest $request, Server $server): array
 }
 ```
 
-### 3.4 文件大小限制
+### 3.5 文件大小限制
 
 **文件**: `app/Repositories/Wings/DaemonFileRepository.php:29-50`
 
@@ -878,7 +1051,10 @@ public function download(GetFileContentsRequest $request, Server $server): array
 | 资源归属校验中间件 | `app/Http/Middleware/Api/Client/Server/ResourceBelongsToServer.php` |
 | 活动日志主体中间件 | `app/Http/Middleware/Activity/ServerSubject.php` |
 | 客户端 API 请求基类 | `app/Http/Requests/Api/Client/ClientApiRequest.php` |
-| 权限常量定义 | `app/Models/Permission.php` |
+| **权限策略（核心判定）** | `app/Policies/ServerPolicy.php` |
+| **权限常量与语义定义** | `app/Models/Permission.php` |
+| **子用户模型（权限存储）** | `app/Models/Subuser.php` |
+| Gate 注册 | `app/Providers/AuthServiceProvider.php` |
 | JWT 签名服务 | `app/Services/Nodes/NodeJWTService.php` |
 | 前端上传组件 | `resources/scripts/components/server/files/UploadButton.tsx` |
 | 前端上传状态 | `resources/scripts/state/server/files.ts` |
