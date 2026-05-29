@@ -357,19 +357,385 @@ catch (\Throwable $exception) {
 
 ---
 
-### 8. 失败通知机制
+### 8. 任务列表配置规则
 
-**重要发现**：当前代码中 **没有内置的失败通知机制**（如邮件、Webhook、Discord 等）。
+**文件位置**：`app/Http/Controllers/Api/Client/Servers/ScheduleTaskController.php:40-174`
 
-#### 现有失败处理方式：
-1. **日志记录**：异常信息写入 Laravel 日志
-2. **控制台输出**：命令行执行时输出错误信息
-3. **任务终止**：失败后默认终止后续任务执行（除非设置 `continue_on_failure`）
+#### 8.1 每个计划的任务上限
 
-#### 可能的扩展点：
-- 可通过监听 Laravel 的 `JobFailed` 事件实现自定义通知
-- 可通过修改 `RunTaskJob::failed()` 方法添加通知逻辑
-- 可通过 Activity Log 系统（`Activity` Facade）扩展通知
+```php
+$limit = config('pterodactyl.client_features.schedules.per_schedule_task_limit', 10);
+if ($schedule->tasks()->count() >= $limit) {
+    throw new ServiceLimitExceededException("Schedules may not have more than $limit tasks associated with them. Creating this task would put this schedule over the limit.");
+}
+```
+
+**配置说明**：
+- **配置项**：`pterodactyl.client_features.schedules.per_schedule_task_limit`
+- **环境变量**：`PTERODACTYL_PER_SCHEDULE_TASK_LIMIT`
+- **默认值**：10
+- **文件位置**：`config/pterodactyl.php:112-115`
+
+#### 8.2 任务序号（sequence_id）调整逻辑
+
+任务序号决定了任务链的执行顺序，支持在创建和更新时动态调整。
+
+##### 创建任务时的序号调整（第 55-83 行）：
+```php
+$this->connection->transaction(function () use ($request, $schedule, $lastTask) {
+    $sequenceId = ($lastTask->sequence_id ?? 0) + 1;
+    $requestSequenceId = $request->integer('sequence_id', $sequenceId);
+
+    // 确保序号至少为 1
+    if ($requestSequenceId < 1) {
+        $requestSequenceId = 1;
+    }
+
+    // 如果请求的序号小于下一个可用序号，需要将后续任务的序号后移
+    if ($requestSequenceId < $sequenceId) {
+        $schedule->tasks()
+            ->where('sequence_id', '>=', $requestSequenceId)
+            ->increment('sequence_id');
+        $sequenceId = $requestSequenceId;
+    }
+
+    return $this->repository->create([...]);
+});
+```
+
+##### 更新任务时的序号调整（第 111-138 行）：
+```php
+$this->connection->transaction(function () use ($request, $schedule, $task) {
+    $sequenceId = $request->integer('sequence_id', $task->sequence_id);
+    
+    if ($sequenceId < 1) {
+        $sequenceId = 1;
+    }
+
+    // 前移：目标序号 < 当前序号 → 中间任务序号 +1
+    if ($sequenceId < $task->sequence_id) {
+        $schedule->tasks()
+            ->where('sequence_id', '>=', $sequenceId)
+            ->where('sequence_id', '<', $task->sequence_id)
+            ->increment('sequence_id');
+    }
+    // 后移：目标序号 > 当前序号 → 中间任务序号 -1
+    elseif ($sequenceId > $task->sequence_id) {
+        $schedule->tasks()
+            ->where('sequence_id', '>', $task->sequence_id)
+            ->where('sequence_id', '<=', $sequenceId)
+            ->decrement('sequence_id');
+    }
+
+    $this->repository->update($task->id, [...]);
+});
+```
+
+##### 删除任务时的序号调整（第 166-168 行）：
+```php
+$schedule->tasks()
+    ->where('sequence_id', '>', $task->sequence_id)
+    ->decrement('sequence_id');
+```
+
+**序号调整规则总结**：
+| 操作 | 场景 | 调整逻辑 |
+|------|------|----------|
+| 创建 | 插入到中间位置 | 目标序号及以后的任务序号 +1 |
+| 创建 | 追加到末尾 | 直接使用最大序号 +1 |
+| 更新 | 前移（目标 < 当前） | 目标到当前之间的任务序号 +1 |
+| 更新 | 后移（目标 > 当前） | 当前到目标之间的任务序号 -1 |
+| 删除 | 任意位置 | 被删任务之后的任务序号 -1 |
+
+#### 8.3 备份动作限制
+
+**文件位置**：`app/Http/Controllers/Api/Client/Servers/ScheduleTaskController.php:47-49, 107-109`
+
+```php
+if ($server->backup_limit === 0 && $request->action === 'backup') {
+    throw new HttpForbiddenException("A backup task cannot be created when the server's backup limit is set to 0.");
+}
+```
+
+**限制条件**：
+1. 当服务器的 `backup_limit = 0` 时，不允许创建备份类型的任务
+2. 该限制在任务创建和更新时都会检查
+
+---
+
+### 9. 备份动作深度分析
+
+#### 9.1 备份任务执行流程
+
+**文件位置**：`app/Services/Backups/InitiateBackupService.php:76-126`
+
+当 RunTaskJob 触发备份动作时，会调用 `InitiateBackupService::handle()`，执行以下步骤：
+
+##### 步骤 1：频率限制检查（第 78-87 行）
+```php
+$limit = config('backups.throttles.limit');
+$period = config('backups.throttles.period');
+if ($period > 0) {
+    $previous = $this->repository->getBackupsGeneratedDuringTimespan($server->id, $period);
+    if ($previous->count() >= $limit) {
+        throw new TooManyRequestsHttpException(...);
+    }
+}
+```
+
+##### 步骤 2：备份数量限制检查（第 91-107 行）
+```php
+$successful = $this->repository->getNonFailedBackups($server);
+if (!$server->backup_limit || $successful->count() >= $server->backup_limit) {
+    // 定时任务调用时 override=true，会尝试删除最旧的非锁定备份
+    if (!$override || $server->backup_limit <= 0) {
+        throw new TooManyBackupsException($server->backup_limit);
+    }
+    
+    // 删除最旧的非锁定备份
+    $oldest = $successful->where('is_locked', false)->orderBy('created_at')->first();
+    if (!$oldest) {
+        throw new TooManyBackupsException($server->backup_limit);
+    }
+    $this->deleteBackupService->handle($oldest);
+}
+```
+
+**定时任务备份的特殊性**：
+- 调用时 `override = true`（来自 `RunTaskJob:69`）
+- 达到备份上限时会自动删除最旧的非锁定备份
+- 如果所有备份都被锁定，则抛出异常
+
+##### 步骤 3：创建备份记录并下发到 Wings（第 109-125 行）
+```php
+return $this->connection->transaction(function () use ($server, $name) {
+    $backup = $this->repository->create([
+        'server_id' => $server->id,
+        'uuid' => Uuid::uuid4()->toString(),
+        'name' => trim($name) ?: sprintf('Backup at %s', CarbonImmutable::now()->toDateTimeString()),
+        'ignored_files' => array_values($this->ignoredFiles),
+        'disk' => $this->backupManager->getDefaultAdapter(),
+        'is_locked' => $this->isLocked,
+    ], true, true);
+
+    // 下发备份指令到 Wings
+    $this->daemonBackupRepository->setServer($server)
+        ->setBackupAdapter($this->backupManager->getDefaultAdapter())
+        ->backup($backup);
+
+    return $backup;
+});
+```
+
+#### 9.2 备份结果回写流程
+
+**文件位置**：`app/Http/Controllers/Api/Remote/Backups/BackupStatusController.php:32-81`
+
+Wings 完成备份后，会通过回调接口将结果回写到 Panel：
+
+##### 回调接口路由
+```
+POST /api/remote/backups/{backup}/status
+```
+
+##### 回写处理逻辑
+```php
+public function index(ReportBackupCompleteRequest $request, string $backup): JsonResponse
+{
+    $node = $request->attributes->get('node');
+    
+    $model = Backup::query()->where('uuid', $backup)->firstOrFail();
+    
+    // 验证节点权限
+    if ($model->server->node_id !== $node->id) {
+        throw new HttpForbiddenException(...);
+    }
+    
+    // 防止重复更新
+    if ($model->is_successful) {
+        throw new BadRequestHttpException(...);
+    }
+
+    $action = $request->boolean('successful') ? 'server:backup.complete' : 'server:backup.fail';
+    $log = Activity::event($action)->subject($model, $model->server)->property('name', $model->name);
+
+    $log->transaction(function () use ($model, $request) {
+        $successful = $request->boolean('successful');
+
+        $model->fill([
+            'is_successful' => $successful,
+            'is_locked' => $successful ? $model->is_locked : false,
+            'checksum' => $successful ? ($request->input('checksum_type') . ':' . $request->input('checksum')) : null,
+            'bytes' => $successful ? $request->input('size') : 0,
+            'completed_at' => CarbonImmutable::now(),
+        ])->save();
+
+        // S3 多部分上传完成处理
+        $adapter = $this->backupManager->adapter();
+        if ($adapter instanceof S3Filesystem) {
+            $this->completeMultipartUpload($model, $adapter, $successful, $request->input('parts'));
+        }
+    });
+
+    return new JsonResponse([], JsonResponse::HTTP_NO_CONTENT);
+}
+```
+
+##### 回写字段说明（Backup 模型）
+**文件位置**：`app/Models/Backup.php:47-62`
+
+| 字段 | 类型 | 回写值 |
+|------|------|--------|
+| `is_successful` | bool | 备份是否成功 |
+| `is_locked` | bool | 失败时强制设为 false |
+| `checksum` | string | 成功时：`checksum_type:checksum` |
+| `bytes` | int | 成功时：备份文件大小 |
+| `completed_at` | datetime | 回写时间 |
+
+#### 9.3 备份任务链注意事项
+
+**重要**：备份任务在 `RunTaskJob` 中是**异步下发**的，`RunTaskJob` 只负责触发备份，不等待备份完成。
+
+```php
+// RunTaskJob:68-70
+case Task::ACTION_BACKUP:
+    $backupService->setIgnoredFiles(explode(PHP_EOL, $this->task->payload))->handle($server, null, true);
+    break;
+```
+
+这意味着：
+1. `RunTaskJob` 会立即完成，并触发下一个任务
+2. 备份的实际执行在 Wings 后台进行
+3. 备份结果通过独立的回调接口回写
+4. 备份失败**不会**影响任务链的执行（除非 Wings 连接失败）
+
+---
+
+### 10. 失败通知机制深度分析
+
+#### 10.1 现有通知系统概览
+
+**文件位置**：`app/Providers/EventServiceProvider.php:25-27`
+
+```php
+protected $listen = [
+    ServerInstalledEvent::class => [ServerInstalledNotification::class],
+];
+```
+
+当前系统仅在服务器安装完成时发送通知，**没有任何与定时任务相关的内置通知**。
+
+#### 10.2 定时任务失败的记录方式
+
+##### 方式 1：日志记录
+**文件位置**：`app/Console/Commands/Schedule/ProcessRunnableCommand.php:69-73`
+```php
+catch (\Throwable $exception) {
+    Log::error($exception, ['schedule_id' => $schedule->id]);
+    $this->error("An error was encountered while processing Schedule #$schedule->id: " . $exception->getMessage());
+}
+```
+
+##### 方式 2：Activity Log 记录
+**文件位置**：`app/Http/Controllers/Api/Remote/Backups/BackupStatusController.php:55-56`
+```php
+$action = $request->boolean('successful') ? 'server:backup.complete' : 'server:backup.fail';
+$log = Activity::event($action)->subject($model, $model->server)->property('name', $model->name);
+```
+
+**可用的 Activity 事件**：
+| 事件 | 触发时机 |
+|------|----------|
+| `server:schedule.create` | 创建计划 |
+| `server:schedule.update` | 更新计划 |
+| `server:schedule.execute` | 手动执行计划 |
+| `server:schedule.delete` | 删除计划 |
+| `server:task.create` | 创建任务 |
+| `server:task.update` | 更新任务 |
+| `server:task.delete` | 删除任务 |
+| `server:backup.complete` | 备份成功 |
+| `server:backup.fail` | 备份失败 |
+
+##### 方式 3：ActivityLogged 事件
+**文件位置**：`app/Events/ActivityLogged.php:9-34`
+
+每次 Activity Log 记录时都会触发 `ActivityLogged` 事件：
+```php
+class ActivityLogged extends Event
+{
+    public function __construct(public ActivityLog $model) {}
+
+    public function is(string $event): bool { ... }
+    public function isServerEvent(): bool { ... }
+    public function isSystem(): bool { ... }
+}
+```
+
+#### 10.3 失败通知扩展方案
+
+虽然没有内置通知，但可以通过以下方式扩展：
+
+##### 方案 1：监听 ActivityLogged 事件
+```php
+// 在 EventServiceProvider 中注册
+ActivityLogged::class => [
+    ScheduleFailedNotificationListener::class,
+],
+
+// 监听器示例
+class ScheduleFailedNotificationListener
+{
+    public function handle(ActivityLogged $event)
+    {
+        if ($event->is('server:backup.fail')) {
+            // 发送备份失败通知
+            $backup = $event->model->subjects->first();
+            $server = $backup->server;
+            $user = $server->user;
+            
+            $user->notify(new BackupFailedNotification($backup));
+        }
+    }
+}
+```
+
+##### 方案 2：扩展 RunTaskJob::failed() 方法
+**文件位置**：`app/Jobs/Schedule/RunTaskJob.php:89-93`
+```php
+public function failed(?\Exception $exception = null)
+{
+    $this->markTaskNotQueued();
+    $this->markScheduleComplete();
+    
+    // 扩展：发送失败通知
+    $this->task->server->user->notify(
+        new ScheduleTaskFailedNotification($this->task, $exception)
+    );
+}
+```
+
+##### 方案 3：监听 Laravel Queue 失败事件
+```php
+// 在 AppServiceProvider 中注册
+Queue::failing(function (JobFailed $event) {
+    if ($event->job instanceof RunTaskJob) {
+        $task = $event->job->task;
+        // 发送通知
+    }
+});
+```
+
+#### 10.4 备份失败的特殊情况
+
+备份失败有两个层面：
+1. **下发失败**：`RunTaskJob` 调用 `InitiateBackupService` 时失败
+   - 触发 `RunTaskJob::failed()`
+   - 终止任务链（除非 `continue_on_failure`）
+   
+2. **执行失败**：Wings 备份过程中失败
+   - 通过 `BackupStatusController` 回写失败状态
+   - 记录 `server:backup.fail` Activity Log
+   - **不影响** 任务链（因为 RunTaskJob 早已完成）
 
 ---
 
@@ -450,7 +816,12 @@ catch (\Throwable $exception) {
 
 ### 注意事项
 1. **精度限制**：每分钟检查一次，不支持秒级调度
-2. **无结果回调**：Wings 执行结果（如命令输出、备份状态）不会回写到 Panel
-3. **无失败通知**：需要自行扩展通知机制
-4. **队列依赖**：必须运行队列 worker（`php artisan queue:work`）
-5. **时间同步**：服务器时间需准确，否则 Cron 计算会有偏差
+2. **结果回调差异**：
+   - 电源/命令操作：无结果回调，Wings 执行结果不会回写到 Panel
+   - 备份操作：有独立的回调接口，备份完成后 Wings 会通过 `POST /api/remote/backups/{backup}/status` 回写状态
+3. **备份异步性**：备份任务触发后立即完成，不等待 Wings 备份完成，任务链继续执行
+4. **无内置失败通知**：需要自行扩展通知机制（可通过 ActivityLogged 事件或 Queue::failing 事件）
+5. **队列依赖**：必须运行队列 worker（`php artisan queue:work`）
+6. **时间同步**：服务器时间需准确，否则 Cron 计算会有偏差
+7. **任务上限**：每个 Schedule 最多 10 个任务（可通过 `PTERODACTYL_PER_SCHEDULE_TASK_LIMIT` 配置）
+8. **备份限制**：服务器 `backup_limit = 0` 时不能创建备份任务
