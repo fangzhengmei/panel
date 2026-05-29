@@ -62,12 +62,61 @@ public function __invoke(Request $request, Node $node): JsonResponse
 }
 ```
 
-**用途**：生成仅具有节点读取权限的 Application API Key，用于一键部署命令：
-```bash
-cd /etc/pterodactyl && sudo wings configure --panel-url <panel_url> --token <deployment_token> --node <node_id>
+**Deployment Token 权限范围**：
+- 类型：`ApiKey::TYPE_APPLICATION`（Application API Key）
+- 权限：`['r_nodes' => 1]` — 仅节点读取权限
+- 权限级别：`AdminAcl::READ = 1`（二进制位运算检查）
+- 其他资源权限：默认 0（无权限）
+
+**权限系统说明**（`app/Services/Acl/Api/AdminAcl.php:19-22`）：
+```php
+public const NONE = 0;   // 无权限
+public const READ = 1;   // 读取权限
+public const WRITE = 2;  // 写入权限
 ```
 
-### 2.3 节点配置获取（首次接入）
+权限检查采用位运算：`$permission & $action`，因此：
+- `r_nodes = 1` → `1 & 1 = 1` → 允许读取
+- `r_nodes = 1` → `1 & 2 = 0` → 不允许写入
+- `r_nodes = 3` → 读取 + 写入权限
+
+**其他可用资源权限**（`app/Models/ApiKey.php:26-34`）：
+| 字段 | 资源 | 说明 |
+|------|------|------|
+| `r_servers` | 服务器 | 服务器管理权限 |
+| `r_nodes` | 节点 | 节点管理权限 |
+| `r_allocations` | 分配 | IP/端口分配权限 |
+| `r_users` | 用户 | 用户管理权限 |
+| `r_locations` | 位置 | 数据中心位置权限 |
+| `r_nests` | 嵌套 | Egg 分组权限 |
+| `r_eggs` | Egg | 游戏服务端配置权限 |
+| `r_database_hosts` | 数据库主机 | 数据库服务器权限 |
+| `r_server_databases` | 服务器数据库 | 游戏数据库权限 |
+
+### 2.3 自动配置命令与配置写入关联
+
+**自动配置命令**（`resources/views/admin/nodes/view/configuration.blade.php:76`）：
+```bash
+cd /etc/pterodactyl && sudo wings configure --panel-url {{ config('app.url') }} --token {{ deployment_token }} --node {{ node_id }}
+```
+
+**命令参数说明**：
+| 参数 | 说明 |
+|------|------|
+| `--panel-url` | Panel 访问地址 |
+| `--token` | Deployment Token（Application API Key） |
+| `--node` | 节点 ID |
+| `--allow-insecure` | 调试模式下忽略 HTTPS 证书验证 |
+
+**自动配置流程（Wings 侧）**：
+1. Wings 使用 `--token` 作为 Application API Key，请求 Panel 的节点配置接口
+2. Panel 通过 Application API 认证中间件验证：
+   - `AuthenticateApplicationUser.php:18`：验证用户是否为 root_admin
+   - `ApplicationApiRequest.php:49`：检查 `r_nodes` 权限 >= READ
+3. Panel 返回包含解密后持久凭据的配置
+4. Wings 将配置写入 `/etc/pterodactyl/config.yml`
+
+### 2.4 节点配置获取接口
 
 > **⚠️ 重要修正**：节点配置获取**不是**通过 Remote API 进行的，也不存在所谓的"daemon.configuration"例外路由。
 
@@ -88,6 +137,11 @@ public function __invoke(GetNodeRequest $request, Node $node): JsonResponse
 }
 ```
 
+**接口权限要求**：
+- Request 类：`GetNodeRequest` extends `GetNodesRequest`
+- 资源：`AdminAcl::RESOURCE_NODES`
+- 权限：`AdminAcl::READ`（即 `r_nodes >= 1`）
+
 **配置输出（含解密后的完整凭据）**：`app/Models/Node.php:142-168`
 
 ```php
@@ -106,11 +160,43 @@ public function getConfiguration(): array
 }
 ```
 
-**首次接入流程**：
-1. 管理员在 Panel 创建节点 → 生成 `daemon_token_id` + `daemon_token`
-2. 管理员通过管理后台或 Application API 获取节点配置（含明文 token）
-3. 将配置复制到 Wings 服务器的 `/etc/pterodactyl/config.yml`
-4. Wings 启动后，使用配置中的 token 与 Panel 通信
+**首次接入完整流程**：
+```
+┌─────────┐          ┌─────────┐          ┌─────────┐
+│  Admin  │          │  Panel  │          │  Wings  │
+└────┬────┘          └────┬────┘          └────┬────┘
+     │  1. 创建节点        │                       │
+     │────────────────────>│                       │
+     │                     │ 生成 daemon_token_id  │
+     │                     │ 生成 daemon_token     │
+     │  2. 点击"自动部署"  │                       │
+     │────────────────────>│                       │
+     │                     │ 生成/复用 API Key     │
+     │                     │ r_nodes = 1           │
+     │  返回 deployment_token │                   │
+     │<────────────────────│                       │
+     │                                             │
+     │  3. 运行自动配置命令                         │
+     │  =========================================>│
+     │                                             │
+     │                                             │ 4. 请求节点配置
+     │                                             │ GET /api/application/nodes/{id}/configuration
+     │                                             │ Authorization: Bearer <deployment_token>
+     │                                             │───────────────────────────────────────────────>│
+     │                                             │                                               │
+     │                                             │ 验证 Application API Key                      │
+     │                                             │ - 检查 root_admin                             │
+     │                                             │ - 检查 r_nodes >= 1                           │
+     │                                             │ 返回配置（含 daemon_token）                   │
+     │                                             │<───────────────────────────────────────────────│
+     │                                             │
+     │                                             │ 5. 写入 config.yml
+     │                                             │ token_id: <daemon_token_id>
+     │                                             │ token: <daemon_token>
+     │                                             │
+     │                                             │ 6. 启动 Wings
+     │                                             │ 使用持久凭据通信
+```
 
 ---
 
@@ -164,6 +250,15 @@ Authorization: Bearer <daemon_token_id>.<decrypted_daemon_token>
 >
 > 结论：**所有 `/api/remote/*` 路由都需要认证，没有例外！**
 
+**例外路由列表**（`DaemonAuthenticate.php:25-27`）：
+```php
+protected array $except = [
+    'daemon.configuration',
+];
+```
+
+**证据**：检查 `routes/api-remote.php` 中所有路由，确认没有 `->name()` 调用。
+
 ### 3.2 路由组配置
 
 **核心代码**：`app/Providers/RouteServiceProvider.php:62-65`
@@ -204,6 +299,17 @@ Route::middleware('daemon')
 | `/api/remote/backups/{backup}` | GET | `BackupRemoteUploadController::__invoke` | 备份下载重定向 |
 | `/api/remote/backups/{backup}` | POST | `BackupStatusController::index` | 备份完成上报 |
 | `/api/remote/backups/{backup}/restore` | POST | `BackupStatusController::restore` | 备份恢复完成上报 |
+| `/api/remote/eggs/install` | POST | `EggInstallController::__invoke` | Egg 安装脚本获取 |
+
+**控制器文件清单**（`app/Http/Controllers/Api/Remote/`）：
+- `SftpAuthenticationController.php`
+- `ServerDetailsController.php`
+- `ActivityProcessingController.php`
+- `ServerInstallController.php`
+- `ServerTransferController.php`
+- `BackupRemoteUploadController.php`
+- `BackupStatusController.php`
+- `EggInstallController.php`
 
 ### 3.4 凭据重置
 
@@ -259,6 +365,7 @@ public function handle(Node $node, array $data, bool $resetToken = false): Node
 **心跳频率**：每 10 秒
 **目标端点**：Wings `/api/system`（注意：这是 Panel 前端直接访问 Wings，不经过 Panel 后端）
 **认证方式**：直接使用解密后的 `daemon_token` 作为 Bearer Token
+**版本展示**：仅在 tooltip 中显示 `v{version}`，不进行版本比较
 
 ### 4.2 后端系统信息获取（节点详情页）
 
@@ -313,11 +420,9 @@ public function getSystemInformation(?int $version = null): array
 })();
 ```
 
-### 4.3 版本比较结果的消费路径
+### 4.3 版本比较方法定义
 
-> **⚠️ 关键发现**：`isLatestDaemon()` 方法**没有在节点心跳展示中被消费**！
-
-**版本比较方法定义**：`app/Services/Helpers/SoftwareVersionService.php:74-81`
+**核心代码**：`app/Services/Helpers/SoftwareVersionService.php:74-81`
 
 ```php
 public function isLatestDaemon(string $version): bool
@@ -329,28 +434,74 @@ public function isLatestDaemon(string $version): bool
 }
 ```
 
-**实际消费情况**：
+**版本获取方法**：
+```php
+public function getPanel(): string  // 获取 Panel 最新版本
+public function getDaemon(): string // 获取 Wings 最新版本
+```
 
-| 位置 | 消费方式 |
-|------|----------|
-| `app/Console/Commands/InfoCommand.php:32` | CLI 命令中显示 Panel 版本信息（只调用 `isLatestPanel()`） |
-| `resources/views/admin/index.blade.php:19,29` | 管理首页显示 Panel 版本状态（只调用 `isLatestPanel()`） |
-| `resources/views/admin/nodes/view/index.blade.php:42` | 节点详情页只显示最新版本号（调用 `getDaemon()`，不调用 `isLatestDaemon()`） |
+**版本比较逻辑**：
+- 若当前版本为 `develop`，直接返回 `true`（视为最新）
+- 使用 `version_compare($current, $latest) >= 0` 进行比较
+- 返回 `true` 表示当前版本 >= 最新版本（已是最新）
+- 返回 `false` 表示当前版本 < 最新版本（需要更新）
 
-**节点详情页展示**：`resources/views/admin/nodes/view/index.blade.php:42`
+### 4.4 isLatestDaemon 实际调用情况
+
+> **⚠️ 关键发现**：`isLatestDaemon()` 方法在代码库中**没有被任何地方调用**！
+
+**实际调用搜索结果**：
+- `isLatestDaemon` 仅在 `SoftwareVersionService.php:74` 中定义
+- 在整个代码库中（`.php` 文件）没有找到任何调用该方法的代码
+- CLI 命令 `InfoCommand.php:31-32` 只调用了 `isLatestPanel()`，**没有调用 `isLatestDaemon()`**
+
+**getDaemon() 调用情况**：
+
+| 文件位置 | 用途 | 是否调用 isLatestDaemon |
+|---------|------|------------------------|
+| `resources/views/admin/nodes/view/index.blade.php:42` | 显示最新版本号 | ❌ 只调用 `getDaemon()` |
+| `app/Services/Telemetry/TelemetryCollectionService.php` | 遥测数据收集 | ❌ 直接比较版本 |
+
+**节点详情页版本展示**：`resources/views/admin/nodes/view/index.blade.php:42`
 
 ```html
 <td>Daemon Version</td>
-<td><code data-attr="info-version"><i class="fa fa-refresh fa-fw fa-spin"></i></code> (Latest: <code>{{ $version->getDaemon() }}</code>)</td>
+<td>
+    <code data-attr="info-version"><i class="fa fa-refresh fa-fw fa-spin"></i></code>
+    (Latest: <code>{{ $version->getDaemon() }}</code>)
+</td>
 ```
 
-**版本数据流程**：
-1. 后端 `SystemInformationController` → 从 Wings 获取 `version` 字段
-2. 前端 AJAX 获取 → 直接替换 `[data-attr="info-version"]` 的 HTML
-3. 页面渲染 → 显示当前版本 + `$version->getDaemon()`（最新版本号）
-4. **没有进行版本比较**，也没有根据版本是否最新显示不同状态
+### 4.5 版本比较结果的消费路径
 
-### 4.4 版本获取机制
+**版本数据完整流程**：
+
+```
+Wings 端:
+  /api/system → 返回 { version: "1.7.0", ... }
+
+Panel 后端:
+  SystemInformationController.php → 从 Wings 获取 version
+  → 返回 JSON: { "version": "1.7.0", "system": {...} }
+
+Panel 前端:
+  AJAX 请求 /admin/nodes/view/{id}/system-information
+  → 成功回调: $('[data-attr="info-version"]').html(data.version)
+  → 直接替换 HTML，不进行任何版本比较
+
+页面展示:
+  显示: 当前版本 <code data-attr="info-version">1.7.0</code>
+        (Latest: <code>1.7.2</code>)  ← 由 {{ $version->getDaemon() }} 渲染
+
+注意: 没有版本比较，没有根据比较结果改变显示样式
+```
+
+**版本比较缺失的影响**：
+- 用户需要手动对比两个版本号来判断是否需要更新
+- 没有自动的"需要更新"提示或警告样式
+- `isLatestDaemon()` 方法实际上是死代码，定义但未使用
+
+### 4.6 版本获取机制
 
 **核心代码**：`app/Services/Helpers/SoftwareVersionService.php:38-41`
 
@@ -548,32 +699,54 @@ $info = $this->daemonConfigurationRepository->setNode($node)->getSystemInformati
 
 ### 7.3 权限隔离
 
-1. **Deployment Token**：仅授予节点读取权限
+1. **Deployment Token**：仅授予节点读取权限（`r_nodes = 1`）
 2. **Remote API**：仅节点可访问，通过 `DaemonAuthenticate` 中间件保护
 3. **用户操作**：通过 JWT 中的 permissions 声明进行细粒度权限控制
+4. **Application API**：双重检查（root_admin + ACL 权限位）
 
 ---
 
 ## 8. 完整认证时序图
 
 ```
-Wings 首次接入流程:
-┌─────────┐          ┌─────────┐
-│  Admin  │          │  Panel  │
-└────┬────┘          └────┬────┘
-     │  1. 创建节点        │
-     │────────────────────>│
-     │                     │ 生成 daemon_token_id(16)
-     │                     │ 生成 daemon_token(64)
-     │  2. 获取配置       │
-     │────────────────────>│ GET /admin/nodes/view/{id}/configuration
-     │                     │ 或 GET /api/application/nodes/{id}/configuration
-     │  返回含解密token    │
-     │<────────────────────│
-     │
-     │  3. 复制配置到 Wings 服务器
-     │  ==================> /etc/pterodactyl/config.yml
-     │
+Wings 自动配置流程:
+┌─────────┐          ┌─────────┐          ┌─────────┐
+│  Admin  │          │  Panel  │          │  Wings  │
+└────┬────┘          └────┬────┘          └────┬────┘
+     │  1. 创建节点        │                       │
+     │────────────────────>│                       │
+     │                     │ 生成 daemon_token_id  │
+     │                     │ 生成 daemon_token     │
+     │  2. 点击"自动部署"  │                       │
+     │────────────────────>│                       │
+     │                     │ 生成 API Key(r_nodes=1) │
+     │  返回 deployment_token │                   │
+     │<────────────────────│                       │
+     │                                             │
+     │  3. 运行自动配置命令                         │
+     │  =========================================>│
+     │                                             │
+     │                                             │ 4. 请求节点配置
+     │                                             │ GET /api/application/nodes/{id}/configuration
+     │                                             │ Authorization: Bearer ptla_xxxxxxxxx
+     │                                             │───────────────────────────────────────────────>│
+     │                                             │                                               │
+     │                                             │ 认证流程:                                     │
+     │                                             │ 1. AuthenticateApplicationUser:               │
+     │                                             │    检查 user.root_admin = true                │
+     │                                             │ 2. GetNodeRequest.authorize():                │
+     │                                             │    AdminAcl::check(key, RESOURCE_NODES, READ) │
+     │                                             │    r_nodes & READ = 1 & 1 = 1 → 通过          │
+     │                                             │ 返回配置（含 daemon_token）                   │
+     │                                             │<───────────────────────────────────────────────│
+     │                                             │
+     │                                             │ 5. 写入 /etc/pterodactyl/config.yml
+     │                                             │    token_id: <daemon_token_id>
+     │                                             │    token: <daemon_token>
+     │                                             │
+     │                                             │ 6. 启动 Wings
+     │                                             │    使用持久凭据通信
+     │                                             │
      │
 Wings 日常通信 (Wings → Panel):
 ┌─────────┐          ┌─────────┐
@@ -584,7 +757,7 @@ Wings 日常通信 (Wings → Panel):
      │                     │ DaemonAuthenticate 验证
      │                     │ 1. 拆分 token
      │                     │ 2. 根据 id 查节点
-     │                     │ 3. 解密 token 比对
+     │                     │ 3. 解密 token 比对 (hash_equals)
      │  返回数据             │
      │<────────────────────│
      │
@@ -595,8 +768,9 @@ Wings 日常通信 (Wings → Panel):
 └────┬─────┘          └────┬────┘
      │  Bearer <daemon_token> │
      │────────────────────>│ GET /api/system
-     │  返回版本/系统信息      │
+     │  返回 {version: "1.7.0"} │
      │<────────────────────│
+     │  直接显示版本号，不比较  │
      │
      │
 用户 Websocket 连接:
@@ -620,14 +794,16 @@ Wings 日常通信 (Wings → Panel):
 
 ---
 
-## 9. 关键代码勘误表
+## 9. 关键代码勘误表（最终版）
 
 | 原分析描述 | 实际情况 | 影响 |
 |-----------|----------|------|
-| `daemon.configuration` 是 Remote API 的例外路由，无需认证 | 例外路由名称不匹配任何实际路由，所有 `/api/remote/*` 都需要认证 | 首次接入必须通过管理后台或 Application API 获取配置 |
-| 节点配置获取通过 Remote API 进行 | 节点配置通过 Admin 后台或 Application API 获取，不属于 Remote API | Wings 无法主动"拉取"配置，必须管理员预先写入 |
-| `isLatestDaemon()` 在节点心跳展示中被消费 | 该方法只在 CLI 命令中使用，前端展示只显示版本号，不进行比较 | 版本比较逻辑实际上未被前端使用 |
+| `daemon.configuration` 是 Remote API 的例外路由，Wings 可无需认证获取配置 | 例外路由名称不匹配任何实际路由，所有 `/api/remote/*` 都需要认证 | 首次接入必须通过 Application API 或管理后台获取配置 |
+| 节点配置获取通过 Remote API 进行 | 节点配置通过 Admin 后台或 Application API 获取，不属于 Remote API | Wings 无法主动"拉取"配置，必须通过管理员预先获取 |
+| `isLatestDaemon()` 在节点心跳展示中被消费 | 该方法**定义但未被调用**，前端展示只显示版本号，不进行比较 | 版本比较逻辑实际上是死代码 |
+| `isLatestDaemon()` 在 CLI 命令中使用 | CLI 命令只调用 `isLatestPanel()`，不调用 `isLatestDaemon()` | Wings 版本没有自动更新提示 |
 | api-remote.php 中的路由有名称 | 所有路由都没有设置 `->name()`，`$route->getName()` 返回 `null` | 中间件例外路由机制无法生效 |
+| Deployment Token 权限只有节点读取权限 | ✅ 正确，`r_nodes = 1`，使用位运算检查权限 | 遵循最小权限原则 |
 
 ---
 
@@ -644,6 +820,10 @@ Wings 日常通信 (Wings → Panel):
 | `app/Http/Controllers/Admin/Nodes/SystemInformationController.php` | 系统信息获取（管理后台） |
 | `app/Http/Controllers/Admin/Nodes/NodeViewController.php` | 节点视图控制器 |
 | `app/Models/Node.php` | 节点模型，凭据解密 |
+| `app/Models/ApiKey.php` | API Key 模型 |
+| `app/Services/Acl/Api/AdminAcl.php` | ACL 权限系统 |
+| `app/Http/Requests/Api/Application/ApplicationApiRequest.php` | Application API 请求基类 |
+| `app/Http/Middleware/Api/Application/AuthenticateApplicationUser.php` | Application API 认证中间件 |
 | `app/Services/Helpers/SoftwareVersionService.php` | 版本兼容性检查 |
 | `app/Repositories/Wings/DaemonRepository.php` | Wings API 客户端基类 |
 | `app/Repositories/Wings/DaemonConfigurationRepository.php` | Wings 配置/系统信息 |
