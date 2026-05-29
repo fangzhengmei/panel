@@ -709,10 +709,10 @@ null（正常）             →    不变
 | 4. 批量将中间状态更新为 `null` | `ServerDetailsController.php:128-130` | ✅ 数据库变更可追踪 |
 | 5. 仅影响本 Node 的服务器（`where('node_id', $node->id)`） | `ServerDetailsController.php:100,128` | ✅ 隔离性可验证 |
 
-### 13.5 关键设计决策
+### 13.5 关键设计决策（含代码不一致性说明）
 
 1. **为什么 `INSTALL_FAILED` / `REINSTALL_FAILED` 不被重置？**
-   这些已经是终态，表示安装确实失败了。重置它们会掩盖真实错误。管理员可通过管理后台的 `toggleInstall` 手动切换。
+   这些状态表示安装确实失败了。但代码中对两种失败状态的处理**完全不对称**（详见第十六章）。
 
 2. **为什么 `RESTORING_BACKUP` 需要写审计日志但 `INSTALLING` 不需要？**
    恢复备份中断后用户需要知道哪个备份失败了（影响数据完整性判断）。安装中断只需重置状态——用户可以重新触发重装。
@@ -722,9 +722,213 @@ null（正常）             →    不变
 
 ---
 
-## 十四、可验证链路与不可验证的 Wings 行为边界
+## 十四、失败状态的真实流转差异：INSTALL_FAILED vs REINSTALL_FAILED
 
-### 14.1 边界总览
+### 14.1 isInstalled() 的不对称判断
+
+**文件**：`app/Models/Server.php:213-216`
+
+```php
+public function isInstalled(): bool
+{
+    return $this->status !== self::STATUS_INSTALLING && $this->status !== self::STATUS_INSTALL_FAILED;
+}
+```
+
+**⚠️ 关键发现**：此函数**只排除了 `STATUS_INSTALL_FAILED`，但完全遗漏了 `STATUS_REINSTALL_FAILED`！**
+
+| 状态 | isInstalled() 返回值 |
+|------|---------------------|
+| `null` (正常) | `true` |
+| `STATUS_INSTALLING` | `false` |
+| `STATUS_INSTALL_FAILED` | `false` |
+| `STATUS_REINSTALL_FAILED` | **`true`** ❗ |
+| `STATUS_SUSPENDED` | `true` |
+
+### 14.2 validateCurrentState() 的实际效果
+
+**文件**：`app/Models/Server.php:390-401`
+
+```php
+public function validateCurrentState()
+{
+    if (
+        $this->isSuspended()
+        || $this->node->isUnderMaintenance()
+        || !$this->isInstalled()    // ← 间接使用 isInstalled()
+        || $this->status === self::STATUS_RESTORING_BACKUP
+        || !is_null($this->transfer)
+    ) {
+        throw new ServerStateConflictException($this);
+    }
+}
+```
+
+**对用户可访问性的影响**：
+
+| 状态 | validateCurrentState() | 用户是否可访问 |
+|------|-----------------------|---------------|
+| `STATUS_INSTALL_FAILED` | ❌ 抛异常 | ❌ 完全被锁死 |
+| `STATUS_REINSTALL_FAILED` | ✅ 通过 | ✅ **正常访问** |
+
+**调用此校验的关键路径**：
+- 客户端 API 中间件：`AuthenticateServerAccess.php:50`
+- SFTP 认证控制器：`SftpAuthenticationController.php:153`
+
+**结论**：`STATUS_REINSTALL_FAILED` 的服务器用户可以：
+- ✅ 正常登录控制台
+- ✅ 启动/停止/重启服务器
+- ✅ 通过 SFTP 上传下载文件
+- ✅ 查看日志和控制台输出
+
+而 `STATUS_INSTALL_FAILED` 的服务器以上操作**全部被禁止**。
+
+### 14.3 toggleInstall() 的不对称处理
+
+**文件**：`app/Http/Controllers/Admin/ServersController.php:88-100`
+
+```php
+public function toggleInstall(Server $server): RedirectResponse
+{
+    if ($server->status === Server::STATUS_INSTALL_FAILED) {
+        throw new DisplayException(trans('admin/server.exceptions.marked_as_failed'));
+    }
+
+    $this->repository->update($server->id, [
+        'status' => $server->isInstalled() ? Server::STATUS_INSTALLING : null,
+    ], true, true);
+
+    // ...
+}
+```
+
+**⚠️ 关键发现**：此函数**只拦截 `STATUS_INSTALL_FAILED`，完全不检查 `STATUS_REINSTALL_FAILED`！**
+
+| 状态 | toggleInstall 行为 |
+|------|-------------------|
+| `STATUS_INSTALL_FAILED` | ❌ 抛异常："marked_as_failed" |
+| `STATUS_REINSTALL_FAILED` | ✅ 执行！`isInstalled()=true` → 设为 `INSTALLING` |
+| `null` (正常) | ✅ 设为 `INSTALLING` |
+| `STATUS_INSTALLING` | ✅ `isInstalled()=false` → 设为 `null` |
+
+### 14.4 ServerViewController::manage() 的不对称拦截
+
+**文件**：`app/Http/Controllers/Admin/Servers/ServerViewController.php:119-123`
+
+```php
+public function manage(Request $request, Server $server): View
+{
+    if ($server->status === Server::STATUS_INSTALL_FAILED) {
+        throw new DisplayException('This server is in a failed install state and cannot be recovered. Please delete and re-create the server.');
+    }
+    // ...
+}
+```
+
+**对管理员的影响**：
+
+| 状态 | 管理页面访问 | 信息提示 |
+|------|-------------|---------|
+| `STATUS_INSTALL_FAILED` | ❌ 完全无法访问 | "cannot be recovered"，建议删除重建 |
+| `STATUS_REINSTALL_FAILED` | ✅ 完全可访问 | **无任何提示** ❗ |
+
+### 14.5 两种失败状态的完整行为对比
+
+| 行为维度 | STATUS_INSTALL_FAILED | STATUS_REINSTALL_FAILED |
+|---------|----------------------|------------------------|
+| **isInstalled()** | `false` | **`true`** ❗ |
+| **用户可访问性** | ❌ 完全锁死 | ✅ 正常访问 |
+| **管理后台可访问** | ❌ 完全锁死 | ✅ 完全可访问 |
+| **toggleInstall 结果** | ❌ 抛异常 | ✅ 转为 INSTALLING |
+| **再次触发重装** | ❌ 用户被锁死 | ✅ 用户可正常发起 |
+| **resetState 处理** | ➖ 不变 | ➖ 不变 |
+| **设计意图** | 首次安装失败=不可恢复 | 重装失败=可重试 |
+| **信息提示** | "cannot be recovered" | **无任何提示** ❗ |
+
+### 14.6 设计意图 vs 代码实现的差异
+
+**设计意图推测**：
+- `INSTALL_FAILED` → 首次安装失败，可能涉及严重问题（如节点资源不足、镜像拉取失败），标记为不可恢复，建议删除重建
+- `REINSTALL_FAILED` → 重装失败，服务器本身是可运行的，只是安装脚本出错，用户应该可以继续使用并重试
+
+**代码实现的问题**：
+1. `isInstalled()` 遗漏了 `STATUS_REINSTALL_FAILED` 是有意设计还是 bug？
+2. 管理后台对 `STATUS_REINSTALL_FAILED` 没有任何视觉提示，管理员可能意识不到重装失败了
+3. 文档中对两种失败状态的区别完全没有说明
+
+**恢复路径对比**：
+
+```
+STATUS_INSTALL_FAILED 路径：
+  用户被锁死 → 管理员也被锁死 → 只能删除重建
+    (无其他出路)
+
+STATUS_REINSTALL_FAILED 路径：
+  用户正常使用 → 可随时再次触发重装
+       │
+       └─ 管理员正常管理 → 可 toggleInstall 或重新安装
+```
+
+### 14.7 修正后的完整状态机
+
+```
+                    ┌──────────────┐
+                    │   null (正常)  │◄──────────────────────────────────┐
+                    └──────┬───────┘                                   │
+                           │                                           │
+              reinstall()  │                                成功回调     │
+                           ▼                                 (store)    │
+                    ┌──────────────┐         ┌──────────────┐          │
+                    │  INSTALLING  │────────►│    null      │──────────┘
+                    └──────┬───────┘         └──────────────┘
+                           │                        │
+              失败回调     │           失败回调      │
+              (reinstall=false)      (reinstall=true)
+                           ▼                        ▼
+                ┌─────────────────┐    ┌────────────────────┐
+                │ INSTALL_FAILED  │    │ REINSTALL_FAILED   │
+                └────────┬────────┘    └─────────┬──────────┘
+                         │                       │
+          🔒 用户锁死     │            ✅ 用户正常访问
+          🔒 管理锁死     │            ✅ 管理正常访问
+         ❌ toggleInstall │           ✅ toggleInstall → INSTALLING
+                         │                       │
+                         ▼                       ▼
+                   [删除重建]          [可再次重装]
+
+
+                    ┌──────────────┐
+                    │  SUSPENDED   │◄──── 挂起操作
+                    └──────┬───────┘
+                           │ reinstall 成功后保持 SUSPENDED
+                           │ (ServerInstallController:72-74)
+                           ▼
+                    ┌──────────────┐
+                    │  SUSPENDED   │  ← 安装完成时检测到已挂起，保持挂起
+                    └──────────────┘
+
+
+         resetState 收敛（仅处理进行中状态）：
+         ┌──────────────┐                ┌──────────────┐
+         │  INSTALLING  │ ─────────────► │    null      │
+         └──────────────┘  Wings 重启时   └──────────────┘
+         ┌──────────────────┐            ┌──────────────┐
+         │RESTORING_BACKUP  │ ─────────► │  null + 审计  │
+         └──────────────────┘             └──────────────┘
+```
+
+**状态机修正要点**：
+1. `INSTALL_FAILED` 和 `REINSTALL_FAILED` 行为**完全不对称**，不是等价的终态
+2. `REINSTALL_FAILED` 不是死胡同——用户可以正常访问并再次触发重装
+3. `toggleInstall` 只能从 `REINSTALL_FAILED` 进入 `INSTALLING`，对 `INSTALL_FAILED` 无效
+4. `resetState` 对两种失败状态都不处理（已是终态）
+5. 从 `REINSTALL_FAILED` 恢复的主要路径是**用户再次触发重装**（而不是 toggleInstall）
+
+---
+
+## 十五、可验证链路与不可验证的 Wings 行为边界
+
+### 15.1 边界总览
 
 Panel 的代码执行在 HTTP 请求/响应的边界内，所有可验证行为都有数据库写入或 HTTP 日志作为证据。而 Wings 的内部行为对 Panel 是黑盒。
 
@@ -756,7 +960,7 @@ Panel 的代码执行在 HTTP 请求/响应的边界内，所有可验证行为�
 └──────────────────────────────────────────────────────────┘
 ```
 
-### 14.2 可验证链路清单
+### 15.2 可验证链路清单
 
 每个重装操作的可验证步骤及证据来源：
 
@@ -773,7 +977,7 @@ Panel 的代码执行在 HTTP 请求/响应的边界内，所有可验证行为�
 | 9 | 触发安装完成事件 | `ServerInstallController:81-85` | `ServerInstalled` 事件 + 邮件发送记录 |
 | 10 | 活动日志记录 | `Activity::event('server:reinstall')->log()` | `activity_logs` 表 |
 
-### 14.3 不可验证的 Wings 行为清单
+### 15.3 不可验证的 Wings 行为清单
 
 | # | Wings 行为 | Panel 的预期 | 无法验证的原因 |
 |---|-----------|-------------|--------------|
@@ -788,7 +992,7 @@ Panel 的代码执行在 HTTP 请求/响应的边界内，所有可验证行为�
 | 9 | 数据目录清理范围 | 安装脚本决定 | Panel 无法审计文件系统变更 |
 | 10 | 安装脚本的 Docker 容器选择 | 使用 `copy_script_container` 返回的镜像 | Panel 只下发配置，无法验证实际使用的容器 |
 
-### 14.4 信任边界分析
+### 15.4 信任边界分析
 
 Panel 对 Wings 的信任是**全量信任**模型：
 
@@ -812,7 +1016,7 @@ Panel 不信任的输入：
 - `reinstall` 字段被 Wings 篡改可导致状态分类错误（`install_failed` vs `reinstall_failed`）
 - 唯一的状态收敛保障是 `resetState`——但前提是 Wings 重启后真的会调用它
 
-### 14.5 Panel → Wings 方向的通信可靠性
+### 15.5 Panel → Wings 方向的通信可靠性
 
 | 调用方式 | 代码位置 | 失败处理 | 可靠性级别 |
 |---------|---------|---------|-----------|
@@ -822,59 +1026,3 @@ Panel 不信任的输入：
 | `delete()` | `DaemonServerRepository:79-88` | 抛出 `DaemonConnectionException` | 强一致 |
 
 **关键差异**：重装和创建操作要求 Wings 必须可达（同步失败则回滚），而构建配置同步允许失败（数据库已更新，Wings 下次启动时拉取最新配置）。
-
----
-
-## 十五、状态机全景
-
-```
-                    ┌──────────────┐
-                    │   null (正常)  │◄─────────────────────────┐
-                    └──────┬───────┘                           │
-                           │                                   │
-              reinstall()  │                      成功回调      │
-                           ▼                       (store)     │
-                    ┌──────────────┐         ┌──────────────┐  │
-                    │  INSTALLING  │────────►│    null      │──┘
-                    └──────┬───────┘         └──────────────┘
-                           │                        │
-              失败回调     │           失败回调      │
-              (首次)      │           (reinstall)   │
-                           ▼                        ▼
-                ┌─────────────────┐    ┌────────────────────┐
-                │ INSTALL_FAILED  │    │ REINSTALL_FAILED   │
-                └────────┬────────┘    └─────────┬──────────┘
-                         │                       │
-            toggleInstall│           toggleInstall│
-                         ▼                       ▼
-                ┌─────────────────┐    ┌────────────────────┐
-                │  INSTALLING     │    │  INSTALLING        │
-                └─────────────────┘    └────────────────────┘
-
-
-                    ┌──────────────┐
-                    │  SUSPENDED   │◄──── 挂起操作
-                    └──────┬───────┘
-                           │ reinstall 成功后保持 SUSPENDED
-                           │ (ServerInstallController:72-74)
-                           ▼
-                    ┌──────────────┐
-                    │  SUSPENDED   │  ← 安装完成时检测到已挂起，保持挂起
-                    └──────────────┘
-
-
-         resetState 收敛：
-         ┌──────────────┐                ┌──────────────┐
-         │  INSTALLING  │ ─────────────► │    null      │
-         └──────────────┘  Wings 重启时   └──────────────┘
-         ┌──────────────────┐            ┌──────────────┐
-         │RESTORING_BACKUP  │ ─────────► │  null + 审计  │
-         └──────────────────┘             └──────────────┘
-```
-
-**状态机要点**：
-1. `INSTALLING` 是所有安装/重装的入口状态，不区分首次和重装
-2. 仅在**失败回调**时通过 Wings 传回的 `reinstall` 字段区分 `INSTALL_FAILED` 和 `REINSTALL_FAILED`
-3. 挂起的服务器安装完成后保持挂起，不会意外恢复
-4. `INSTALL_FAILED` 和 `REINSTALL_FAILED` 是终态，只能通过 `toggleInstall` 或 Wings 重启时的 `resetState` 脱离
-5. `resetState` 不处理失败状态——它只收敛"正在进行中"的状态
