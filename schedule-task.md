@@ -900,6 +900,173 @@ public function failed(?\Exception $exception = null)
 3. 后续任务**不会被分发**，任务链彻底终止
 4. Schedule 的 `next_run_at` 在 `ProcessScheduleService` 中已经更新为下一次时间，所以下次 Cron 周期仍会触发
 
+#### 10.5 手动执行与队列执行的失败记录差异
+
+定时任务有两条执行路径，它们的失败记录方式存在根本性差异。这个差异的根源在于 `ProcessScheduleService::handle()` 的第二个参数 `$now`，以及 Laravel 队列系统对 `dispatch()` 与 `dispatchNow()` 的不同处理方式。
+
+##### 10.5.1 两条路径的入口
+
+| 触发方式 | 入口 | `$now` 参数 | 分发方式 |
+|----------|------|-------------|----------|
+| 定时调度 | `ProcessRunnableCommand` → `ProcessScheduleService::handle($schedule)` | `false`（默认） | `dispatch($job->delay(...))` |
+| 手动执行 | `ScheduleController::execute()` → `ProcessScheduleService::handle($schedule, true)` | `true` | `dispatchNow($job)` |
+
+**文件位置**：
+- 定时调度：`app/Console/Commands/Schedule/ProcessRunnableCommand.php:63`
+- 手动执行：`app/Http/Controllers/Api/Client/Servers/ScheduleController.php:146`
+
+##### 10.5.2 队列执行路径（定时调度，`now = false`）
+
+```
+ProcessRunnableCommand::processSchedule()
+  │
+  └─ ProcessScheduleService::handle($schedule)    // now = false
+       │
+       ├─ only_when_online 检查（若开启）
+       │   ├─ Wings 返回 offline/stopping → $job->failed() → return
+       │   ├─ 非 DaemonConnectionException → $job->failed($exception) → return
+       │   └─ DaemonConnectionException → $job->failed() → return
+       │
+       └─ $this->dispatcher->dispatch($job->delay($task->time_offset))
+            │
+            │   ──── Job 进入队列，由 queue:work 消费 ────
+            │
+            └─ RunTaskJob::handle()
+                 │
+                 ├─ 无异常 → markTaskNotQueued() → queueNextTask()
+                 │
+                 ├─ continue_on_failure + DaemonConnectionException
+                 │   → 吞掉异常 → markTaskNotQueued() → queueNextTask()
+                 │
+                 ├─ 抛出异常（非上述情况）
+                 │   → Laravel 框架自动：
+                 │     1. 调用 RunTaskJob::failed($exception)
+                 │     2. 写入 failed_jobs 表
+                 │     3. 触发 JobFailed 事件
+                 │
+                 └─ server.status != null
+                     → $this->failed() → Laravel 框架不额外调用 failed()（已手动调用）
+```
+
+**关键特征**：
+- Job 在队列 worker 进程中执行，与触发者（ProcessRunnableCommand）完全解耦
+- `RunTaskJob` 未声明 `$tries` 属性，Laravel 默认 `tries=1`，即**不重试**
+- 异常抛出后，Laravel 队列框架**自动**调用 `failed()` 并写入 `failed_jobs` 表
+- `ProcessRunnableCommand` **无法感知** Job 执行结果（已 fire-and-forget）
+
+##### 10.5.3 手动执行路径（手动触发，`now = true`）
+
+```
+ScheduleController::execute()
+  │
+  └─ ProcessScheduleService::handle($schedule, true)   // now = true
+       │
+       ├─ only_when_online 检查（若开启）
+       │   ├─ Wings 返回 offline/stopping → $job->failed() → return
+       │   ├─ 非 DaemonConnectionException → $job->failed($exception) → return
+       │   └─ DaemonConnectionException → $job->failed() → return
+       │
+       └─ $this->dispatcher->dispatchNow($job)
+            │
+            │   ──── dispatchNow：同步执行，当前进程内直接运行 ────
+            │
+            └─ RunTaskJob::handle()
+                 │
+                 ├─ 无异常 → markTaskNotQueued() → queueNextTask()
+                 │
+                 ├─ continue_on_failure + DaemonConnectionException
+                 │   → 吞掉异常 → markTaskNotQueued() → queueNextTask()
+                 │
+                 ├─ 抛出异常（非上述情况）
+                 │   → Laravel 的 dispatchNow **不会**自动调用 failed()
+                 │   → 异常冒泡到 ProcessScheduleService 的 catch 块：
+                 │       catch (\Exception $exception) {
+                 │           $job->failed($exception);   // 手动调用
+                 │           throw $exception;           // 继续抛出
+                 │       }
+                 │   → 异常继续冒泡到 ScheduleController::execute()
+                 │   → 最终由 Laravel 全局异常处理器返回 HTTP 500 错误给前端
+                 │
+                 └─ server.status != null
+                     → $this->failed() → 已调用，无需再次调用
+```
+
+**关键特征**：
+- `dispatchNow` 在当前请求进程内同步执行，不经过队列
+- Laravel 的 `dispatchNow` **不会自动调用 `failed()`**，这是 Pterodactyl 在 `ProcessScheduleService:73-83` 手动补调的原因
+  - **相关 Issue**：https://github.com/pterodactyl/panel/issues/2550
+- 手动调用 `failed()` 后，异常仍被 `throw` 向上冒泡
+- **不会**写入 `failed_jobs` 表（因为从未进入队列）
+- 异常最终到达 HTTP 层，前端可以收到错误响应
+
+##### 10.5.4 `failed()` 的所有调用时机
+
+`RunTaskJob::failed()` 在以下场景被调用，但调用者和上下文各不相同：
+
+| 调用场景 | 调用者 | 执行路径 | `failed_jobs` 写入 | HTTP 错误响应 |
+|----------|--------|----------|-------------------|--------------|
+| only_when_online + offline/stopping | `ProcessScheduleService:53` | 两种路径都有 | ❌ 不写入 | ❌ 无（静默返回） |
+| only_when_online + 非 DaemonConnectionException | `ProcessScheduleService:62` | 两种路径都有 | ❌ 不写入 | ❌ 无（静默返回） |
+| only_when_online + DaemonConnectionException | `ProcessScheduleService:64` | 两种路径都有 | ❌ 不写入 | ❌ 无（静默返回） |
+| server.status != null | `RunTaskJob:54` | 两种路径都有 | 队列路径：✅ 写入 | 手动路径：❌ |
+| 任务执行抛异常（队列） | Laravel 框架自动 | 仅队列路径 | ✅ 写入 | ❌ 无（已解耦） |
+| 任务执行抛异常（手动） | `ProcessScheduleService:80` | 仅手动路径 | ❌ 不写入 | ✅ HTTP 500 |
+| schedule 非激活 | `RunTaskJob:42-43` | 两种路径都有 | ❌ 不写入（不算失败） | ❌ 无（正常结束） |
+
+**关键发现**：
+1. `ProcessScheduleService` 中的 3 处 `$job->failed()` 调用发生在 **Job 分发之前**，此时 Job 尚未进入队列，因此 `failed_jobs` 表不会被写入
+2. `RunTaskJob:54` 的 `$this->failed()` 调用发生在 Job **已分发之后**，但 `failed()` 是手动调用而非框架触发——队列路径下框架还会再次尝试调用 `failed()`（幂等，无副作用）
+3. **只有队列路径中由 Laravel 框架自动触发的 `failed()` 才会写入 `failed_jobs` 表**
+4. 手动路径中的 `failed()` 永远不会导致 `failed_jobs` 写入
+
+##### 10.5.5 `failed_jobs` 表的使用范围
+
+**配置**（`config/queue.php:87-91`）：
+```php
+'failed' => [
+    'driver' => env('QUEUE_FAILED_DRIVER', 'database-uuids'),
+    'database' => env('DB_CONNECTION', 'mysql'),
+    'table' => 'failed_jobs',
+],
+```
+
+**写入条件**（Laravel 框架行为）：
+1. Job 必须**通过队列分发**（`dispatch()`），而非同步执行（`dispatchNow()`）
+2. Job 执行过程中抛出异常
+3. Job 的重试次数耗尽（`RunTaskJob` 未声明 `$tries`，默认 `tries=1`，首次失败即写入）
+
+**`RunTaskJob` 的 `failed_jobs` 记录内容**：
+- `queue`: `standard`
+- `payload`: 序列化的 `RunTaskJob` 实例（含 Task 模型快照）
+- `exception`: 异常的完整堆栈信息
+- `uuid`: 唯一标识符
+
+**不写入 `failed_jobs` 的场景**：
+1. 手动执行路径（`dispatchNow`）
+2. `ProcessScheduleService` 中分发前的 `failed()` 调用
+3. `continue_on_failure` 生效时（异常被吞掉，不抛出）
+4. schedule 非激活导致的提前返回
+
+##### 10.5.6 两种路径的监控方式对比
+
+| 监控维度 | 队列执行（定时调度） | 手动执行 |
+|----------|---------------------|----------|
+| **失败记录** | `failed_jobs` 表 + Laravel 日志 | HTTP 500 响应 + Laravel 日志 |
+| **查询失败** | `php artisan queue:failed` 或查询 `failed_jobs` 表 | 查看 Web 服务器访问日志 / 浏览器控制台 |
+| **重试失败任务** | `php artisan queue:retry {id}` | 不适用（无队列记录，需手动重新触发） |
+| **前端反馈** | 无（fire-and-forget） | HTTP 错误响应（用户可立即感知） |
+| **ProcessRunnableCommand 日志** | ✅ 仅记录 `ProcessScheduleService::handle()` 阶段的异常 | 不涉及 |
+| **Activity Log** | ❌ 无定时任务失败记录 | ❌ 无定时任务失败记录 |
+| **Laravel 日志** | ✅ Job 执行异常由框架写入 | ✅ 全局异常处理器写入 |
+
+**监控盲区**：
+
+1. **队列路径的静默失败**：`ProcessScheduleService` 中 `only_when_online` 检查失败时，直接调用 `$job->failed()` 然后 `return`，没有任何日志记录。这种"本应执行但被跳过"的情况在系统中不留痕迹。
+
+2. **队列路径的 Job 执行失败**：虽然写入 `failed_jobs` 表，但**没有 Activity Log 记录**，也没有通知。管理员必须主动查询 `failed_jobs` 表才能发现。
+
+3. **手动路径的 `failed()` 调用**：`ProcessScheduleService:80` 手动调用 `$job->failed($exception)` 后又 `throw $exception`，`failed()` 方法本身不记录任何日志，异常信息仅通过后续的 throw 传递到 HTTP 层。
+
 ---
 
 ## 三、关键数据结构
@@ -990,3 +1157,8 @@ public function failed(?\Exception $exception = null)
 8. **备份悬挂风险**：若 Wings 在接受备份指令后崩溃，Backup 记录会处于 `is_successful=false, completed_at=null` 的悬挂状态，需 `PruneOrphanedBackupsCommand` 清理
 9. **任务上限**：每个 Schedule 最多 10 个任务（可通过 `PTERODACTYL_PER_SCHEDULE_TASK_LIMIT` 配置）
 10. **备份限制**：服务器 `backup_limit = 0` 时不能创建备份任务
+11. **手动执行与队列执行的失败记录不对称**：
+    - 队列路径（定时调度）：失败写入 `failed_jobs` 表，但前端无感知；可通过 `queue:retry` 重试
+    - 手动路径（用户触发）：失败不写 `failed_jobs`，但前端收到 HTTP 500 错误；无法通过 `queue:retry` 重试
+12. **`dispatchNow` 不会自动调用 `failed()`**：手动执行路径依赖 `ProcessScheduleService:73-83` 的显式 `failed()` 补调（修复 issue #2550）
+13. **分发前的 `failed()` 调用无 `failed_jobs` 记录**：`ProcessScheduleService` 中 `only_when_online` 检查失败时，Job 尚未分发，`failed()` 调用不会写入 `failed_jobs` 表，也不记录日志，形成监控盲区
