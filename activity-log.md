@@ -5,20 +5,23 @@
 操作日志系统覆盖三条独立的写入路径，每条路径经过不同的中间件组，最终统一查询展示：
 
 ```
-路径1: 客户端 API 请求 (/api/client, /api/application)
-  中间件组: api + client-api (或 application-api)
+路径1: 客户端 API — 账户与服务器操作
+  路由范围: /api/client/account/* 和 /api/client/servers/{server}/*
+  中间件组: api + client-api + 路由级中间件（AccountSubject/ServerSubject）
   → TrackAPIKey 设置 apiKeyId → AccountSubject/ServerSubject 设置 actor/subject
   → 业务逻辑 → Activity::log() → 写入 activity_logs + activity_log_subjects
   → 触发 ActivityLogged 事件（当前无消费方）
 
-路径2: Wings 守护进程批量推送 (/api/remote/activity)
-  中间件组: daemon (SubstituteBindings + DaemonAuthenticate)
+路径2: Wings 守护进程批量推送
+  路由范围: /api/remote/activity
+  中间件组: daemon（SubstituteBindings + DaemonAuthenticate）
   → 不经 TrackAPIKey，不设 apiKeyId → ActivityProcessingController
   → 批量 insertGetId() 直接插入 activity_logs + activity_log_subjects
   → 不触发 ActivityLogged 事件（insertGetId 不触发 Eloquent 模型事件）
 
-路径3: Wings 远程回调 (/api/remote/sftp/auth, /api/remote/backups/...)
-  中间件组: daemon (SubstituteBindings + DaemonAuthenticate)
+路径3: Wings 远程回调
+  路由范围: /api/remote/sftp/auth, /api/remote/backups/... 等
+  中间件组: daemon（SubstituteBindings + DaemonAuthenticate）
   → 不经 TrackAPIKey，不设 apiKeyId → 控制器手动设置 actor/subject
   → Activity::log() → 写入 activity_logs + activity_log_subjects
   → 触发 ActivityLogged 事件（当前无消费方）
@@ -27,16 +30,22 @@
   前端 → 客户端 API 控制器 → QueryBuilder 分页 → Transformer 转换 → 页面渲染
 ```
 
+### 关键前提：/api/application 不产生 Activity 日志
+
+**重要说明**：虽然 `/api/application` 路由经过 `api` 中间件组（含 TrackAPIKey），但经代码核实，**所有 Application API 控制器均不调用 `Activity::log()`**，因此不会产生任何 activity_logs 记录。文档中提到的"客户端 API"特指 `/api/client` 下产生日志的子路由。
+
 ### 三条路径的关键差异
 
-| 维度 | 路径1: 客户端 API | 路径2: Wings 批量推送 | 路径3: Wings 远程回调 |
-|------|-------------------|----------------------|---------------------|
-| 中间件组 | `api` + `client-api` | `daemon` | `daemon` |
+| 维度 | 路径1: 客户端 API（账户/服务器） | 路径2: Wings 批量推送 | 路径3: Wings 远程回调 |
+|------|--------------------------------|----------------------|---------------------|
+| 路由范围 | `/api/client/account/*`<br>`/api/client/servers/{server}/*` | `/api/remote/activity` | `/api/remote/backups/*`<br>`/api/remote/sftp/auth` 等 |
+| 中间件组 | `api` + `client-api` + 路由级 | `daemon` | `daemon` |
 | TrackAPIKey | ✅ 生效 | ❌ 不生效 | ❌ 不生效 |
-| AccountSubject/ServerSubject | ✅ 生效 | ❌ 不生效 | ❌ 不生效 |
-| api_key_id | 有值 | null | null |
-| actor 来源 | LogTarget 自动设置 | 请求体中的 user UUID | 控制器手动设置 |
-| subject 来源 | LogTarget 自动设置 | 固定为 Server | 控制器手动设置 |
+| AccountSubject | ✅ 仅 `/api/client/account/*` | ❌ 不生效 | ❌ 不生效 |
+| ServerSubject | ✅ 仅 `/api/client/servers/{server}/*` | ❌ 不生效 | ❌ 不生效 |
+| api_key_id | 有值（API Key 认证时） | null | null |
+| actor 来源 | AccountSubject/ServerSubject 自动设置 | 请求体中的 user UUID | 控制器手动设置 |
+| subject 来源 | AccountSubject/ServerSubject 自动设置 | 固定为 Server | 控制器手动设置 |
 | batch UUID | 可能有 | null | 可能有 |
 | 触发 ActivityLogged | ✅ (save()) | ❌ (insertGetId()) | ✅ (save()) |
 
@@ -126,8 +135,8 @@ Activity::event('server:backup.start')        // 设置事件类型（必须）
 - `getActivity()` (`ActivityLogService.php:196-220`): 延迟创建 ActivityLog 实例，自动填充:
   - IP 地址: `Request::ip()`
   - Batch UUID: 从 `ActivityLogBatchService::uuid()` 获取（可能为 null）
-  - API Key ID: 从 `ActivityLogTargetableService::apiKeyId()` 获取（仅客户端 API 路径有值，因为仅该路径经 TrackAPIKey 中间件设置）
-  - Subject: 从 `ActivityLogTargetableService::subject()` 获取（仅客户端 API 路径由中间件预设）
+  - API Key ID: 从 `ActivityLogTargetableService::apiKeyId()` 获取（仅经 TrackAPIKey 的路径有值）
+  - Subject: 从 `ActivityLogTargetableService::subject()` 获取（仅 AccountSubject/ServerSubject 设置）
   - Actor: 优先使用 `ActivityLogTargetableService::actor()`（中间件预设），其次回退到 `AuthManager->guard()->user()`
 
 - `save()` (`ActivityLogService.php:227-252`): 在数据库事务中:
@@ -178,11 +187,13 @@ Activity::event('server:backup.start')->transaction(function ($log) use (...) {
 **设计目的**: 在请求生命周期中存储日志上下文（actor、subject、apiKeyId），避免在每个控制器中重复传递。
 
 **可存储信息**:
-- `actor`: 操作者模型（由客户端 API 路径的中间件通过 `LogTarget::setActor()` 预设）
-- `subject`: 关联主题模型（由客户端 API 路径的中间件通过 `LogTarget::setSubject()` 预设）
-- `apiKeyId`: API 密钥 ID（由客户端 API 路径的 TrackAPIKey 中间件通过 `LogTarget::setApiKeyId()` 预设）
+- `actor`: 操作者模型（仅 AccountSubject/ServerSubject 经过的路径由中间件预设）
+- `subject`: 关联主题模型（仅 AccountSubject/ServerSubject 经过的路径由中间件预设）
+- `apiKeyId`: API 密钥 ID（仅 TrackAPIKey 经过的路径由中间件预设）
 
-**注意**: remote 路径使用 `daemon` 中间件组，不经过 TrackAPIKey/AccountSubject/ServerSubject，因此 `ActivityLogTargetableService` 中的 actor/subject/apiKeyId 均不会被中间件预设，需要控制器手动设置或回退到其他默认值。
+**注意**: 
+- remote 路径使用 `daemon` 中间件组，不经过 TrackAPIKey/AccountSubject/ServerSubject，因此 actor/subject/apiKeyId 均不会被中间件预设
+- `/api/client` 根路由（`/` 和 `/permissions`）不经过 AccountSubject/ServerSubject，也不写 Activity 日志
 
 **服务注册** (`app/Providers/ActivityLogServiceProvider.php:15-19`):
 ```php
@@ -202,6 +213,7 @@ Laravel 的中间件按组分配，不同的路由前缀使用不同的中间件
 // RouteServiceProvider::routes() 的关键结构
 
 // 1. /api/client 和 /api/application → api 中间件组
+// 注意：/api/application 的控制器不产生 Activity 日志
 Route::middleware(['api', RequireTwoFactorAuthentication::class])->group(function () {
     Route::middleware(['application-api', 'throttle:api.application'])
         ->prefix('/api/application')
@@ -227,7 +239,7 @@ protected $middlewareGroups = [
         EnsureStatefulRequests::class,
         'auth:sanctum',
         IsValidJson::class,
-        TrackAPIKey::class,            // ← 仅在此组中，作用于客户端 API
+        TrackAPIKey::class,            // ← 仅在此组中
         RequireTwoFactorAuthentication::class,
         AuthenticateIPAccess::class,
     ],
@@ -246,10 +258,14 @@ protected $middlewareGroups = [
 ];
 ```
 
-**核心结论**: `/api/remote` 路由使用 `daemon` 中间件组，不包含 `TrackAPIKey`，也不包含 `auth:sanctum`。因此 remote 路径中：
-- `TrackAPIKey` 不会执行 → `api_key_id` 始终为 null
-- `$request->user()` 返回的不是 User 模型 → AuthManager 回退取不到用户
-- `AccountSubject`/`ServerSubject` 不在中间件栈中 → actor/subject 不会被自动设置
+**核心结论**:
+| 路由 | 中间件组 | TrackAPIKey | AccountSubject/ServerSubject | 产生 Activity 日志 |
+|------|---------|------------|-----------------------------|-------------------|
+| `/api/client/account/*` | `api` + `client-api` + 路由级 | ✅ | ✅ AccountSubject | ✅ |
+| `/api/client/servers/{server}/*` | `api` + `client-api` + 路由级 | ✅ | ✅ ServerSubject | ✅ |
+| `/api/client/`（根路由） | `api` + `client-api` | ✅ | ❌ | ❌ |
+| `/api/application/*` | `api` + `application-api` | ✅ | ❌ | ❌ |
+| `/api/remote/*` | `daemon` | ❌ | ❌ | ✅（部分控制器） |
 
 ### 4.1 TrackAPIKey - API 密钥追踪
 
@@ -258,6 +274,8 @@ protected $middlewareGroups = [
 **注入位置**: `app/Http/Kernel.php:74`，在 `api` 中间件组中注册。
 
 **作用域**: 仅作用于使用 `api` 中间件组的路由，即 `/api/client` 和 `/api/application`。**不作用于** `/api/remote`（该路径使用 `daemon` 中间件组）。
+
+**注意**: TrackAPIKey 只是设置 `api_key_id`，但 `/api/application` 的控制器不调用 `Activity::log()`，因此即使经过 TrackAPIKey 也不会产生带 `api_key_id` 的日志。
 
 **实现逻辑** (`TrackAPIKey.php:17-26`):
 - 检查 `$request->user()` 是否存在
@@ -269,21 +287,21 @@ protected $middlewareGroups = [
 
 **文件**: `app/Http/Middleware/Activity/AccountSubject.php`
 
-**注入位置**: `routes/api-client.php:23`，仅作用于 `/api/client/account` 路由组：
+**注入位置**: `routes/api-client.php:23`，**仅作用于** `/api/client/account` 路由组：
 
 ```php
 Route::prefix('/account')->middleware(AccountSubject::class)->group(function () {
-    // 账户相关路由...
+    // 账户相关路由（改密码、2FA、API Key、SSH Key 等）
 });
 ```
 
-**作用**: 将当前登录用户同时设为 `LogTarget::setActor()` 和 `LogTarget::setSubject()`，适用于账户自身操作（改密码、2FA、API Key 管理等）。
+**作用**: 将当前登录用户同时设为 `LogTarget::setActor()` 和 `LogTarget::setSubject()`，适用于账户自身操作。
 
 ### 4.3 ServerSubject - 服务器上下文
 
 **文件**: `app/Http/Middleware/Activity/ServerSubject.php`
 
-**注入位置**: `routes/api-client.php:57-64`，作用于 `/api/client/servers/{server}` 路由组：
+**注入位置**: `routes/api-client.php:57-64`，**仅作用于** `/api/client/servers/{server}` 路由组：
 
 ```php
 Route::group([
@@ -294,7 +312,7 @@ Route::group([
         ResourceBelongsToServer::class,
     ],
 ], function () {
-    // 服务器相关路由...
+    // 服务器相关路由（电源、命令、文件、备份、调度等）
 });
 ```
 
@@ -306,12 +324,12 @@ Route::group([
 
 ### 4.4 中间件协作时序
 
-#### 客户端 API 请求
+#### 客户端 API — 账户操作
 
 ```
-/api/client/servers/{server}/...
+/api/client/account/...
   │
-  ├─ 1. api 中间件组 (Kernel.php) ← TrackAPIKey 在此层
+  ├─ 1. api 中间件组 (Kernel.php)
   │     ├─ EnsureStatefulRequests
   │     ├─ auth:sanctum             → 认证 User，设置 $request->user()
   │     ├─ IsValidJson
@@ -323,12 +341,37 @@ Route::group([
   │     ├─ SubstituteClientBindings
   │     └─ RequireClientApiKey
   │
-  ├─ 3. 路由级中间件 (api-client.php) ← AccountSubject/ServerSubject 在此层
+  ├─ 3. 路由级中间件 (api-client.php:23)
+  │     └─ AccountSubject           → LogTarget::setActor(user) + LogTarget::setSubject(user)
+  │
+  └─ 4. 控制器（AccountController、TwoFactorController、ApiKeyController 等）
+       └─ Activity::event('user:account.xxx')->log()
+            → 从 LogTarget 读取预设的 actor / subject / apiKeyId
+```
+
+#### 客户端 API — 服务器操作
+
+```
+/api/client/servers/{server}/...
+  │
+  ├─ 1. api 中间件组 (Kernel.php)
+  │     ├─ EnsureStatefulRequests
+  │     ├─ auth:sanctum             → 认证 User，设置 $request->user()
+  │     ├─ IsValidJson
+  │     ├─ TrackAPIKey              → LogTarget::setApiKeyId(...)
+  │     ├─ RequireTwoFactorAuthentication
+  │     └─ AuthenticateIPAccess     → Activity::event('auth:ip-blocked') (可选)
+  │
+  ├─ 2. client-api 中间件组 (Kernel.php)
+  │     ├─ SubstituteClientBindings
+  │     └─ RequireClientApiKey
+  │
+  ├─ 3. 路由级中间件 (api-client.php:57-64)
   │     ├─ ServerSubject            → LogTarget::setActor(user) + LogTarget::setSubject(server)
   │     ├─ AuthenticateServerAccess
   │     └─ ResourceBelongsToServer
   │
-  └─ 4. 控制器
+  └─ 4. 控制器（PowerController、FileController、BackupController 等）
        └─ Activity::event('server:xxx')->log()
             → 从 LogTarget 读取预设的 actor / subject / apiKeyId
 ```
@@ -338,7 +381,7 @@ Route::group([
 ```
 /api/remote/...
   │
-  ├─ 1. daemon 中间件组 (Kernel.php) ← 注意：不含 TrackAPIKey
+  ├─ 1. daemon 中间件组 (Kernel.php) ← 不含 TrackAPIKey
   │     ├─ SubstituteBindings
   │     └─ DaemonAuthenticate        → 认证 Node，设置 $request->attributes->get('node')
   │                                    （不设置 $request->user() 为 User 模型）
@@ -350,7 +393,7 @@ Route::group([
   │     │
   │     ├─ 方式A: 手动设置 actor/subject
   │     │   Activity::event('...')->actor($user)->subject($server)->log()
-  │     │   (SftpAuthenticationController, BackupStatusController 等)
+  │     │   (SftpAuthenticationController、BackupStatusController 等)
   │     │
   │     └─ 方式B: 直接 insertGetId，完全绕过 Activity Facade
   │         (ActivityProcessingController)
@@ -488,9 +531,16 @@ public function __invoke(ProvidedAuthenticationToken $event): void
 
 ### 6.1 路径一：客户端 API — 通过 Activity Facade
 
-**覆盖范围**: 所有 `/api/client/` 和 `/api/application/` 路由下的控制器
+**路由范围**: 
+- `/api/client/account/*`（经过 AccountSubject）
+- `/api/client/servers/{server}/*`（经过 ServerSubject）
 
-**中间件栈**: `api` 组（含 TrackAPIKey）→ `client-api` 或 `application-api` 组 → 路由级中间件（AccountSubject / ServerSubject）
+**不产生日志的路由**:
+- `/api/client` 根路由（`/` 和 `/permissions`）
+- `/api/application/*`（经 TrackAPIKey 但控制器不写日志）
+
+**中间件栈**: 
+- `api` 组（含 TrackAPIKey）→ `client-api` 组 → 路由级中间件（AccountSubject / ServerSubject）
 
 **自动注入的上下文**:
 - `api_key_id`: 由 TrackAPIKey 设置（API Key 认证时有值，会话认证时为 null）
@@ -724,7 +774,9 @@ return [
 
 **迁移**: `database/migrations/2022_06_18_112822_track_api_key_usage_for_activity_events.php`
 - 在 `activity_logs` 表添加 `api_key_id` unsignedInteger nullable 列
-- 仅客户端 API 路径（`/api/client`, `/api/application`）通过 `TrackAPIKey` 中间件自动填充
+- 仅经过 TrackAPIKey 且控制器调用 `Activity::log()` 的路径会填充此字段
+- 实际产生带 `api_key_id` 日志的路径：`/api/client/account/*` 和 `/api/client/servers/{server}/*`
+- `/api/application/*` 虽经 TrackAPIKey 但控制器不写日志，因此不会产生带 `api_key_id` 的记录
 - Remote 路径（`/api/remote`）使用 `daemon` 中间件组，不含 TrackAPIKey，因此 `api_key_id` 始终为 null
 - 在 Transformer 中通过 `is_api` 字段暴露给前端
 
@@ -774,7 +826,8 @@ Activity::event('...')->subject(...)->property(...)->log();
 │                           日志写入路径                                    │
 ├─────────────────────────────────────────────────────────────────────────┤
 │                                                                         │
-│  路径1: 客户端 API (/api/client, /api/application)                      │
+│  路径1: 客户端 API — 账户/服务器操作                                      │
+│  路由范围: /api/client/account/* 和 /api/client/servers/{server}/*       │
 │  ┌──────────┐   ┌───────────────────────┐   ┌────────────────────┐     │
 │  │ 请求进入  │→ │ api 中间件组            │→ │ 路由级中间件         │     │
 │  │          │   │ TrackAPIKey            │   │ AccountSubject     │     │
