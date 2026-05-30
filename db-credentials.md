@@ -305,3 +305,192 @@ DatabasePasswordService::handle($database)
 | 使用场景 | DynamicDatabaseConnection 建立管理连接 | 远程 MySQL CREATE USER，客户端连接数据库 |
 | 存储位置 | `database_hosts.password` | `databases.password` |
 | 加密方式 | Laravel Encrypter 加密 | Laravel Encrypter 加密 |
+
+## 7. 深度问题分析
+
+### 7.1 客户端数据库接口返回密码的真实条件
+
+#### 问题：密码返回有两个层级的控制条件，必须同时满足：
+
+**条件 1：API 层必须显式请求包含 `password`
+
+- 创建数据库和轮换密码时，Controller 会主动调用 `parseIncludes(['password'])，但列表查询时不会主动包含密码。
+
+```php
+// DatabaseController.php:64-67（创建数据库）
+return $this->fractal->item($database)
+    ->parseIncludes(['password'])  // 主动请求包含密码
+    ->transformWith($this->getTransformer(DatabaseTransformer::class))
+    ->toArray();
+
+// DatabaseController.php:83-86（轮换密码）
+return $this->fractal->item($database->refresh())
+    ->parseIncludes(['password'])  // 主动请求包含密码
+    ->transformWith($this->getTransformer(DatabaseTransformer::class))
+    ->toArray();
+
+// DatabaseController.php:36-40（列表查询）
+return $this->fractal->collection($server->databases)
+    ->transformWith($this->getTransformer(DatabaseTransformer::class))
+    ->toArray();  // 没有 parseIncludes，不会返回密码
+```
+
+**条件 2：权限层检查 `database.view_password` 权限**
+
+即使 API 层请求了 `include=password，Transformer 还会做二次鉴权：
+
+```php
+// DatabaseTransformer.php:54-65
+public function includePassword(Database $database): Item|NullResource
+{
+    if (!$this->request->user()->can(Permission::ACTION_DATABASE_VIEW_PASSWORD, $database->server)) {
+        return $this->null();
+    }
+    // ...
+}
+```
+
+权限判定逻辑在 `ServerPolicy.php:26-33`：
+
+```php
+public function before(User $user, string $ability, Server $server): bool
+{
+    if ($user->root_admin || $server->owner_id === $user->id) {
+        return true;  // root_admin 或服务器所有者自动拥有所有权限
+    }
+
+    return $this->checkPermission($user, $user, $ability);  // 子用户需要检查 subuser 权限
+}
+```
+
+**结论：
+
+| 用户类型 | 是否返回密码 | 原因 |
+|---|---|---|
+| root_admin | 是 | ServerPolicy::before() 直接返回 true |
+| 服务器所有者 | 是 | ServerPolicy::before() 直接返回 true |
+| 有 database.view_password 权限的子用户 | 是 | checkPermission() 返回 true |
+| 无 database.view_password 权限的子用户 | 否 | checkPermission() 返回 false |
+
+### 7.2 节点删除后 node_id 置空对主机分配路径的影响
+
+#### 数据库外键约束
+
+`database_hosts` 表的外键定义：
+
+```sql
+CONSTRAINT `database_hosts_node_id_foreign` 
+FOREIGN KEY (`node_id`) REFERENCES `nodes` (`id`) ON DELETE SET NULL
+```
+
+**ON DELETE SET NULL 意味着：
+- 节点删除 → node_id 字段被设置为 NULL，而不是级联删除 DatabaseHost 记录
+- DatabaseHost 本身仍然存在，可以继续使用
+
+#### 对主机分配路径的影响
+
+主机选择逻辑（`DeployServerDatabaseService.php:30-44）：
+
+```php
+$hosts = DatabaseHost::query()->get()->toBase();
+$nodeHosts = $hosts->where('node_id', $server->node_id)->toBase();
+
+'database_host_id' => $nodeHosts->isEmpty()
+    ? $hosts->random()->id      // 随机选择任意主机
+    : $nodeHosts->random()->id, // 优先选择同节点主机
+```
+
+**当 DatabaseHost.node_id = null 的主机的影响链：
+
+1. **该主机不再出现在任何服务器的 `nodeHosts` 列表中**
+   - `where('node_id', $server->node_id` 不会匹配 null 值
+   - 因为 `null == $server->node_id` 永远为 false
+
+2. **该主机只能进入全局随机池**
+   - 只能在 `$nodeHosts->isEmpty() 为 true 时才可能被选中
+   - 即：只有当同节点无可用主机时才可能被选中
+
+3. **分配路径变化：
+
+| 状态 | 分配优先级 | 说明 |
+|---|---|---|
+| node_id = X（正常绑定） | 高 | 同节点服务器优先匹配 |
+| node_id = null（节点删除后） | 低 | 只能作为全局备用池 |
+
+**实际行为示例：**
+
+假设配置：`allow_random = true**
+
+场景：服务器在节点 A，有主机 H1（node_id=A，H2（node_id=null）
+
+- 节点 A 存在时：H1 优先被选中，H2 永远不会被同节点服务器选中
+- 节点 A 删除后：H1.node_id 变为 null，两台主机都进入全局备用池
+- 此时创建数据库：从 [H1, H2] 中随机选择
+
+**场景：服务器在节点 B，有主机 H3（node_id=B），H4（node_id=null）
+
+- 节点 B 存在时：H3 优先被选中
+- 节点 B 删除后：H3.node_id 变为 null
+- 此时创建数据库：从所有 node_id=null 的主机中随机选
+
+### 7.3 主机分配机制为何未使用 max_databases 限制
+
+#### max_databases 字段存在但**完全未使用**的证据：
+
+**证据 1：创建主机时硬编码为 null
+
+```php
+// HostCreationService.php:34-42
+$host = $this->repository->create([
+    // ...
+    'max_databases' => null,  // 硬编码为 null
+    'node_id' => array_get($data, 'node_id'),
+]);
+```
+
+**证据 2：主机选择时完全不检查
+
+```php
+// DeployServerDatabaseService.php:30-44
+$hosts = DatabaseHost::query()->get()->toBase();
+// 没有任何地方检查：主机已有数据库数量 vs max_databases
+```
+
+**证据 3：整个代码库没有使用逻辑
+
+搜索整个代码库，没有任何代码统计 `DatabaseHost->databases()->count() 与 max_databases 比较
+
+#### 字段的设计意图推测：
+
+从历史迁移文件（2016_02_07_181319_add_database_servers_table.php）：
+- `max_databases` 字段从一开始就设计为 nullable
+- 最初可能计划用于"单台数据库主机的数据库数量限制
+
+#### 实际使用的限制机制：
+
+**实际生效的是 `Server.database_limit`：
+
+```php
+// DatabaseManagementService.php:77-82
+if ($this->validateDatabaseLimit) {
+    if (!is_null($server->database_limit) && $server->databases()->count() >= $server->database_limit) {
+        throw new TooManyDatabasesException();
+    }
+}
+```
+
+**结论**：
+- `DatabaseHost.max_databases**是一个历史遗留字段，从未实现
+- 实际生效的只有 `Server.database_limit 限制单服务器可创建的数据库数
+- 可能的设计意图可能是：
+  - 最初设计时考虑了"每台 MySQL 实例的数据库总数限制
+  - 但实际只实现了"每个服务器可创建数据库数
+  - 或者这是一个未完成的功能，从未完成功能
+
+#### 风险：
+
+如果要实现主机级别的数据库数限制，需要修改：
+1. HostCreationService 允许设置 max_databases 值
+2. DeployServerDatabaseService 选择主机时过滤掉已达上限的主机
+3. 需要考虑并发问题（锁机制）
+
