@@ -2,18 +2,20 @@
 
 ## 一、全局概览
 
-本项目（Pterodactyl Panel）存在 **两套独立的 API 接口**，共享同一张 `api_keys` 数据表和同一个 Sanctum 认证管道，但权限模型完全不同：
+本项目（Pterodactyl Panel）存在 **两套独立的 API 接口**，共享同一张 `api_keys` 数据表和同一个 Sanctum 认证管道，但权限模型完全不同。最容易让人困惑的是：**管理端 API Key 的签发入口（Web 后台）和使用入口（Application API）走完全不同的中间件栈**。
 
 | 维度 | Application API（管理接口） | Client API（客户端接口） |
 |------|---------------------------|------------------------|
-| 前缀 | `/api/application` | `/api/client` |
+| 接口前缀 | `/api/application` | `/api/client` |
 | Key 类型 | `TYPE_APPLICATION = 2`（已标记 @deprecated） | `TYPE_ACCOUNT = 1` |
 | Key 前缀 | `ptla_` | `ptlc_` |
-| 权限模型 | `AdminAcl` — 列级 `r_{resource}` 位运算（NONE/READ/WRITE） | `Permission` + `ServerPolicy` — 子用户权限常量 |
-| 签发入口 | Admin Web 后台（`AdminController@store`） | Client API 自助（`ApiKeyController@store`） |
-| 管理员校验 | `AuthenticateApplicationUser`（必须 `root_admin`） | `RequireClientApiKey`（禁止 Application Key 闯入） |
+| 权限模型 | `AdminAcl` — 列级 `r_{resource}` 位运算 | `Permission` + `ServerPolicy` — 子用户权限 |
+| 签发入口 | Admin Web 后台（`/admin/api/new`，Web 路由） | Client API 自助（`/api/client/account/api-keys`，API 路由） |
+| 签发中间件 | `web` 组 + `AdminAuthenticate`（Session Cookie） | `api` 组 + `auth:sanctum`（Bearer Token） |
+| 使用时管理员校验 | `AuthenticateApplicationUser`（必须 `root_admin`） | `RequireClientApiKey`（禁止 Application Key 闯入） |
+| 使用时权限校验 | `AdminAcl::check()`（对 Application Key） | `user()->can(permission, $server)`（ServerPolicy） |
 
-两套接口在 `RouteServiceProvider` 中被挂载到 **同一个** `api` 中间件组上，共享认证与 IP 校验逻辑，之后才分流到各自专属的中间件栈。
+两套 API 接口在 `RouteServiceProvider` 中被挂载到 **同一个** `api` 中间件组上，共享认证与 IP 校验逻辑，之后才分流到各自专属的中间件栈。而管理端 Web 后台（Key 签发入口）则完全独立，走 `web` 中间件组。
 
 ---
 
@@ -68,7 +70,335 @@ public static function findToken(string $token): ?self
 
 这是 Sanctum 底层调用的入口。Sanctum 在 `auth:sanctum` 守卫中拿到 Bearer Token 后，调用此方法完成"查表 → 解密 → 比对"三步。
 
-### 2.3 Client API Key 签发
+---
+
+### 2.3 管理端 API Key 签发（Application Key）—— 完整路径逐段解析
+
+这是最难以理解的部分，因为 **签发入口走 Web 路由，而使用时走 API 路由**。下面逐段拆解完整调用链。
+
+#### 2.3.1 路由挂载层 — `RouteServiceProvider`
+
+文件：`app/Providers/RouteServiceProvider.php:38-48`
+
+```php
+$this->routes(function () {
+    Route::middleware('web')->group(function () {
+        // 基础 Web 路由
+        Route::middleware(['auth.session', RequireTwoFactorAuthentication::class])
+            ->group(base_path('routes/base.php'));
+
+        // ⭐ 管理端 Web 路由（包括 API Key 签发入口）
+        Route::middleware(['auth.session', RequireTwoFactorAuthentication::class, AdminAuthenticate::class])
+            ->prefix('/admin')
+            ->group(base_path('routes/admin.php'));  // ← Key 签发路由在这里
+
+        Route::middleware('guest')->prefix('/auth')->group(base_path('routes/auth.php'));
+    });
+
+    // ⭐ API 接口路由（Application API + Client API）
+    Route::middleware(['api', RequireTwoFactorAuthentication::class])->group(function () {
+        Route::middleware(['application-api', 'throttle:api.application'])
+            ->prefix('/api/application')
+            ->scopeBindings()
+            ->group(base_path('routes/api-application.php'));
+
+        Route::middleware(['client-api', 'throttle:api.client'])
+            ->prefix('/api/client')
+            ->scopeBindings()
+            ->group(base_path('routes/api-client.php'));
+    });
+    // ...
+});
+```
+
+**关键分流点**：管理端 Web 后台（Key 签发）走 `web` 中间件组（Session Cookie 认证），而 Application API（Key 使用）走 `api` 中间件组（Bearer Token 认证）。它们唯一的连接点是 **共享同一张 `api_keys` 数据表**。
+
+#### 2.3.2 管理端 API Key 路由定义 — `routes/admin.php`
+
+文件：`routes/admin.php:17-24`
+
+```php
+Route::group(['prefix' => 'api'], function () {
+    Route::get('/', [Admin\ApiController::class, 'index'])->name('admin.api.index');
+    Route::get('/new', [Admin\ApiController::class, 'create'])->name('admin.api.new');
+    Route::post('/new', [Admin\ApiController::class, 'store']);
+    Route::delete('/revoke/{identifier}', [Admin\ApiController::class, 'delete'])->name('admin.api.delete');
+});
+```
+
+**路由与处理器对应关系表**：
+
+| URL 路径 | HTTP 方法 | 路由名称 | 控制器方法 | Request 类 | 中间件 | 响应类型 |
+|---------|-----------|----------|-----------|------------|--------|----------|
+| `/admin/api` | GET | `admin.api.index` | `ApiController@index` | （无） | `web` + `AdminAuthenticate` | Blade 视图（Key 列表） |
+| `/admin/api/new` | GET | `admin.api.new` | `ApiController@create` | （无） | `web` + `AdminAuthenticate` | Blade 视图（创建表单） |
+| `/admin/api/new` | POST | （无，同路径不同方法） | `ApiController@store` | `StoreApplicationApiKeyRequest` | `web` + `AdminAuthenticate` | 重定向到列表 |
+| `/admin/api/revoke/{identifier}` | DELETE | `admin.api.delete` | `ApiController@delete` | （无） | `web` + `AdminAuthenticate` | 204 No Content |
+
+#### 2.3.3 第一步：访问创建页面 — GET `/admin/api/new`
+
+**中间件执行顺序**：
+1. `web` 全局中间件组（EncryptCookies → StartSession → VerifyCsrfToken 等）
+2. `auth.session` → 通过 Session Cookie 认证用户
+3. `RequireTwoFactorAuthentication` → 检查 2FA 配置
+4. `AdminAuthenticate` → 检查 `user()->root_admin`
+
+**控制器方法**：`app/Http/Controllers/Admin/ApiController.php:42-55`
+
+```php
+public function create(): View
+{
+    $resources = AdminAcl::getResourceList();  // 反射获取所有 RESOURCE_* 常量
+    sort($resources);
+
+    return view('admin.api.new', [
+        'resources' => $resources,
+        'permissions' => [
+            'r'  => AdminAcl::READ,            // 1
+            'rw' => AdminAcl::READ | AdminAcl::WRITE,  // 3
+            'n'  => AdminAcl::NONE,            // 0
+        ],
+    ]);
+}
+```
+
+`AdminAcl::getResourceList()` 通过反射读取类中所有 `RESOURCE_` 开头的常量，返回 9 种资源：
+- `servers`, `nodes`, `allocations`, `users`, `locations`, `nests`, `eggs`, `database_hosts`, `server_databases`
+
+#### 2.3.4 第二步：表单渲染 — `resources/views/admin/api/new.blade.php`
+
+表单的核心结构：
+
+```blade
+<form method="POST" action="{{ route('admin.api.new') }}">
+    <!-- 9 种资源，每种 3 个单选按钮 -->
+    @foreach($resources as $resource)
+        <tr>
+            <td>{{ str_replace('_', ' ', title_case($resource)) }}</td>
+            <td>
+                <input type="radio" id="r_{{ $resource }}" 
+                       name="r_{{ $resource }}" value="{{ $permissions['r'] }}">
+                <label for="r_{{ $resource }}">Read</label>
+            </td>
+            <td>
+                <input type="radio" id="rw_{{ $resource }}" 
+                       name="r_{{ $resource }}" value="{{ $permissions['rw'] }}">
+                <label for="rw_{{ $resource }}">Read &amp; Write</label>
+            </td>
+            <td>
+                <input type="radio" id="n_{{ $resource }}" 
+                       name="r_{{ $resource }}" value="{{ $permissions['n'] }}" checked>
+                <label for="n_{{ $resource }}">None</label>
+            </td>
+        </tr>
+    @endforeach
+
+    <!-- 描述字段 -->
+    <div class="form-group">
+        <label for="memoField">Description</label>
+        <input id="memoField" type="text" name="memo" class="form-control">
+    </div>
+
+    {{ csrf_field() }}
+    <button type="submit" class="btn btn-success">Create Credentials</button>
+</form>
+```
+
+**表单提交时的字段**：
+- `memo` → 描述文本
+- `r_servers` → 0/1/3（None/Read/Read&Write）
+- `r_nodes` → 0/1/3
+- `r_allocations` → 0/1/3
+- ...（共 9 个 `r_*` 字段）
+- `_token` → CSRF Token
+
+#### 2.3.5 第三步：表单提交 — POST `/admin/api/new`
+
+**Request 类继承链**：
+
+```
+StoreApplicationApiKeyRequest
+    ↓ extends
+AdminFormRequest
+    ↓ extends
+FormRequest (Laravel 基础类)
+```
+
+**第一层鉴权 — `AdminFormRequest::authorize()`**
+
+文件：`app/Http/Requests/Admin/AdminFormRequest.php:18-25`
+
+```php
+public function authorize(): bool
+{
+    if (is_null($this->user())) {
+        return false;
+    }
+    return (bool) $this->user()->root_admin;  // 必须是 root_admin
+}
+```
+
+**第二层校验 — `StoreApplicationApiKeyRequest::rules()`**
+
+文件：`app/Http/Requests/Admin/Api/StoreApplicationApiKeyRequest.php:15-22`
+
+```php
+public function rules(): array
+{
+    $modelRules = ApiKey::getRules();
+
+    // 动态为每个资源生成验证规则
+    return collect(AdminAcl::getResourceList())->mapWithKeys(function ($resource) use ($modelRules) {
+        return [AdminAcl::COLUMN_IDENTIFIER . $resource => $modelRules['r_' . $resource]];
+        // → 'r_servers' => 'integer|min:0|max:3'
+        // → 'r_nodes'   => 'integer|min:0|max:3'
+        // ... 共 9 个
+    })->merge(['memo' => $modelRules['memo']])->toArray();
+}
+```
+
+**提取权限字段 — `StoreApplicationApiKeyRequest::getKeyPermissions()`**
+
+文件：`app/Http/Requests/Admin/Api/StoreApplicationApiKeyRequest.php:31-36`
+
+```php
+public function getKeyPermissions(): array
+{
+    return collect($this->validated())->filter(function ($value, $key) {
+        return substr($key, 0, strlen(AdminAcl::COLUMN_IDENTIFIER)) === AdminAcl::COLUMN_IDENTIFIER;
+        // 只保留以 'r_' 开头的字段
+    })->toArray();
+}
+```
+
+#### 2.3.6 第四步：控制器处理 — `ApiController@store`
+
+文件：`app/Http/Controllers/Admin/ApiController.php:62-72`
+
+```php
+public function store(StoreApplicationApiKeyRequest $request): RedirectResponse
+{
+    $this->keyCreationService->setKeyType(ApiKey::TYPE_APPLICATION)->handle([
+        'memo'    => $request->input('memo'),
+        'user_id' => $request->user()->id,
+    ], $request->getKeyPermissions());  // 传入 9 个 r_* 权限
+
+    $this->alert->success('A new application API key has been generated for your account.')->flash();
+
+    return redirect()->route('admin.api.index');  // 重定向回列表页
+}
+```
+
+#### 2.3.7 第五步：服务层创建 — `KeyCreationService@handle`
+
+文件：`app/Services/Api/KeyCreationService.php:38-51`
+
+```php
+public function handle(array $data, array $permissions = []): ApiKey
+{
+    $data = array_merge($data, [
+        'key_type'   => $this->keyType,                   // TYPE_APPLICATION = 2
+        'identifier' => ApiKey::generateTokenIdentifier($this->keyType),  // ptla_ 前缀
+        'token'      => $this->encrypter->encrypt(str_random(ApiKey::KEY_LENGTH)),  // 加密 32 字符随机
+    ]);
+    
+    if ($this->keyType === ApiKey::TYPE_APPLICATION) {
+        $data = array_merge($data, $permissions);  // 合并 r_servers, r_nodes 等权限列
+    }
+    
+    return $this->repository->create($data, true, true);
+}
+```
+
+#### 2.3.8 第六步：明文 Key 展示 — 列表页视图
+
+文件：`resources/views/admin/api/index.blade.php:37-43`
+
+```blade
+@foreach($keys as $key)
+    <tr>
+        <td><code>
+            @if (Auth::user()->is($key->user))
+                {{ $key->identifier . decrypt($key->token) }}
+                {{-- ⭐ 只有 Key 创建者本人才能看到完整明文 --}}
+            @else
+                {{ $key->identifier . '****' }}
+                {{-- 其他管理员只能看到 identifier --}}
+            @endif
+        </code></td>
+        <!-- ... -->
+    </tr>
+@endforeach
+```
+
+**明文 Key 展示的唯一性**：完整明文 Key 仅在重定向后的列表页展示一次，刷新页面后仍然可见（因为是实时解密展示），但只有创建者本人能看到。这是与 Client API Key 最大的不同 —— Client Key 仅在创建响应的 JSON 中返回一次，之后永远无法再获取明文。
+
+#### 2.3.9 Application Key 签发完整流程图
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                Application API Key 签发完整流程                               │
+└─────────────────────────────────────────────────────────────────────────────┘
+        │
+        ▼
+GET /admin/api/new
+        │
+        ├─ 中间件：web → auth.session → Require2FA → AdminAuthenticate
+        │
+        ▼
+Admin\ApiController@create()
+        │
+        ├─ 调用 AdminAcl::getResourceList() 获取 9 种资源
+        │
+        ▼
+渲染视图 admin.api.new
+        │
+        ├─ 表单包含：memo + 9 组 r_{resource} 单选按钮
+        │  每组三个选项：None(0) / Read(1) / Read&Write(3)
+        │
+        ▼
+用户填写表单，点击提交 → POST /admin/api/new
+        │
+        ├─ 中间件同上（Session Cookie 认证）
+        │
+        ▼
+StoreApplicationApiKeyRequest 验证
+        │
+        ├─ authorize() → AdminFormRequest 检查 root_admin
+        ├─ rules()     → 动态生成 9 个 r_* 字段规则（0-3 范围）
+        ├─ getKeyPermissions() → 提取所有 r_ 开头字段
+        │
+        ▼
+Admin\ApiController@store()
+        │
+        ├─ KeyCreationService->setKeyType(TYPE_APPLICATION)->handle()
+        │
+        ▼
+KeyCreationService@handle()
+        │
+        ├─ 生成 identifier（ptla_ 前缀）
+        ├─ 加密生成 token（32 随机字符）
+        ├─ 合并 memo + user_id + 9 个 r_* 权限
+        ├─ ApiKeyRepository->create() 写入数据库
+        │
+        ▼
+重定向到 GET /admin/api
+        │
+        ▼
+Admin\ApiController@index()
+        │
+        ├─ 查询所有 TYPE_APPLICATION 的 Key
+        │
+        ▼
+渲染列表页视图
+        │
+        ├─ 对当前用户创建的 Key：{{ identifier + decrypt(token) }} → 显示完整明文
+        ├─ 对其他用户创建的 Key：{{ identifier + '****' }} → 仅显示 identifier
+```
+
+---
+
+### 2.4 Client API Key 签发
 
 文件：`app/Models/Traits/HasAccessTokens.php:30-43`
 
@@ -92,73 +422,171 @@ public function createToken(?string $memo, ?array $ips): NewAccessToken
 2. `StoreApiKeyRequest` 校验 `description` + `allowed_ips`（IP 格式校验，最多 50 个）
 3. `ApiKeyController@store` 检查用户 Key 数量上限（25 个）
 4. 调用 `$request->user()->createToken(...)` → 上述方法
-5. 返回 `secret_token`（完整明文 Key），**只出现这一次**
+5. 返回 `secret_token`（完整明文 Key），**只出现这一次**（数据库中加密存储，之后无法再解密展示）
 
-### 2.4 Application API Key 签发
-
-文件：`app/Services/Api/KeyCreationService.php:38-51`
-
-```php
-public function handle(array $data, array $permissions = []): ApiKey
-{
-    $data = array_merge($data, [
-        'key_type'   => $this->keyType,
-        'identifier' => ApiKey::generateTokenIdentifier($this->keyType), // ptla_ 前缀
-        'token'      => $this->encrypter->encrypt(str_random(ApiKey::KEY_LENGTH)),
-    ]);
-    if ($this->keyType === ApiKey::TYPE_APPLICATION) {
-        $data = array_merge($data, $permissions);  // 合并 r_servers, r_nodes 等权限列
-    }
-    return $this->repository->create($data, true, true);
-}
-```
-
-调用链：
-1. 管理员在 Web 后台 `/admin/api/new` 填写表单
-2. `StoreApplicationApiKeyRequest` 校验 memo + 各 `r_{resource}` 字段（0-3 范围）
-3. `getKeyPermissions()` 提取所有 `r_` 开头的字段
-4. `AdminController@store` 调用 `KeyCreationService->setKeyType(TYPE_APPLICATION)->handle()`
-5. 重定向回列表页，完整明文 Key **在页面上显示一次**
+---
 
 ### 2.5 签发流程对比
 
 ```
-┌──────────────────────────────────────────────────────────────┐
-│                  Client API Key 签发                          │
-│  POST /api/client/account/api-keys                           │
-│  → StoreApiKeyRequest (description + allowed_ips 校验)        │
-│  → ApiKeyController@store (数量上限 25)                       │
-│  → User::createToken() (HasAccessTokens trait)               │
-│    → key_type = TYPE_ACCOUNT, 前缀 ptlc_                     │
-│    → 无 r_* 权限列                                            │
-│  → 返回 JSON 含 secret_token                                 │
-└──────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────┐
+│                  Client API Key 签发                                  │
+│  接口：POST /api/client/account/api-keys                              │
+│  认证：Bearer Token（api 中间件组 + auth:sanctum）                   │
+│  处理器：ApiKeyController@store                                       │
+│  Request：StoreApiKeyRequest（校验 description + allowed_ips）        │
+│  服务：User::createToken()（HasAccessTokens trait）                   │
+│  Key 类型：TYPE_ACCOUNT，前缀 ptlc_                                    │
+│  权限列：不写入 r_*（全部为 0）                                        │
+│  明文展示：JSON 响应中 secret_token 字段，仅返回一次                   │
+└──────────────────────────────────────────────────────────────────────┘
 
-┌──────────────────────────────────────────────────────────────┐
-│                Application API Key 签发                       │
-│  POST /admin/api (Web 表单)                                  │
-│  → StoreApplicationApiKeyRequest (memo + r_* 校验)            │
-│  → ApiController@store                                       │
-│  → KeyCreationService->handle()                              │
-│    → key_type = TYPE_APPLICATION, 前缀 ptla_                  │
-│    → 合并 r_servers/r_nodes/... 等权限列                      │
-│  → 重定向到列表页，页面展示明文 Key                            │
-└──────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────┐
+│                Application API Key 签发                               │
+│  接口：POST /admin/api/new（Web 表单）                                │
+│  认证：Session Cookie（web 中间件组 + AdminAuthenticate）             │
+│  处理器：Admin\ApiController@store                                    │
+│  Request：StoreApplicationApiKeyRequest（校验 memo + 9 个 r_*）       │
+│  服务：KeyCreationService->handle()                                   │
+│  Key 类型：TYPE_APPLICATION，前缀 ptla_                                │
+│  权限列：写入 r_servers/r_nodes/... 等 9 个权限列                      │
+│  明文展示：重定向后列表页实时解密展示，创建者每次访问都可见             │
+└──────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## 三、请求认证管道（Authentication Pipeline）
+## 三、认证分流处的连接方式
 
-所有 API 请求共享同一个中间件栈，在 `RouteServiceProvider` 中组装：
+这是整个体系最核心的设计。**管理端 API Key 的签发入口和使用入口走完全不同的中间件栈，但共享同一张 `api_keys` 数据表**。
+
+### 3.1 双轨中间件架构
 
 ```
-Route::middleware(['api', RequireTwoFactorAuthentication::class])
-  ├── /api/application  →  ['application-api', 'throttle:api.application']
-  └── /api/client       →  ['client-api',       'throttle:api.client']
+                        ┌───────────────────────────────────────────┐
+                        │              HTTP 请求入口                 │
+                        └───────────────────────────────────────────┘
+                                       │
+                    ┌──────────────────┴───────────────────┐
+                    ▼                                      ▼
+           ┌──────────────────────┐             ┌──────────────────────┐
+           │   Web 后台路由组       │             │    API 接口路由组     │
+           │  /admin/*（签发 Key）  │             │  /api/*（使用 Key）  │
+           └──────────────────────┘             └──────────────────────┘
+                    │                                      │
+                    ▼                                      ▼
+           走 web 中间件组                       走 api 中间件组
+┌────────────────────────────────────┐  ┌────────────────────────────────────┐
+│  EncryptCookies                    │  │  EnsureStatefulRequests            │
+│  AddQueuedCookiesToResponse        │  │  auth:sanctum                     │
+│  StartSession                      │  │  IsValidJson                       │
+│  ShareErrorsFromSession            │  │  TrackAPIKey                       │
+│  VerifyCsrfToken                   │  │  RequireTwoFactorAuthentication    │
+│  SubstituteBindings                │  │  AuthenticateIPAccess              │
+│  LanguageMiddleware                │  └────────────────────────────────────┘
+└────────────────────────────────────┘                  │
+                    │                                   ▼
+                    ▼                         ┌──────────────────────┐
+           admin 专属中间件                     │  分流中间件组        │
+┌────────────────────────────────────┐          ├──────────────────────┤
+│  auth.session                      │          │  application-api    │
+│  RequireTwoFactorAuthentication    │          │    └─ AuthenticateApplicationUser (root_admin?)│
+│  AdminAuthenticate (root_admin?)   │          │  throttle:api.application │
+└────────────────────────────────────┘          ├──────────────────────┤
+                    │                           │  client-api         │
+                    ▼                           │    └─ RequireClientApiKey (!TYPE_APPLICATION?)│
+           routes/admin.php                     │  throttle:api.client│
+           ├─ GET  /admin/api                   └──────────────────────┘
+           ├─ GET  /admin/api/new                        │
+           ├─ POST /admin/api/new                        ▼
+           └─ DELETE /admin/api/revoke/{id}    routes/api-application.php
+                    │                           routes/api-client.php
+                    ▼                                      │
+           Admin\ApiController                             ▼
+           ├─ index()  →  Key 列表             Api\Application\*Controller
+           ├─ create() → 创建表单               Api\Client\*Controller
+           ├─ store()  → 创建 Key                       │
+           └─ delete() → 删除 Key                       ▼
+                    │                           ApplicationApiRequest::authorize()
+                    ▼                           ClientApiRequest::authorize()
+           KeyCreationService                            │
+                    │                                   ▼
+                    └───────────────┬───────────────────┘
+                                    ▼
+                          ┌───────────────────┐
+                          │   api_keys 表      │
+                          │  共享数据存储      │
+                          └───────────────────┘
 ```
 
-### 3.1 `api` 中间件组（Kernel.php:70-77）
+### 3.2 `RouteServiceProvider` 中的分流点
+
+文件：`app/Providers/RouteServiceProvider.php:38-60`
+
+```php
+$this->routes(function () {
+    // ═══════════════ 第一组：Web 路由 ═══════════════
+    Route::middleware('web')->group(function () {
+        // 基础页面路由
+        Route::middleware(['auth.session', RequireTwoFactorAuthentication::class])
+            ->group(base_path('routes/base.php'));
+
+        // ⭐ 管理端 Web 路由（Key 签发入口）
+        Route::middleware([
+            'auth.session', 
+            RequireTwoFactorAuthentication::class, 
+            AdminAuthenticate::class  // ← 检查 root_admin
+        ])
+            ->prefix('/admin')
+            ->group(base_path('routes/admin.php'));
+
+        Route::middleware('guest')->prefix('/auth')->group(base_path('routes/auth.php'));
+    });
+
+    // ═══════════════ 第二组：API 接口路由 ═══════════════
+    Route::middleware(['api', RequireTwoFactorAuthentication::class])->group(function () {
+        // ⭐ Application API（Key 使用入口之一）
+        Route::middleware([
+            'application-api',  // ← 包含 AuthenticateApplicationUser
+            'throttle:api.application'
+        ])
+            ->prefix('/api/application')
+            ->scopeBindings()
+            ->group(base_path('routes/api-application.php'));
+
+        // ⭐ Client API（Key 使用入口之二）
+        Route::middleware([
+            'client-api',       // ← 包含 RequireClientApiKey
+            'throttle:api.client'
+        ])
+            ->prefix('/api/client')
+            ->scopeBindings()
+            ->group(base_path('routes/api-client.php'));
+    });
+});
+```
+
+**分流逻辑解析**：
+
+1. **按路径前缀分流**：
+   - `/admin/*` → Web 路由，Session Cookie 认证
+   - `/api/application/*` → API 路由，Bearer Token 认证
+   - `/api/client/*` → API 路由，Bearer Token 认证
+
+2. **按认证方式分流**：
+   - Web 路由使用 `auth.session`（Laravel Session Guard）
+   - API 路由使用 `auth:sanctum`（Sanctum Guard，调用 `ApiKey::findToken()`）
+
+3. **管理员身份双重校验**：
+   - Web 管理路由：`AdminAuthenticate` 中间件检查 `root_admin`
+   - Application API：`AuthenticateApplicationUser` 中间件检查 `root_admin`
+
+4. **Key 类型隔离**：
+   - Client API：`RequireClientApiKey` 中间件拒绝 `TYPE_APPLICATION` 的 Key
+
+### 3.3 `api` 中间件组详细解析
+
+文件：`app/Http/Kernel.php:70-77`
 
 ```php
 'api' => [
@@ -171,38 +599,44 @@ Route::middleware(['api', RequireTwoFactorAuthentication::class])
 ],
 ```
 
-### 3.2 Sanctum 认证 (`auth:sanctum`)
+**每一步的衔接逻辑**：
 
-文件：`app/Providers/AuthServiceProvider.php:22`
-
+**① `EnsureStatefulRequests`** — 决定后续认证路径
 ```php
-Sanctum::usePersonalAccessTokenModel(ApiKey::class);
+// 继承自 Sanctum 的 EnsureFrontendRequestsAreStateful
+public static function fromFrontend($request)
+{
+    if (parent::fromFrontend($request)) return true;
+    return $request->hasCookie(config('session.cookie'));
+}
+```
+- 如果来自前端 SPA 域名或携带 Session Cookie → 走 Session 认证，生成 `TransientToken`
+- 否则 → 走 Bearer Token 认证，生成 `ApiKey` 实例
+
+**② `auth:sanctum`** — Sanctum Guard 认证
+- 若是 Stateful 请求：通过 Session 认证，token 为 `TransientToken`
+- 若是 Stateless 请求：从 `Authorization: Bearer <token>` 提取令牌 → 调用 `ApiKey::findToken()` → 查表 → 解密 → 比对 → 认证成功时 token 为 `ApiKey` 实例
+
+**③ `IsValidJson`** — 仅对 POST/PUT/PATCH 等有请求体的方法校验 JSON 格式
+
+**④ `TrackAPIKey`** — 记录 Key 上下文
+```php
+// 如果是 ApiKey 实例，记录 ID 到 LogTarget；TransientToken 则记 null
+LogTarget::setApiKeyId($token instanceof ApiKey ? $token->id : null);
 ```
 
-Sanctum 被配置为使用 `ApiKey` 模型作为 Personal Access Token。认证流程：
+**⑤ `RequireTwoFactorAuthentication`** — 检查 2FA 配置，API 请求直接抛异常而非重定向
 
-1. **Stateful 请求**（前端 SPA 带 Cookie）：`EnsureStatefulRequests` 判断请求是否来自受信任的前端域名或携带 Session Cookie。如果是，Sanctum 使用 Session 认证，认证后生成 `TransientToken`。
-2. **Stateless 请求**（Bearer Token）：Sanctum 从 `Authorization: Bearer <token>` 中提取令牌，调用 `ApiKey::findToken()` 完成认证。
-
-**关键区别**：
-- `TransientToken`：表示通过 Session Cookie 认证的前端请求，不受 IP 限制，不受 Key 类型限制
-- `ApiKey` 实例：表示通过 Bearer Token 认证的 API 请求，受所有后续中间件约束
-
-### 3.3 IP 白名单校验 (`AuthenticateIPAccess`)
-
-文件：`app/Http/Middleware/Api/AuthenticateIPAccess.php`
-
-```
-if token 是 TransientToken → 放行（前端 Cookie 请求不受限）
-if token.allowed_ips 为空 → 放行（无 IP 限制）
-否则逐一匹配 allowed_ips（支持 CIDR）→ 不匹配则记录日志并 403
+**⑥ `AuthenticateIPAccess`** — IP 白名单校验
+```php
+if ($token instanceof TransientToken) return $next($request);  // 前端请求跳过
+if (empty($token->allowed_ips)) return $next($request);       // 无限制跳过
+// 否则逐一匹配 CIDR，不匹配则记录日志并 403
 ```
 
-### 3.4 分流中间件
+### 3.4 分流后的专属中间件
 
-认证完成后，请求进入各自的分流中间件组：
-
-**Application API 专属**（`application-api` 组）：
+**Application API 专属**（`application-api` 组，Kernel.php:78-81）：
 ```php
 'application-api' => [
     SubstituteBindings::class,
@@ -210,7 +644,7 @@ if token.allowed_ips 为空 → 放行（无 IP 限制）
 ],
 ```
 
-**Client API 专属**（`client-api` 组）：
+**Client API 专属**（`client-api` 组，Kernel.php:82-85）：
 ```php
 'client-api' => [
     SubstituteClientBindings::class,
@@ -218,11 +652,152 @@ if token.allowed_ips 为空 → 放行（无 IP 限制）
 ],
 ```
 
+**`AuthenticateApplicationUser` 源码**（`app/Http/Middleware/Api/Application/AuthenticateApplicationUser.php`）：
+```php
+public function handle(Request $request, \Closure $next): mixed
+{
+    $user = $request->user();
+    if (!$user || !$user->root_admin) {
+        throw new AccessDeniedHttpException('This account does not have permission to access the API.');
+    }
+    return $next($request);
+}
+```
+
+**`RequireClientApiKey` 源码**（`app/Http/Middleware/Api/Client/RequireClientApiKey.php`）：
+```php
+public function handle(Request $request, \Closure $next): mixed
+{
+    $token = $request->user()->currentAccessToken();
+    if ($token instanceof ApiKey && $token->key_type === ApiKey::TYPE_APPLICATION) {
+        throw new AccessDeniedHttpException(
+            'You are attempting to use an application API key on an endpoint that requires a client API key.'
+        );
+    }
+    return $next($request);
+}
+```
+
 ---
 
-## 四、范围校验（Scope Validation）
+## 四、请求认证管道（Authentication Pipeline）
 
-### 4.1 Application API — AdminAcl 位运算
+### 4.1 Application API 请求完整生命周期
+
+以一个典型的 Application API 请求为例，完整中间件执行顺序：
+
+```
+HTTP 请求: GET /api/application/servers
+Authorization: Bearer ptla_xxxxxxxxxxxxxxyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy
+
+1. 全局中间件 (Kernel::$middleware)
+   ├── TrustProxies
+   ├── HandleCors
+   ├── PreventRequestsDuringMaintenance
+   ├── ValidatePostSize
+   ├── TrimStrings
+   ├── ConvertEmptyStringsToNull
+   └── SetSecurityHeaders
+
+2. api 中间件组
+   ├── EnsureStatefulRequests     → 非 SPA 无 Cookie → 继续
+   ├── auth:sanctum               → Bearer Token → ApiKey::findToken() → 识别为 TYPE_APPLICATION
+   ├── IsValidJson                → GET 请求跳过
+   ├── TrackAPIKey                → LogTarget::setApiKeyId($token->id)
+   ├── RequireTwoFactorAuthentication → 检查 2FA
+   └── AuthenticateIPAccess       → 检查 allowed_ips 白名单
+
+3. application-api 中间件组
+   ├── SubstituteBindings         → 路由模型绑定
+   └── AuthenticateApplicationUser → 检查 root_admin → 通过
+
+4. throttle:api.application       → 检查用户 UUID 维度速率限制（256/分钟）
+
+5. 控制器 Request 层 — ApplicationApiRequest::authorize()
+   ├── TransientToken? 否
+   ├── TYPE_ACCOUNT? 否（是 TYPE_APPLICATION）
+   └── AdminAcl::check($token, 'servers', AdminAcl::READ)
+       → 读 $token->r_servers 的值 → 位运算 ($permission & $action) → 通过
+
+6. 控制器
+   └─ Application\Servers\ServerController@index
+
+7. Transformer 层 — BaseTransformer::authorize()
+   └─ AdminAcl::check($token, 'servers') → 二次校验（用于 include 关联资源）
+```
+
+### 4.2 Client API 请求完整生命周期
+
+```
+HTTP 请求: GET /api/client/servers/xxx/files/list
+Authorization: Bearer ptlc_xxxxxxxxxxxxxxyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy
+
+1. 全局中间件 (同上)
+
+2. api 中间件组 (同上)
+   ├── EnsureStatefulRequests     → 继续
+   ├── auth:sanctum               → 识别为 TYPE_ACCOUNT
+   ├── IsValidJson                → 跳过
+   ├── TrackAPIKey                → 记录 Key ID
+   ├── RequireTwoFactorAuthentication → 通过
+   └── AuthenticateIPAccess       → 检查 allowed_ips
+
+3. client-api 中间件组
+   ├── SubstituteClientBindings   → 路由模型绑定
+   └── RequireClientApiKey        → key_type !== TYPE_APPLICATION → 通过
+
+4. throttle:api.client            → 检查用户 UUID 速率限制
+
+5. 路由中间件
+   ├── ServerSubject              → Activity 日志绑定
+   ├── AuthenticateServerAccess   → 用户是否有权访问此服务器
+   └── ResourceBelongsToServer    → 资源是否属于此服务器
+
+6. 控制器 Request 层 — ClientApiRequest::authorize()
+   └─ user()->can('file.read', $server) → ServerPolicy 校验
+
+7. Transformer 层 — BaseClientTransformer::authorize()
+   └─ user()->can($ability, [$server]) → 二次鉴权
+```
+
+### 4.3 管理端 Web 请求生命周期（Key 签发）
+
+```
+HTTP 请求: POST /admin/api/new（表单提交）
+Cookie: laravel_session=xxx
+
+1. 全局中间件 (同上)
+
+2. web 中间件组
+   ├── EncryptCookies
+   ├── AddQueuedCookiesToResponse
+   ├── StartSession
+   ├── ShareErrorsFromSession
+   ├── VerifyCsrfToken            → 校验 _token 字段
+   ├── SubstituteBindings
+   └── LanguageMiddleware
+
+3. admin 专属中间件
+   ├── auth.session                → Session Guard 认证用户
+   ├── RequireTwoFactorAuthentication → 检查 2FA
+   └── AdminAuthenticate           → 检查 root_admin → 通过
+
+4. 路由：POST /admin/api/new → Admin\ApiController@store
+
+5. Request 层 — StoreApplicationApiKeyRequest
+   ├── authorize() → AdminFormRequest 检查 root_admin
+   └── rules() → 校验 memo + 9 个 r_* 字段
+
+6. 控制器 → KeyCreationService → 写入 api_keys 表
+
+7. 重定向到 GET /admin/api → 列表页展示明文 Key
+```
+
+---
+
+## 五、范围校验（Scope Validation）
+
+### 5.1 Application API — AdminAcl 位运算
 
 文件：`app/Services/Acl/Api/AdminAcl.php`
 
@@ -263,7 +838,7 @@ public function authorize(): bool
 
 **注意**：`TYPE_ACCOUNT` 的 Key 访问 Application API 时**自动放行**（因为 Account Key 是用户自己的，而 Application API 要求 `root_admin`，所以前面 `AuthenticateApplicationUser` 中间件已经保证了只有管理员才能到这里）。但 `TYPE_APPLICATION` 的 Key **必须通过 AdminAcl 校验**。
 
-### 4.2 Client API — Permission + ServerPolicy
+### 5.2 Client API — Permission + ServerPolicy
 
 文件：`app/Models/Permission.php`、`app/Http/Requests/Api/Client/ClientApiRequest.php`
 
@@ -281,7 +856,7 @@ return true;  // 非 Server 相关请求（如账户 API）直接放行
 
 Permission 模型定义了细粒度的操作权限（如 `websocket.connect`、`file.read-content`、`backup.restore` 等），存储在 `permissions` 表中，关联到 `subusers` 表。
 
-### 4.3 Transformer 层的二次鉴权
+### 5.3 Transformer 层的二次鉴权
 
 即使控制器层通过了鉴权，在 Transformer 序列化时还有一道检查：
 
@@ -300,54 +875,16 @@ return $this->request->user()->can($ability, [$server]);  // 用 ServerPolicy
 
 这确保了 include 关联资源时不会泄露无权限的数据。
 
-### 4.4 Key 类型隔离 — RequireClientApiKey
-
-文件：`app/Http/Middleware/Api/Client/RequireClientApiKey.php`
-
-```php
-if ($token instanceof ApiKey && $token->key_type === ApiKey::TYPE_APPLICATION) {
-    throw new AccessDeniedHttpException(
-        'You are attempting to use an application API key on an endpoint that requires a client API key.'
-    );
-}
-```
-
-这是**单向隔离**：Application Key 不能访问 Client API，但 Client Account Key 在通过 `root_admin` 检查后可以访问 Application API。
-
-### 4.5 范围校验全景图
-
-```
-请求到达
-  │
-  ▼
-auth:sanctum 识别出 ApiKey(或 TransientToken)
-  │
-  ├─ /api/application ──→ AuthenticateApplicationUser (root_admin?)
-  │                       │
-  │                       ApplicationApiRequest::authorize()
-  │                       ├─ TransientToken → 放行
-  │                       ├─ TYPE_ACCOUNT  → 放行（已由 root_admin 保证）
-  │                       └─ TYPE_APPLICATION → AdminAcl::check(r_{resource}, action)
-  │
-  └─ /api/client ──→ RequireClientApiKey (TYPE_APPLICATION → 403)
-                      │
-                      ClientApiRequest::authorize()
-                      ├─ 非 Server 请求 → 放行
-                      └─ Server 请求 → user()->can(permission, $server)
-                                        ├─ Owner → 全部权限
-                                        └─ Subuser → 查 permissions 表
-```
-
 ---
 
-## 五、频率限制（Rate Limiting）
+## 六、频率限制（Rate Limiting）
 
-### 5.1 三层频率限制体系
+### 6.1 三层频率限制体系
 
 ```
 ┌─────────────────────────────────────────────────────────┐
 │ 第一层：全局 API 速率限制                                  │
-│   由 RouteServiceProvider 注册，按 Key 维度限制             │
+│   由 RouteServiceProvider 注册，按用户 UUID 限制           │
 │   ┌────────────────┬─────────────────────────────┐      │
 │   │ api.client     │ 256 次/分钟 (可配)            │      │
 │   │ api.application│ 256 次/分钟 (可配)            │      │
@@ -373,7 +910,7 @@ auth:sanctum 识别出 ApiKey(或 TransientToken)
 └─────────────────────────────────────────────────────────┘
 ```
 
-### 5.2 全局 API 限制配置
+### 6.2 全局 API 限制配置
 
 文件：`config/http.php`
 
@@ -386,7 +923,7 @@ auth:sanctum 识别出 ApiKey(或 TransientToken)
 ],
 ```
 
-### 5.3 限制器注册
+### 6.3 限制器注册
 
 文件：`app/Providers/RouteServiceProvider.php:93-109`
 
@@ -404,26 +941,9 @@ RateLimiter::for('api.application', function (Request $request) {
 });
 ```
 
-**关键设计**：限制维度是 **用户 UUID** 而非 API Key。这意味着同一个用户的所有 Key 共享配额，切换 Key 无法绕过限制。未认证时退化为 IP 维度。
+**关键设计**：限制维度是 **用户 UUID** 而非 API Key。这意味着同一个用户的所有 Key 共享配额，切换 Key 无法绕过限制。
 
-### 5.4 路由上的 Throttle 中间件
-
-```php
-// RouteServiceProvider 中路由注册
-Route::middleware(['api', RequireTwoFactorAuthentication::class])->group(function () {
-    Route::middleware(['application-api', 'throttle:api.application'])
-        ->prefix('/api/application')
-        ->group(...);
-
-    Route::middleware(['client-api', 'throttle:api.client'])
-        ->prefix('/api/client')
-        ->group(...);
-});
-```
-
-`throttle:api.application` 和 `throttle:api.client` 是在路由层声明的，确保每条路由都受到对应的速率限制。
-
-### 5.5 ResourceLimit — 服务器级资源限制
+### 6.4 ResourceLimit — 服务器级资源限制
 
 文件：`app/Enum/ResourceLimit.php`
 
@@ -448,58 +968,21 @@ Route::middleware([ResourceLimit::Backup->middleware()])
     ->post('/{backup}/restore', ...);
 ```
 
-限制维度是 **服务器 UUID**（`$case->limit()->by($server->uuid)`），而非用户。这是为了防止单个服务器上的资源被过度创建，即使不同用户操作同一台服务器也共享配额。
-
----
-
-## 六、完整请求生命周期
-
-以一个典型的 Client API 请求为例，完整中间件执行顺序：
-
-```
-HTTP 请求: GET /api/client/servers/xxx/files/list
-Authorization: Bearer ptlc_xxxxxxxxxxxxxxyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy
-
-1. 全局中间件 (Kernel::$middleware)
-   ├── TrustProxies
-   ├── HandleCors
-   ├── PreventRequestsDuringMaintenance
-   ├── ValidatePostSize
-   ├── TrimStrings
-   ├── ConvertEmptyStringsToNull
-   └── SetSecurityHeaders
-
-2. api 中间件组
-   ├── EnsureStatefulRequests     → 非 SPA 请求，跳过
-   ├── auth:sanctum               → Bearer Token → ApiKey::findToken() → 认证成功
-   ├── IsValidJson                → GET 请求，跳过
-   ├── TrackAPIKey                → LogTarget::setApiKeyId($token->id)
-   ├── RequireTwoFactorAuthentication → 检查 2FA 配置
-   └── AuthenticateIPAccess       → 检查 allowed_ips 白名单
-
-3. client-api 中间件组
-   ├── SubstituteClientBindings   → 路由模型绑定
-   └── RequireClientApiKey        → key_type !== TYPE_APPLICATION → 放行
-
-4. throttle:api.client            → 检查用户 UUID 维度速率限制
-
-5. 路由中间件
-   ├── ServerSubject              → Activity 日志绑定
-   ├── AuthenticateServerAccess   → 用户是否有权访问此服务器
-   └── ResourceBelongsToServer    → 资源是否属于此服务器
-
-6. 控制器
-   └── ClientApiRequest::authorize() → user()->can('file.read', $server)
-
-7. Transformer 层
-   └── BaseClientTransformer::authorize() → 二次鉴权
-```
+限制维度是 **服务器 UUID**，而非用户。防止单个服务器上的资源被过度创建。
 
 ---
 
 ## 七、容易混淆的设计点
 
-### 7.1 Account Key 为什么能通过 Application API 的 authorize()？
+### 7.1 为什么管理端 Key 签发走 Web 路由而不是 API 路由？
+
+这是历史设计。管理端是传统的服务器端渲染（SSR）Web 应用，使用 Session Cookie 认证。而 Application API 是为第三方应用设计的，使用 Bearer Token 认证。**它们唯一的连接点是共享 `api_keys` 数据表**。
+
+### 7.2 Application Key 明文为什么能反复查看？
+
+管理端列表页的 `decrypt($key->token)` 是实时解密。因为管理端走 Session 认证，知道当前用户身份，可以判断 `Auth::user()->is($key->user)`。而 Client API 是无状态的，无法在列表查询时安全地解密返回明文。
+
+### 7.3 Account Key 为什么能通过 Application API 的 authorize()？
 
 `ApplicationApiRequest::authorize()` 中有：
 ```php
@@ -508,21 +991,15 @@ if ($token->key_type === ApiKey::TYPE_ACCOUNT) return true;
 
 这看起来是"Account Key 拥有全部 Application 权限"，但实际上 `AuthenticateApplicationUser` 中间件已经确保了只有 `root_admin` 用户才能到达这里。Account Key 本身就属于管理员，所以无需 AdminAcl 细分权限。
 
-### 7.2 TYPE_APPLICATION 已标记 @deprecated
+### 7.4 TYPE_APPLICATION 已标记 @deprecated
 
 `ApiKey` 模型中 `TYPE_APPLICATION = 2` 已被标记为废弃。当前系统仍然支持签发和使用 Application Key，但未来可能移除。Account Key + root_admin 的组合正在成为访问管理 API 的推荐方式。
 
-### 7.3 AdminAcl 的权限列只对 Application Key 有意义
+### 7.5 AdminAcl 的权限列只对 Application Key 有意义
 
 `r_servers`、`r_nodes` 等列只在使用 `KeyCreationService` 签发 Application Key 时写入。Client Account Key 签发时不涉及这些列，它们的值默认为 0（NONE）。AdminAcl::check() 只在 `ApplicationApiRequest::authorize()` 中对 Application Key 调用。
 
-### 7.4 ResourceLimit 是"服务器维度"而非"用户维度"
-
-全局速率限制（`api.client`/`api.application`）是按用户 UUID 限的，但 ResourceLimit 是按服务器 UUID 限的。这意味着：
-- 一个用户在 10 台服务器上各创建 2 个数据库 → 全局限制内
-- 但在 1 台服务器上连续创建 3 个数据库 → ResourceLimit 会拦截第 3 个
-
-### 7.5 TransientToken 的特殊地位
+### 7.6 TransientToken 的特殊地位
 
 通过前端 SPA Cookie 认证的请求产生 `TransientToken`：
 - 不受 `AuthenticateIPAccess` 限制
@@ -531,10 +1008,17 @@ if ($token->key_type === ApiKey::TYPE_ACCOUNT) return true;
 
 这意味着前端管理员 Session 在 API 层面拥有最大的自由度。
 
-### 7.6 ApiKey::can() 始终返回 false
+### 7.7 ApiKey::can() 始终返回 false
 
 ```php
 public function can($ability) { return false; }
 ```
 
 这是 Laravel Sanctum `HasAbilities` 接口的方法，原本用于按 ability 字符串校验权限。但 Pterodactyl 使用了自己的 `AdminAcl` 体系而非 Sanctum 的 ability 机制，所以这个方法未被实现，始终返回 false。实际权限校验走的是 `AdminAcl::check()` 和 `ServerPolicy`。
+
+### 7.8 Key 类型隔离是单向的
+
+- Application Key → Client API：`RequireClientApiKey` 中间件直接 403
+- Account Key → Application API：`AuthenticateApplicationUser` 检查 root_admin，通过后 `ApplicationApiRequest::authorize()` 直接放行
+
+这是**单向隔离**。
