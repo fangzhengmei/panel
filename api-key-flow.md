@@ -1022,3 +1022,386 @@ public function can($ability) { return false; }
 - Account Key → Application API：`AuthenticateApplicationUser` 检查 root_admin，通过后 `ApplicationApiRequest::authorize()` 直接放行
 
 这是**单向隔离**。
+
+---
+
+## 八、明文展示机制的代码级分析
+
+### 8.1 两种 Key 的明文生命周期对比
+
+结论先行：**Application Key 的明文并非"仅创建后可见"，而是创建者每次访问列表页都能看到。Client Key 的明文确实仅创建响应返回一次。** 这是一个容易误解的关键差异。
+
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│               Application Key (ptla_) 明文生命周期                      │
+├────────────────────────────────────────────────────────────────────────┤
+│                                                                        │
+│  KeyCreationService::handle()                                         │
+│    └─ $this->encrypter->encrypt(str_random(ApiKey::KEY_LENGTH))       │
+│       └─ 生成 32 字符随机明文 → Laravel encrypt() AES-256-CBC 加密    │
+│       └─ 加密密文写入 api_keys.token 列                                │
+│       └─ ⚠️ 明文变量在函数结束后丢弃，未向上层返回                      │
+│                                                                        │
+│  展示方式：列表页视图实时解密                                           │
+│    └─ resources/views/admin/api/index.blade.php:39                     │
+│       └─ {{ $key->identifier . decrypt($key->token) }}                │
+│       └─ 每次渲染页面时，对 token 列执行 decrypt() 解密                │
+│       └─ 条件：Auth::user()->is($key->user) → 仅创建者可见             │
+│                                                                        │
+│  ⚠️ 明文可反复查看：只要创建者登录管理后台访问列表页，                  │
+│     decrypt($key->token) 每次都能还原出完整的 32 字符明文               │
+│                                                                        │
+└────────────────────────────────────────────────────────────────────────┘
+
+┌────────────────────────────────────────────────────────────────────────┐
+│               Client Key (ptlc_) 明文生命周期                           │
+├────────────────────────────────────────────────────────────────────────┤
+│                                                                        │
+│  HasAccessTokens::createToken()                                        │
+│    └─ encrypt($plain = Str::random(ApiKey::KEY_LENGTH))               │
+│       └─ 生成 32 字符随机明文 $plain → encrypt() 加密                  │
+│       └─ 加密密文写入 api_keys.token 列                                │
+│    └─ return new NewAccessToken($token, $plain);                       │
+│       └─ ⭐ 明文 $plain 被包装进 NewAccessToken 对象向上层返回         │
+│                                                                        │
+│  ApiKeyController::store()                                             │
+│    └─ $token = $request->user()->createToken(...)                      │
+│    └─ ->addMeta(['secret_token' => $token->plainTextToken])            │
+│       └─ 明文作为 JSON meta 字段返回给前端                             │
+│       └─ ⭐ 这是明文最后一次出现在服务端响应中                         │
+│                                                                        │
+│  前端展示：ApiKeyModal 组件                                             │
+│    └─ resources/scripts/components/dashboard/ApiKeyModal.tsx           │
+│       └─ "Please store this in a safe location, it will not be        │
+│          shown again."                                                 │
+│       └─ setApiKey(`${key.identifier}${secretToken}`)                  │
+│       └─ 拼接 identifier + secretToken 作为完整 Key 展示               │
+│       └─ 关闭弹窗后 setApiKey('') → 明文从内存中清除                   │
+│                                                                        │
+│  列表查询：ApiKeyController::index()                                   │
+│    └─ ApiKeyTransformer::transform()                                   │
+│       └─ 只返回 identifier、description、allowed_ips、时间戳            │
+│       └─ ⚠️ 不返回 token，不返回 secret_token                          │
+│       └─ 没有任何端点可以再次获取明文                                   │
+│                                                                        │
+│  ✅ 明文确实仅可见一次：创建响应 + 弹窗展示，之后无法再获取             │
+│                                                                        │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+### 8.2 为什么 Application Key 能反复查看而 Client Key 不能？
+
+**根本原因在于 `KeyCreationService` 没有返回明文**。
+
+对比两种签发方式的核心差异：
+
+**Application Key — `KeyCreationService::handle()`**
+```php
+// app/Services/Api/KeyCreationService.php:43
+'token' => $this->encrypter->encrypt(str_random(ApiKey::KEY_LENGTH)),
+//         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+// str_random() 的返回值直接传给 encrypt()，没有赋值给变量
+// 明文在 encrypt() 调用后立即丢失，无法向上层传递
+```
+
+`handle()` 的返回值是 `ApiKey` 模型实例（`$this->repository->create()`），**不含明文**。控制器 `ApiController@store` 拿到 `ApiKey` 后直接重定向，明文在服务端已经不存在。
+
+但管理端列表页通过 `decrypt($key->token)` **实时解密**恢复明文。这是因为 Laravel 的 `encrypt()` 是对称加密（AES-256-CBC），只要有加密密钥（`APP_KEY`）就能解密。管理端视图在服务端执行，天然拥有解密能力。
+
+**Client Key — `HasAccessTokens::createToken()`**
+```php
+// app/Models/Traits/HasAccessTokens.php:37
+'token' => encrypt($plain = Str::random(ApiKey::KEY_LENGTH)),
+//                  ^^^^^ ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+//                  $plain 变量捕获了随机字符串的明文
+```
+
+这里使用了 PHP 的赋值表达式内嵌语法 `$plain = Str::random(...)`，`$plain` 捕获了明文并向上传递：
+
+```
+createToken() → NewAccessToken($token, $plain)
+  → ApiKeyController@store → $token->plainTextToken
+    → JSON meta.secret_token
+              → 前端 ApiKeyModal 展示
+```
+
+**Client API 的列表接口为什么不解密返回？**
+
+文件：`app/Transformers/Api/Client/ApiKeyTransformer.php:17-25`
+
+```php
+public function transform(ApiKey $model): array
+{
+    return [
+        'identifier' => $model->identifier,
+        'description' => $model->memo,
+        'allowed_ips' => $model->allowed_ips,
+        'last_used_at' => $model->last_used_at ? $model->last_used_at->toAtomString() : null,
+        'created_at' => $model->created_at->toAtomString(),
+    ];
+}
+```
+
+Transformer 返回的字段中**没有 `token`**（`ApiKey` 模型的 `$hidden = ['token']` 也阻止了序列化泄露），更没有 `decrypt($model->token)`。这是因为：
+
+1. Client API 是无状态的 REST 接口，面向第三方应用和前端 SPA
+2. 列表接口的消费者不是"Key 创建者本人"（请求可能来自任何持有有效 Token 的请求方）
+3. 如果列表接口返回解密后的明文，任何有权限调用列表接口的人都能看到所有 Key 的明文，这是严重的安全风险
+
+而管理端列表页是服务端渲染的 Blade 视图，运行在服务端，通过 `Auth::user()->is($key->user)` 严格限制只有创建者本人才能看到 `decrypt($key->token)`。
+
+### 8.3 明文可见性的安全边界
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│                    明文可见性矩阵                                 │
+├───────────────────────┬──────────────┬──────────────────────────┤
+│ 场景                   │ Application  │ Client                   │
+│                       │ Key (ptla_)  │ Key (ptlc_)              │
+├───────────────────────┼──────────────┼──────────────────────────┤
+│ 创建瞬间（服务端）     │ ⚠️ 丢失      │ ✅ 保留在 NewAccessToken │
+│ 创建响应               │ ❌ 不返回     │ ✅ meta.secret_token     │
+│ 管理端列表页（创建者） │ ✅ 可反复看   │ ❌ 不适用                 │
+│ 管理端列表页（他人）   │ ❌ identifier │ ❌ 不适用                 │
+│                       │    + ****    │                          │
+│ Client API 列表接口   │ ❌ 不适用     │ ❌ 不返回                 │
+│ ApiKey::findToken()   │ ✅ 可解密    │ ✅ 可解密（仅用于鉴权比对）│
+│ 数据库直接读取 token 列│ ✅ 可 decrypt│ ✅ 可 decrypt             │
+├───────────────────────┼──────────────┼──────────────────────────┤
+│ 整体安全性             │ 较弱         │ 较强                     │
+│ （明文获取难度）       │              │                          │
+└───────────────────────┴──────────────┴──────────────────────────┘
+```
+
+**`ApiKey::$hidden = ['token']`**（`app/Models/ApiKey.php:137`）确保了 `token` 列不会出现在 `toArray()` / `toJson()` 输出中。这防止了以下场景的意外泄露：
+
+- Client API 的 `ApiKeyTransformer` 不会泄露加密密文
+- 任何将 `ApiKey` 模型转为 JSON 的操作（如 API 响应）都不会包含 `token`
+
+但这**不能**防止管理端 Blade 视图中的 `decrypt($key->token)` 主动解密展示。
+
+---
+
+## 九、Sanctum 令牌模型与 key_type 分流机制
+
+### 9.1 Sanctum 如何接入 ApiKey 模型
+
+文件：`app/Providers/AuthServiceProvider.php:22`
+
+```php
+Sanctum::usePersonalAccessTokenModel(ApiKey::class);
+```
+
+这一行是整个体系的连接点。Sanctum 原本使用自己的 `PersonalAccessToken` 模型，Pterodactyl 将其替换为 `ApiKey`。这意味着：
+
+1. Sanctum Guard 在执行 `auth:sanctum` 时，会调用 `ApiKey::findToken()` 而非默认的 `PersonalAccessToken::findToken()`
+2. 认证成功后，`$request->user()->currentAccessToken()` 返回的是 `ApiKey` 实例
+3. `ApiKey` 模型必须实现 `Laravel\Sanctum\Contracts\HasAbilities` 接口（已实现，但 `can()` 始终返回 false）
+4. `ApiKey` 模型必须有 `tokenable()` 关系方法（已实现，返回 `$this->user()`）
+
+### 9.2 findToken() 的鉴权流程与 key_type 无关
+
+文件：`app/Models/ApiKey.php:200-210`
+
+```php
+public static function findToken(string $token): ?self
+{
+    $identifier = substr($token, 0, self::IDENTIFIER_LENGTH);
+    $model = static::where('identifier', $identifier)->first();
+    if (!is_null($model) && decrypt($model->token) === substr($token, strlen($identifier))) {
+        return $model;
+    }
+    return null;
+}
+```
+
+**关键发现**：`findToken()` **不检查 `key_type`**。它只做两件事：
+1. 用 `identifier`（前 16 字符）查表
+2. 解密 `token` 列并与请求中剩余部分比对
+
+这意味着无论是 `ptlc_`（TYPE_ACCOUNT）还是 `ptla_`（TYPE_APPLICATION）的 Key，都能通过 `auth:sanctum` 认证。**key_type 的分流不在 Sanctum 认证层，而在下游的分流中间件和 Request 层**。
+
+### 9.3 key_type 分流的三层检查点
+
+`key_type` 在三个不同的层级被检查，每层的作用不同：
+
+```
+请求通过 auth:sanctum（不检查 key_type）
+       │
+       ▼
+┌──────────────────────────────────────────────────────────────┐
+│ 第一层：中间件分流（决定请求能否进入对应的 API 路径）          │
+├──────────────────────────────────────────────────────────────┤
+│                                                              │
+│  /api/application 路径                                       │
+│    └─ AuthenticateApplicationUser                           │
+│       └─ 只检查 user->root_admin                             │
+│       └─ ⚠️ 不检查 key_type                                 │
+│       └─ TYPE_APPLICATION 和 TYPE_ACCOUNT 都能通过           │
+│                                                              │
+│  /api/client 路径                                            │
+│    └─ RequireClientApiKey                                    │
+│       └─ 检查 key_type === TYPE_APPLICATION → 403            │
+│       └─ ⚠️ 这是唯一在中间件层检查 key_type 的地方           │
+│       └─ TYPE_ACCOUNT 和 TransientToken 能通过               │
+│                                                              │
+└──────────────────────────────────────────────────────────────┘
+       │
+       ▼
+┌──────────────────────────────────────────────────────────────┐
+│ 第二层：Request 授权（决定请求能否访问特定资源）               │
+├──────────────────────────────────────────────────────────────┤
+│                                                              │
+│  ApplicationApiRequest::authorize()                          │
+│    ├─ TransientToken     → 放行                              │
+│    ├─ TYPE_ACCOUNT       → 放行（已由 root_admin 保证）       │
+│    └─ TYPE_APPLICATION   → AdminAcl::check(r_{resource})     │
+│       └─ ⭐ key_type 决定了是否需要 AdminAcl 细粒度校验      │
+│                                                              │
+│  ClientApiRequest::authorize()                               │
+│    └─ 不检查 key_type（由中间件层保证了不会有 TYPE_APPLICATION）│
+│    └─ 检查 ServerPolicy（Owner 或 Subuser 权限）              │
+│                                                              │
+└──────────────────────────────────────────────────────────────┘
+       │
+       ▼
+┌──────────────────────────────────────────────────────────────┐
+│ 第三层：Transformer 授权（决定关联资源能否被序列化）           │
+├──────────────────────────────────────────────────────────────┤
+│                                                              │
+│  BaseTransformer::authorize($resource)                       │
+│    ├─ TYPE_ACCOUNT     → 检查 user->root_admin               │
+│    └─ TYPE_APPLICATION → AdminAcl::check($token, $resource)  │
+│                                                              │
+│  BaseClientTransformer::authorize($ability, $server)         │
+│    └─ user()->can($ability, [$server])                       │
+│    └─ 不检查 key_type                                        │
+│                                                              │
+└──────────────────────────────────────────────────────────────┘
+```
+
+### 9.4 管理端签发结果如何接入两条 API 路径
+
+核心问题是：管理端通过 `KeyCreationService` 签发的 `TYPE_APPLICATION` Key，是如何被 Application API 和 Client API 两条路径分别接纳或拒绝的？
+
+**接入 Application API 路径**：
+
+```
+管理端签发 KeyCreationService::handle()
+  → 写入 api_keys 表，key_type = TYPE_APPLICATION
+  → 写入 r_servers/r_nodes/... 等 9 个权限列
+
+使用时：
+  Bearer ptla_xxxxxxxxxxxxxxyyyyyy...
+    → auth:sanctum → ApiKey::findToken() → 返回 ApiKey{key_type=2}
+    → AuthenticateApplicationUser → 检查 user->root_admin → 通过
+    → ApplicationApiRequest::authorize()
+      → key_type === TYPE_APPLICATION → AdminAcl::check()
+      → 读取 r_servers 等 9 个权限列 → 位运算校验 → 通过/拒绝
+```
+
+**被 Client API 路径拒绝**：
+
+```
+使用时：
+  Bearer ptla_xxxxxxxxxxxxxxyyyyyy...
+    → auth:sanctum → ApiKey::findToken() → 返回 ApiKey{key_type=2}
+    → RequireClientApiKey
+      → $token instanceof ApiKey → true
+      → $token->key_type === TYPE_APPLICATION → true
+      → 抛出 AccessDeniedHttpException → 403
+```
+
+**反向：Client Key 接入 Application API 路径**：
+
+```
+客户端签发 HasAccessTokens::createToken()
+  → 写入 api_keys 表，key_type = TYPE_ACCOUNT
+  → r_* 权限列全部为 0（NONE）
+
+使用时：
+  Bearer ptlc_xxxxxxxxxxxxxxyyyyyy...
+    → auth:sanctum → ApiKey::findToken() → 返回 ApiKey{key_type=1}
+    → AuthenticateApplicationUser → 检查 user->root_admin → 通过
+    → ApplicationApiRequest::authorize()
+      → key_type === TYPE_ACCOUNT → 直接放行（不检查 AdminAcl）
+      → ⚠️ 即使 r_* 权限列全为 0，也能访问所有 Application API 资源
+```
+
+### 9.5 key_type 分流的完整决策树
+
+```
+ApiKey::findToken($bearerToken)
+  │
+  ├─ 返回 null → 401 Unauthorized
+  │
+  └─ 返回 ApiKey 实例
+       │
+       ├─ key_type === TYPE_ACCOUNT (1, ptlc_)
+       │     │
+       │     ├─ /api/application 路径
+       │     │     ├─ AuthenticateApplicationUser: root_admin? → 否则 403
+       │     │     └─ ApplicationApiRequest::authorize()
+       │     │           └─ TYPE_ACCOUNT → 放行（不查 AdminAcl）
+       │     │                 → ⚠️ 拥有全部 Application API 权限
+       │     │
+       │     └─ /api/client 路径
+       │           ├─ RequireClientApiKey: 不是 TYPE_APPLICATION → 放行
+       │           └─ ClientApiRequest::authorize()
+       │                 └─ ServerPolicy 校验
+       │
+       ├─ key_type === TYPE_APPLICATION (2, ptla_)
+       │     │
+       │     ├─ /api/application 路径
+       │     │     ├─ AuthenticateApplicationUser: root_admin? → 否则 403
+       │     │     └─ ApplicationApiRequest::authorize()
+       │     │           └─ TYPE_APPLICATION → AdminAcl::check()
+       │     │                 → 读取 r_{resource} → 位运算校验
+       │     │
+       │     └─ /api/client 路径
+       │           └─ RequireClientApiKey: TYPE_APPLICATION → 403 ❌
+       │
+       └─ TransientToken（前端 SPA Cookie 认证）
+             │
+             ├─ /api/application 路径
+             │     ├─ AuthenticateApplicationUser: root_admin? → 否则 403
+             │     └─ ApplicationApiRequest::authorize()
+             │           └─ TransientToken → 放行
+             │
+             └─ /api/client 路径
+                   ├─ RequireClientApiKey: 不是 ApiKey 实例 → 放行
+                   └─ ClientApiRequest::authorize()
+                         └─ ServerPolicy 校验
+```
+
+### 9.6 identifier 前缀在分流中的作用
+
+文件：`app/Models/ApiKey.php:215-230`
+
+```php
+public static function getPrefixForType(int $type): string
+{
+    Assert::oneOf($type, [self::TYPE_ACCOUNT, self::TYPE_APPLICATION]);
+    return $type === self::TYPE_ACCOUNT ? 'ptlc_' : 'ptla_';
+}
+
+public static function generateTokenIdentifier(int $type): string
+{
+    $prefix = self::getPrefixForType($type);
+    return $prefix . Str::random(self::IDENTIFIER_LENGTH - strlen($prefix));
+}
+```
+
+`ptlc_` 和 `ptla_` 前缀占据了 `identifier` 的前 5 个字符（identifier 总长 16 字符）。**前缀仅用于人类可读性，不参与任何分流逻辑**。系统在所有分流点检查的是 `key_type` 数值字段（1 或 2），而非 identifier 的前缀字符串。
+
+但前缀有间接的安全价值：管理员在日志或数据库中看到 `ptla_` 前缀就能立刻识别这是 Application Key，不应在 Client API 中使用。`findToken()` 虽然不检查前缀，但前缀是 identifier 的一部分，用于查表定位。
+
+### 9.7 findToken() 为什么不检查 key_type？
+
+这是有意的设计选择。`findToken()` 的职责是**认证**（"这个 Token 有效吗？"），而非**授权**（"这个 Token 能访问什么？"）。将授权逻辑分离到中间件和 Request 层，使得：
+
+1. 认证层保持简洁，只做 Token 有效性验证
+2. 授权层可以根据路径（`/api/application` vs `/api/client`）灵活决定是否允许
+3. 同一个 Token 可以在不同路径上得到不同的授权结果（如 TYPE_ACCOUNT 在两条路径上都可使用）
+
+如果 `findToken()` 检查了 `key_type`，就会把授权逻辑混入认证层，违反关注点分离原则。
