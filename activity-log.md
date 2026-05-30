@@ -30,9 +30,51 @@
   前端 → 客户端 API 控制器 → QueryBuilder 分页 → Transformer 转换 → 页面渲染
 ```
 
-### 关键前提：/api/application 不产生 Activity 日志
+### 关键前提：/api/application 的日志来源边界
 
-**重要说明**：虽然 `/api/application` 路由经过 `api` 中间件组（含 TrackAPIKey），但经代码核实，**所有 Application API 控制器均不调用 `Activity::log()`**，因此不会产生任何 activity_logs 记录。文档中提到的"客户端 API"特指 `/api/client` 下产生日志的子路由。
+`/api/application` 路由的日志来源需区分两种情况：
+
+1. **控制器层**：所有 Application API 控制器均不调用 `Activity::log()`，因此不会主动产生业务操作日志。
+2. **中间件层**：`/api/application` 经过 `api` 中间件组（`Kernel.php:70-77`），其中包含 `AuthenticateIPAccess`。当请求因 IP 白名单拦截而被拒绝时，该中间件会写入 `auth:ip-blocked` 事件日志（见下方详细说明）。
+
+因此，`/api/application` 并非完全不产生 activity_logs 记录，而是仅在中间件拦截场景下产生 `auth:ip-blocked` 日志，控制器不会产生任何日志。文档中提到的"客户端 API"特指 `/api/client` 下产生日志的子路由。
+
+#### AuthenticateIPAccess 在 application 路由上的触发条件
+
+**文件**: `app/Http/Middleware/Api/AuthenticateIPAccess.php`
+
+**中间件执行位置**: `api` 中间件组第6位（`Kernel.php:76`），在 TrackAPIKey 之后执行。`/api/client` 和 `/api/application` 均经过此中间件。
+
+**触发条件**（三个条件同时满足）:
+1. 请求的认证 token 是 `ApiKey` 实例（非 `TransientToken` 会话认证）
+2. 该 ApiKey 设置了 `allowed_ips`（IP 白名单）且非空
+3. 请求来源 IP 不在白名单范围内
+
+**不触发的情况**:
+- 会话认证（`TransientToken`）：直接放行，不做 IP 检查
+- ApiKey 未设置 IP 白名单（`allowed_ips` 为 null 或空数组）：直接放行
+- ApiKey 设置了白名单且请求 IP 在白名单中：正常放行
+
+**日志写入的上下文来源** (`AuthenticateIPAccess.php:40-44`):
+```php
+Activity::event('auth:ip-blocked')
+    ->actor($request->user())         // 手动设置，取 AuthManager 已认证的 User
+    ->subject($request->user(), $token)  // 手动设置，两个 subject: User + ApiKey
+    ->property('identifier', $token->identifier)
+    ->log();
+```
+
+**上下文特征**:
+- `actor`: 由中间件手动调用 `->actor($request->user())` 设置，不依赖 LogTarget 预设（此时 AccountSubject/ServerSubject 尚未执行或不在中间件栈中）
+- `subject`: 由中间件手动调用 `->subject($request->user(), $token)` 设置，包含 User 和 ApiKey 两个主题
+- `api_key_id`: 从 `ActivityLogTargetableService::apiKeyId()` 获取，TrackAPIKey 在同一 `api` 中间件组中先于 AuthenticateIPAccess 执行，已设置 apiKeyId，因此此字段有值
+- `batch`: 通常为 null（不在批次事务中）
+- 触发 `ActivityLogged` 事件（通过 Eloquent `save()`）
+
+**在 /api/application 上的特殊性**:
+- `/api/application` 的 `application-api` 中间件组不含 AccountSubject/ServerSubject，LogTarget 的 actor/subject 不会被预设
+- 但 `auth:ip-blocked` 日志的 actor/subject 由 AuthenticateIPAccess 手动设置，因此不受此限制
+- 此日志的 subject 包含 ApiKey 模型实例，这是 activity_log_subjects 中少数以 ApiKey 作为 subject 的场景
 
 ### 三条路径的关键差异
 
@@ -259,13 +301,13 @@ protected $middlewareGroups = [
 ```
 
 **核心结论**:
-| 路由 | 中间件组 | TrackAPIKey | AccountSubject/ServerSubject | 产生 Activity 日志 |
-|------|---------|------------|-----------------------------|-------------------|
-| `/api/client/account/*` | `api` + `client-api` + 路由级 | ✅ | ✅ AccountSubject | ✅ |
-| `/api/client/servers/{server}/*` | `api` + `client-api` + 路由级 | ✅ | ✅ ServerSubject | ✅ |
-| `/api/client/`（根路由） | `api` + `client-api` | ✅ | ❌ | ❌ |
-| `/api/application/*` | `api` + `application-api` | ✅ | ❌ | ❌ |
-| `/api/remote/*` | `daemon` | ❌ | ❌ | ✅（部分控制器） |
+| 路由 | 中间件组 | TrackAPIKey | AccountSubject/ServerSubject | 控制器写日志 | 中间件写日志 |
+|------|---------|------------|-----------------------------|-------------|-------------|
+| `/api/client/account/*` | `api` + `client-api` + 路由级 | ✅ | ✅ AccountSubject | ✅ | ✅ AuthenticateIPAccess |
+| `/api/client/servers/{server}/*` | `api` + `client-api` + 路由级 | ✅ | ✅ ServerSubject | ✅ | ✅ AuthenticateIPAccess |
+| `/api/client/`（根路由） | `api` + `client-api` | ✅ | ❌ | ❌ | ✅ AuthenticateIPAccess |
+| `/api/application/*` | `api` + `application-api` | ✅ | ❌ | ❌ | ✅ AuthenticateIPAccess |
+| `/api/remote/*` | `daemon` | ❌ | ❌ | ✅（部分控制器） | ❌ |
 
 ### 4.1 TrackAPIKey - API 密钥追踪
 
@@ -335,7 +377,7 @@ Route::group([
   │     ├─ IsValidJson
   │     ├─ TrackAPIKey              → LogTarget::setApiKeyId(...)
   │     ├─ RequireTwoFactorAuthentication
-  │     └─ AuthenticateIPAccess     → Activity::event('auth:ip-blocked') (可选)
+  │     └─ AuthenticateIPAccess     → 若 IP 不在白名单，写入 auth:ip-blocked 后抛异常
   │
   ├─ 2. client-api 中间件组 (Kernel.php)
   │     ├─ SubstituteClientBindings
@@ -360,7 +402,7 @@ Route::group([
   │     ├─ IsValidJson
   │     ├─ TrackAPIKey              → LogTarget::setApiKeyId(...)
   │     ├─ RequireTwoFactorAuthentication
-  │     └─ AuthenticateIPAccess     → Activity::event('auth:ip-blocked') (可选)
+  │     └─ AuthenticateIPAccess     → 若 IP 不在白名单，写入 auth:ip-blocked 后抛异常
   │
   ├─ 2. client-api 中间件组 (Kernel.php)
   │     ├─ SubstituteClientBindings
@@ -374,6 +416,28 @@ Route::group([
   └─ 4. 控制器（PowerController、FileController、BackupController 等）
        └─ Activity::event('server:xxx')->log()
             → 从 LogTarget 读取预设的 actor / subject / apiKeyId
+```
+
+#### Application API 请求（管理员 API）
+
+```
+/api/application/...
+  │
+  ├─ 1. api 中间件组 (Kernel.php)
+  │     ├─ EnsureStatefulRequests
+  │     ├─ auth:sanctum             → 认证 User，设置 $request->user()
+  │     ├─ IsValidJson
+  │     ├─ TrackAPIKey              → LogTarget::setApiKeyId(...)
+  │     ├─ RequireTwoFactorAuthentication
+  │     └─ AuthenticateIPAccess     → 若 IP 不在白名单，写入 auth:ip-blocked 后抛异常
+  │                                    （此为 /api/application 唯一产生日志的路径）
+  │
+  ├─ 2. application-api 中间件组 (Kernel.php)
+  │     ├─ SubstituteBindings
+  │     └─ AuthenticateApplicationUser → 检查 root_admin，不写日志
+  │
+  └─ 3. 控制器（UserController、NodeController、ServerController 等）
+       └─ 不调用 Activity::log()，不产生业务操作日志
 ```
 
 #### Remote API 请求 (Wings 守护进程)
@@ -512,10 +576,10 @@ public function __invoke(ProvidedAuthenticationToken $event): void
 |------|---------------|------|
 | `LoginController.php:60` | `auth:checkpoint` | 2FA 验证检查点 |
 
-**客户端 API 安全拦截** (走 `api` 中间件组，经过 TrackAPIKey):
+**API 安全拦截 — IP 白名单** (走 `api` 中间件组，经过 TrackAPIKey，作用于 `/api/client` 和 `/api/application`):
 | 文件 | activity event | 说明 |
 |------|---------------|------|
-| `AuthenticateIPAccess.php:40` | `auth:ip-blocked` | API Key 的 IP 白名单拦截 |
+| `AuthenticateIPAccess.php:40` | `auth:ip-blocked` | API Key 的 IP 白名单拦截。actor/subject 由中间件手动设置，apiKeyId 由 TrackAPIKey 预设。此日志可能出现在 `/api/application` 路由上（控制器不写日志，但中间件拦截时写日志） |
 
 **Remote API (Wings)** (走 `daemon` 中间件组，不经过 TrackAPIKey):
 | 文件 | activity event | 说明 |
@@ -527,6 +591,73 @@ public function __invoke(ProvidedAuthenticationToken $event): void
 | `ServerDetailsController.php:118` | `server:backup.restore-failed` | 节点重置时恢复失败 |
 | `ActivityProcessingController.php` | 动态 `server:*` 事件 | Wings 推送的服务器活动日志 |
 
+### 5.4 中间件写入与控制器写入的场景覆盖分析
+
+Activity 日志的写入分为两个层次：中间件层和控制器层，各自覆盖不同的场景。
+
+#### 中间件层写入
+
+中间件在请求到达控制器之前执行，写入的日志均为**请求被拒绝**的场景：
+
+| 中间件 | 事件 | 触发条件 | 作用路由 | actor/subject 来源 | api_key_id |
+|--------|------|----------|----------|-------------------|-----------|
+| `AuthenticateIPAccess` | `auth:ip-blocked` | API Key 有 IP 白名单且请求 IP 不在白名单中 | `/api/client/*`、`/api/application/*` | 手动设置 actor=User, subject=User+ApiKey | 有值（TrackAPIKey 先执行） |
+
+**特征**:
+- 写入时机早于控制器，请求不会到达控制器（抛出 `AccessDeniedHttpException`）
+- actor 和 subject 由中间件手动调用 `->actor()` / `->subject()` 设置，不依赖 LogTarget 预设
+- 是 `/api/application` 路由上唯一产生日志的路径
+- 仅在使用 API Key 认证且配置了 IP 白名单时才可能触发
+
+#### 控制器层写入
+
+控制器在中间件全部通过后执行，写入的日志为**业务操作**场景：
+
+| 控制器类别 | 事件前缀 | 作用路由 | actor/subject 来源 | api_key_id |
+|-----------|---------|----------|-------------------|-----------|
+| 账户控制器 | `user:account.*` | `/api/client/account/*` | LogTarget（AccountSubject 预设） | 有值 |
+| 服务器控制器 | `server:*` | `/api/client/servers/{server}/*` | LogTarget（ServerSubject 预设） | 有值 |
+| Wings 远程回调 | `server:backup.*` 等 | `/api/remote/*` | 控制器手动设置 | null |
+| Application 控制器 | — | `/api/application/*` | — | —（不写日志） |
+
+**特征**:
+- 请求已通过所有中间件，业务逻辑正常执行
+- actor/subject 可以依赖 LogTarget（客户端 API）或手动设置（remote 路径）
+- `/api/application` 的控制器不写日志
+
+#### 事件监听器写入
+
+此外还有一类写入来自事件监听器，在认证事件发生时触发：
+
+| Listener | 事件 | 触发时机 | 中间件上下文 |
+|----------|------|----------|-------------|
+| `AuthenticationListener` | `auth:fail` / `auth:success` / `event:password-reset` | Laravel 认证事件 | 取决于请求路径，可能在任意中间件组中触发 |
+| `TwoFactorListener` | `auth:recovery-token` / `auth:token` | 2FA 验证事件 | 同上 |
+
+**特征**:
+- 不在中间件栈或控制器中直接调用，而是通过事件订阅机制间接触发
+- actor/subject 由 Listener 代码手动设置，不依赖 LogTarget 预设
+- 可能在 Web 认证流程、API 认证流程等多种场景下触发
+
+#### 三层写入的覆盖关系
+
+```
+请求进入
+  │
+  ├─ 中间件层（请求被拒绝时记录）
+  │     └─ AuthenticateIPAccess → auth:ip-blocked
+  │        （若触发，请求终止，不进入后续层）
+  │
+  ├─ 事件监听器层（认证事件触发时记录）
+  │     ├─ AuthenticationListener → auth:fail / auth:success / event:password-reset
+  │     └─ TwoFactorListener → auth:recovery-token / auth:token
+  │
+  └─ 控制器层（业务操作成功时记录）
+        ├─ /api/client/account/* → user:account.* 等事件
+        ├─ /api/client/servers/{server}/* → server:* 等事件
+        └─ /api/remote/* → server:backup.* 等事件
+```
+
 ## 六、日志写入完整路径
 
 ### 6.1 路径一：客户端 API — 通过 Activity Facade
@@ -535,9 +666,9 @@ public function __invoke(ProvidedAuthenticationToken $event): void
 - `/api/client/account/*`（经过 AccountSubject）
 - `/api/client/servers/{server}/*`（经过 ServerSubject）
 
-**不产生日志的路由**:
+**控制器不产生日志的路由**:
 - `/api/client` 根路由（`/` 和 `/permissions`）
-- `/api/application/*`（经 TrackAPIKey 但控制器不写日志）
+- `/api/application/*`（控制器不写日志，但 AuthenticateIPAccess 中间件在 IP 白名单拦截时写 `auth:ip-blocked` 日志）
 
 **中间件栈**: 
 - `api` 组（含 TrackAPIKey）→ `client-api` 组 → 路由级中间件（AccountSubject / ServerSubject）
@@ -774,9 +905,10 @@ return [
 
 **迁移**: `database/migrations/2022_06_18_112822_track_api_key_usage_for_activity_events.php`
 - 在 `activity_logs` 表添加 `api_key_id` unsignedInteger nullable 列
-- 仅经过 TrackAPIKey 且控制器调用 `Activity::log()` 的路径会填充此字段
-- 实际产生带 `api_key_id` 日志的路径：`/api/client/account/*` 和 `/api/client/servers/{server}/*`
-- `/api/application/*` 虽经 TrackAPIKey 但控制器不写日志，因此不会产生带 `api_key_id` 的记录
+- 仅经过 TrackAPIKey 且实际写入日志的路径会填充此字段
+- 控制器写入日志的路径：`/api/client/account/*` 和 `/api/client/servers/{server}/*` — api_key_id 有值（API Key 认证时）
+- 中间件写入日志的路径：`/api/client/*` 和 `/api/application/*` — `AuthenticateIPAccess` 写入 `auth:ip-blocked` 时，TrackAPIKey 已在同一中间件组中先执行，api_key_id 有值
+- `/api/application/*` 的控制器不写日志，但中间件拦截时会产生带 api_key_id 的 `auth:ip-blocked` 日志
 - Remote 路径（`/api/remote`）使用 `daemon` 中间件组，不含 TrackAPIKey，因此 `api_key_id` 始终为 null
 - 在 Transformer 中通过 `is_api` 字段暴露给前端
 
