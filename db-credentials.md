@@ -310,43 +310,99 @@ DatabasePasswordService::handle($database)
 
 ### 7.1 客户端数据库接口返回密码的真实条件
 
-密码返回有两个层级的控制条件，必须同时满足：
+密码是否返回由两个独立的层级共同决定：**Fractal include 机制**（决定是否调用 `includePassword` 方法）和**权限校验**（决定该方法是否返回实际密码）。
 
-#### 条件 1：API 层必须显式请求包含 `password`
+#### 层级 1：Fractal include 机制——决定是否触发 `includePassword` 方法
 
-- 创建数据库和轮换密码时，Controller 会主动调用 `parseIncludes(['password'])`，但列表查询时不会主动包含密码。
+`DatabaseTransformer` 声明了 `protected array $availableIncludes = ['password']`，这意味着 `password` 是一个**可选的** include 关系，默认不输出，只有被请求时才会触发 `includePassword` 方法。
+
+include 请求有两个独立的来源，两者取并集：
+
+**来源 A：请求查询参数 `?include=password`**
+
+`ApplicationApiController` 构造函数（`ApplicationApiController.php:28-35`）在每次请求时自动解析 URL 查询参数中的 `include` 值，并注入到 Fractal Manager 中：
+
+```php
+// ApplicationApiController.php:28-35（构造函数中，每个请求都会执行）
+$input = $this->request->input('include', []);
+$input = is_array($input) ? $input : explode(',', $input);
+
+$includes = (new Collection($input))->map(function ($value) {
+    return trim($value);
+})->filter()->toArray();
+
+$this->fractal->parseIncludes($includes);
+```
+
+这意味着客户端可以通过 URL 查询参数 `?include=password` 请求包含密码。前端代码正是利用了这条路径：
+
+```typescript
+// getServerDatabases.ts:21-25（列表查询时通过查询参数传递 include）
+export default (uuid: string, includePassword = true): Promise<ServerDatabase[]> => {
+    return new Promise((resolve, reject) => {
+        http.get(`/api/client/servers/${uuid}/databases`, {
+            params: includePassword ? { include: 'password' } : undefined,
+        })
+            // ...
+    });
+};
+
+// createServerDatabase.ts:7-14（创建数据库时也通过查询参数传递 include）
+http.post(
+    `/api/client/servers/${uuid}/databases`,
+    { database: data.databaseName, remote: data.connectionsFrom },
+    { params: { include: 'password' } },
+)
+```
+
+**来源 B：Controller 中链式调用 `->parseIncludes(['password'])`**
+
+`DatabaseController` 的 `store()` 和 `rotatePassword()` 方法在 Fractal 链式调用中显式指定了 `parseIncludes`：
 
 ```php
 // DatabaseController.php:64-67（创建数据库）
 return $this->fractal->item($database)
-    ->parseIncludes(['password'])  // 主动请求包含密码
+    ->parseIncludes(['password'])  // 链式调用中显式指定
     ->transformWith($this->getTransformer(DatabaseTransformer::class))
     ->toArray();
 
 // DatabaseController.php:83-86（轮换密码）
 return $this->fractal->item($database->refresh())
-    ->parseIncludes(['password'])  // 主动请求包含密码
+    ->parseIncludes(['password'])  // 链式调用中显式指定
     ->transformWith($this->getTransformer(DatabaseTransformer::class))
     ->toArray();
-
-// DatabaseController.php:36-40（列表查询）
-return $this->fractal->collection($server->databases)
-    ->transformWith($this->getTransformer(DatabaseTransformer::class))
-    ->toArray();  // 没有 parseIncludes，不会返回密码
 ```
 
-#### 条件 2：权限层检查 `database.view_password` 权限
+**来源 A 与来源 B 的合并行为**
 
-即使 API 层请求了 `include=password`，Transformer 还会做二次鉴权：
+Fractal Manager 的 `parseIncludes` 方法是**累加**的，而非覆盖。构造函数中通过来源 A 注入的 includes 与链式调用中来源 B 指定的 includes 会合并生效。因此：
+
+- 创建数据库 / 轮换密码：来源 B 已指定 `['password']`，无论请求参数如何，`includePassword` 方法都会被触发
+- 列表查询：没有来源 B，只有来源 A（请求参数 `?include=password`）可以触发 `includePassword`
+
+**三个接口的 include 来源汇总：**
+
+| 接口 | 来源 A（请求参数） | 来源 B（链式调用） | `includePassword` 是否触发 |
+|---|---|---|---|
+| `GET .../databases`（列表） | `?include=password` 可选 | 无 | 取决于请求参数 |
+| `POST .../databases`（创建） | `?include=password` 可选 | `->parseIncludes(['password'])` | **始终触发** |
+| `POST .../databases/{id}/rotate-password` | `?include=password` 可选 | `->parseIncludes(['password'])` | **始终触发** |
+
+#### 层级 2：权限校验——决定 `includePassword` 方法是否返回实际密码
+
+当 `includePassword` 方法被触发后，还需通过权限校验：
 
 ```php
 // DatabaseTransformer.php:54-65
 public function includePassword(Database $database): Item|NullResource
 {
     if (!$this->request->user()->can(Permission::ACTION_DATABASE_VIEW_PASSWORD, $database->server)) {
-        return $this->null();
+        return $this->null();  // 无权限 → 返回空，不泄露密码
     }
-    // ...
+
+    return $this->item($database, function (Database $model) {
+        return ['password' => $this->encrypter->decrypt($model->password)];
+    }, 'database_password');
 }
 ```
 
@@ -365,14 +421,27 @@ public function before(User $user, string $ability, Server $server): bool
 
 其中 `checkPermission` 方法签名为 `checkPermission(User $user, Server $server, string $permission)`，三个参数分别为：用户对象、服务器对象、权限字符串。
 
-**结论：**
+#### 最终判定条件总结
 
-| 用户类型 | 是否返回密码 | 原因 |
-|---|---|---|
-| `root_admin` | 是 | `ServerPolicy::before()` 直接返回 `true` |
-| 服务器所有者 | 是 | `ServerPolicy::before()` 直接返回 `true` |
-| 有 `database.view_password` 权限的子用户 | 是 | `checkPermission()` 返回 `true` |
-| 无 `database.view_password` 权限的子用户 | 否 | `checkPermission()` 返回 `false` |
+密码是否出现在 API 响应中，由以下逻辑链决定：
+
+```
+1. include 是否包含 'password'？
+   ├─ 否 → includePassword 不被调用 → 密码不返回
+   └─ 是 ↓
+2. 用户是否有 database.view_password 权限？
+   ├─ 否 → includePassword 返回 null → 密码不返回
+   └─ 是 → includePassword 返回解密后的密码 → 密码返回
+```
+
+**各用户类型在不同接口下的完整行为：**
+
+| 用户类型 | 列表查询（`GET`） | 创建（`POST`）| 轮换密码（`POST`）|
+|---|---|---|---|
+| `root_admin` | 带 `?include=password` 时返回密码 | 始终返回密码 | 始终返回密码 |
+| 服务器所有者 | 带 `?include=password` 时返回密码 | 始终返回密码 | 始终返回密码 |
+| 有 `database.view_password` 权限的子用户 | 带 `?include=password` 时返回密码 | 始终返回密码 | 始终返回密码 |
+| 无 `database.view_password` 权限的子用户 | 即使带 `?include=password` 也不返回 | 响应中 password 为 null | 响应中 password 为 null |
 
 ### 7.2 节点删除后 `node_id` 置空对主机分配路径的影响
 
