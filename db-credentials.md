@@ -388,16 +388,24 @@ Fractal Manager 的 `parseIncludes` 方法是**累加**的，而非覆盖。构�
 | `POST .../databases`（创建） | `?include=password` 可选 | `->parseIncludes(['password'])` | **始终触发** |
 | `POST .../databases/{id}/rotate-password` | `?include=password` 可选 | `->parseIncludes(['password'])` | **始终触发** |
 
-#### 层级 2：权限校验——决定 `includePassword` 方法是否返回实际密码
+#### 层级 2：权限校验——决定 `includePassword` 方法返回什么
 
-当 `includePassword` 方法被触发后，还需通过权限校验：
+当 `includePassword` 方法被触发后，还需通过权限校验。需要明确区分三个层级的概念：
+
+| 概念 | 类型 | 说明 |
+|---|---|---|
+| `NullResource` | Fractal 资源对象 | `League\Fractal\Resource\NullResource` 类的实例，表示"include 被请求但无数据返回" |
+| `null_resource` 序列化结构 | JSON 对象 | `PterodactylSerializer::null()` 输出的结构 `{"object": "null_resource", "attributes": null}` |
+| 密码字段最终值 | 前端字段值 | `data.relationships.password?.attributes?.password` 经过可选链解析后的结果 |
+
+**权限校验逻辑：**
 
 ```php
 // DatabaseTransformer.php:54-65
 public function includePassword(Database $database): Item|NullResource
 {
     if (!$this->request->user()->can(Permission::ACTION_DATABASE_VIEW_PASSWORD, $database->server)) {
-        return $this->null();  // 无权限 → 返回空，不泄露密码
+        return $this->null();  // 无权限 → 返回 NullResource 对象（不是 PHP null）
     }
 
     return $this->item($database, function (Database $model) {
@@ -406,7 +414,88 @@ public function includePassword(Database $database): Item|NullResource
 }
 ```
 
-权限判定逻辑在 `ServerPolicy.php:26-33`：
+`$this->null()` 继承自 Fractal 的 `TransformerAbstract` 基类，返回一个 `NullResource` 对象，**不是 PHP 的 `null`**。
+
+#### 序列化流程：`NullResource` → JSON 响应
+
+Fractal 检测到 `includePassword` 返回 `NullResource` 对象后，会调用 `PterodactylSerializer::null()` 方法进行序列化：
+
+```php
+// PterodactylSerializer.php:39-45
+public function null(): ?array
+{
+    return [
+        'object' => 'null_resource',
+        'attributes' => null,
+    ];
+}
+```
+
+然后通过 `mergeIncludes()` 方法将其放入 `relationships` 中：
+
+```php
+// PterodactylSerializer.php:50-57
+public function mergeIncludes(array $transformedData, array $includedData): array
+{
+    foreach ($includedData as $key => $datum) {
+        $transformedData['relationships'][$key] = $datum;
+    }
+    return $transformedData;
+}
+```
+
+**最终 JSON 响应结构对比：**
+
+| 场景 | `relationships.password` 的值 |
+|---|---|
+| 有权限 | `{"object": "database_password", "attributes": {"password": "明文密码"}}` |
+| 无权限 | `{"object": "null_resource", "attributes": null}` |
+
+注意：**无权限时 `relationships.password` 字段本身存在且是一个对象**，不是 `null`，只是其内部 `attributes` 为 `null`。
+
+#### 前端取值路径：`rawDataToServerDatabase`
+
+前端通过统一的转换函数处理 API 响应：
+
+```typescript
+// getServerDatabases.ts:12-19
+export const rawDataToServerDatabase = (data: any): ServerDatabase => ({
+    id: data.id,
+    name: data.name,
+    username: data.username,
+    connectionString: `${data.host.address}:${data.host.port}`,
+    allowConnectionsFrom: data.connections_from,
+    password: data.relationships.password?.attributes?.password,  // 可选链取值
+});
+
+// ServerDatabase 接口定义
+export interface ServerDatabase {
+    id: string;
+    name: string;
+    username: string;
+    connectionString: string;
+    allowConnectionsFrom: string;
+    password?: string;  // 可选字段，可能为 undefined
+}
+```
+
+**可选链解析过程（无权限场景）：**
+
+```
+data.relationships.password?.attributes?.password
+│                           │                    │
+│                           │                    └─ null?.password → 返回 undefined（可选链特性）
+│                           │
+│                           └─ 存在，但值为 null（来自 "attributes": null）
+│
+└─ 存在，是 {object: "null_resource", attributes: null} 对象
+```
+
+**最终结果**：前端 `password` 字段值为 `undefined`（TypeScript 可选字段的默认缺失值），**不是 `null`**。
+
+#### 权限判定逻辑补充
+
+`ServerPolicy.php:26-33`：
 
 ```php
 public function before(User $user, string $ability, Server $server): bool
@@ -427,21 +516,26 @@ public function before(User $user, string $ability, Server $server): bool
 
 ```
 1. include 是否包含 'password'？
-   ├─ 否 → includePassword 不被调用 → 密码不返回
+   ├─ 否 → includePassword 不被调用 → relationships.password 字段不存在
+   │                                       → 前端 password 为 undefined
    └─ 是 ↓
 2. 用户是否有 database.view_password 权限？
-   ├─ 否 → includePassword 返回 null → 密码不返回
-   └─ 是 → includePassword 返回解密后的密码 → 密码返回
+   ├─ 否 → includePassword 返回 NullResource 对象
+   │       → 序列化为 {"object": "null_resource", "attributes": null}
+   │       → 前端可选链解析为 undefined
+   └─ 是 → includePassword 返回 Item 对象
+           → 序列化为 {"object": "database_password", "attributes": {"password": "明文"}}
+           → 前端 password 为明文字符串
 ```
 
 **各用户类型在不同接口下的完整行为：**
 
 | 用户类型 | 列表查询（`GET`） | 创建（`POST`）| 轮换密码（`POST`）|
 |---|---|---|---|
-| `root_admin` | 带 `?include=password` 时返回密码 | 始终返回密码 | 始终返回密码 |
-| 服务器所有者 | 带 `?include=password` 时返回密码 | 始终返回密码 | 始终返回密码 |
-| 有 `database.view_password` 权限的子用户 | 带 `?include=password` 时返回密码 | 始终返回密码 | 始终返回密码 |
-| 无 `database.view_password` 权限的子用户 | 即使带 `?include=password` 也不返回 | 响应中 password 为 null | 响应中 password 为 null |
+| `root_admin` | 带 `?include=password` 时返回明文字符串 | 始终返回明文字符串 | 始终返回明文字符串 |
+| 服务器所有者 | 带 `?include=password` 时返回明文字符串 | 始终返回明文字符串 | 始终返回明文字符串 |
+| 有 `database.view_password` 权限的子用户 | 带 `?include=password` 时返回明文字符串 | 始终返回明文字符串 | 始终返回明文字符串 |
+| 无 `database.view_password` 权限的子用户 | 即使带 `?include=password`，前端 `password` 为 `undefined` | 前端 `password` 为 `undefined` | 前端 `password` 为 `undefined` |
 
 ### 7.2 节点删除后 `node_id` 置空对主机分配路径的影响
 
