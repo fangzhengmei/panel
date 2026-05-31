@@ -13,6 +13,7 @@
 3. [节点容量约束关系](#3-节点容量约束关系)
 4. [新建实例——端口/地址分配流程与冲突避免](#4-新建实例端口地址分配流程与冲突避免)
 5. [实例迁移——端口/地址再分配与冲突检测](#5-实例迁移端口地址再分配与冲突检测)
+   5.5 [迁移状态机与时序详解——目标分配被占用后的走向](#55-迁移状态机与时序详解目标分配被占用后的走向)
 6. [实例释放——端口/地址回收机制](#6-实例释放端口地址回收机制)
 7. [运行时分配变更——Build Modification 与用户自服务](#7-运行时分配变更build-modification-与用户自服务)
 8. [面板与守护层之间的协议](#8-面板与守护层之间的协议)
@@ -338,6 +339,173 @@ public function validateCurrentState() {
 
 `ServerStateConflictException` 返回 HTTP 409 Conflict，消息为 "This server is currently being transferred to a new machine, please try again later."
 
+### 5.5 迁移状态机与时序详解——目标分配被占用后的走向
+
+**核心发现：Wings notify 在数据库事务内调用。** 如果 HTTP 调用失败抛出异常，整个事务回滚——包括 ServerTransfer 记录和分配预占。这是一个"全部成功或全部失败"的原子操作边界。
+
+#### 5.5.1 完整时序与状态分支
+
+```
+初始状态（server_transfers 无 successful IS NULL 记录）
+    │
+    │ [管理员发起迁移]
+    ▼
+┌──────────────────────────────────────────────────────────────┐
+│  前置验证（事务外）                                           │
+│  1. allocation_id: unique:servers → 检查是否是其他服务器的默认分配 │
+│  2. allocation_id: exists:allocations → 检查分配记录是否存在     │
+│  3. Node.isViable(memory, disk) → 目标节点容量检查              │
+│  4. Server.validateTransferState() → 无活跃迁移                 │
+└──────────────────────────────┬─────────────────────────────────┘
+                               │
+                  ┌────────────┴────────────┐
+                  │ 验证失败                  │ 验证通过
+                  ▼                           ▼
+             重定向+错误提示          ┌──────────────────────────────────┐
+             【可直接重试】           │  启动数据库事务                │
+                                     │  ┌────────────────────────────┐ │
+                                     │  │ 1. INSERT server_transfers │ │
+                                     │  │    successful = NULL       │ │
+                                     │  └────────────────────────────┘ │
+                                     │  ┌────────────────────────────┐ │
+                                     │  │ 2. assignAllocationsToServ…│ │
+                                     │  │    查询 getUnassignedAlloc… │ │
+                                     │  │    不在列表中的 → 静默跳过   │ │
+                                     │  │    在列表中的 → UPDATE      │ │
+                                     │  │      server_id = server.id  │ │
+                                     │  └────────────────────────────┘ │
+                                     │  ┌────────────────────────────┐ │
+                                     │  │ 3. 生成 JWT (15分钟过期)   │ │
+                                     │  └────────────────────────────┘ │
+                                     │  ┌────────────────────────────┐ │
+                                     │  │ 4. Wings notify()          │ │
+                                     │  │    POST /api/servers/{uuid}/│ │
+                                     │  │    transfer                │ │
+                                     │  │    ⚠️ HTTP 请求在事务内!    │ │
+                                     │  └────────────────────────────┘ │
+                                     └─────────────────┬──────────────┘
+                                                       │
+                                      ┌────────────────┴─────────────────┐
+                                      │ Wings 异常（网络/5xx/超时等）      │ Wings 200 OK
+                                      ▼                                    ▼
+                                  事务自动回滚                          事务提交
+                                  ────────────                      ──────────────────
+                                  • ServerTransfer 回滚（无记录）         • ServerTransfer 持久化
+                                  • 分配 UPDATE 回滚（server_id 复原）    • 部分/全部分配已绑定 server_id
+                                  • JWT 作废（未被 Wings 接收）          • 服务器进入"迁移中"状态
+                                  • 【可直接重试】                         • Server::transfer() 非空
+                                                                           │
+                                                                           ▼
+                                                                   Wings 侧执行迁移流程
+                                                                   （归档 → 传输 → 恢复）
+                                                                           │
+                                                      ┌────────────────────┴────────────────────┐
+                                                      │ 迁移失败（任何阶段）                        │ 迁移成功
+                                                      ▼                                           ▼
+                                          POST /api/remote/servers/{uuid}/transfer/failure    POST /api/remote/servers/{uuid}/transfer/success
+                                          ──────────────────────────────────────────────      ────────────────────────────────────────────────
+                                          1. 认证：仅新旧节点可上报失败                              1. 认证：仅新节点可上报成功
+                                          2. 事务内：                                                  2. 事务内：
+                                             ServerTransfer.successful = false                            释放旧分配（server_id = NULL）
+                                          3. 事务内：                                                  更新 server.node_id = new_node
+                                             释放新节点预占分配：                                        更新 server.allocation_id = new_allocation
+                                             new_allocation + new_additional_allocations                ServerTransfer.successful = true
+                                             → server_id = NULL                                     3. 事务外：
+                                          4. 返回 204 No Content                                         尝试 DELETE 旧节点上的实例（异常仅记录日志）
+                                          • 旧分配仍绑定服务器（状态不变）                                • 返回 204 No Content
+                                          • 预占已清理                                                     旧节点上可能残留"幽灵实例"
+                                          • 【可直接重试】                                               • 【需要人工检查：旧节点清理结果】
+```
+
+#### 5.5.2 关键时序点的原子性分析
+
+| 操作 | 原子边界 | 失败影响 |
+|------|---------|---------|
+| ServerTransfer INSERT | 数据库事务 | 回滚，无残留 |
+| assignAllocationsToServer | 数据库事务 | 回滚，分配占用状态恢复 |
+| Wings notify | **在事务内同步调用** | 抛出异常 → 事务回滚，全部复原 |
+| 事务 COMMIT | 数据库事务 | 以上所有变更持久化 |
+| 迁移失败回调 | 独立数据库事务 | 只清理新节点预占，旧节点不受影响 |
+| 迁移成功回调 | 独立数据库事务 | 切换服务器绑定，随后的旧节点删除是"尽力而为" |
+
+**⚠️ 注意：事务内发起 HTTP 请求是反模式。** 如果 Wings 接收了请求但响应超时，会出现：
+- Panel 侧事务回滚（认为迁移未发起）
+- Wings 侧已收到迁移指令并执行
+→ **造成脑裂**，需要人工干预。
+
+#### 5.5.3 目标分配被占用的四种场景与可重试性
+
+根据 `assignAllocationsToServer()` 的静默跳过逻辑，目标分配被占用时走向分四种：
+
+**场景 A：默认分配（new_allocation）被占用**
+
+```php
+$unassigned = $this->allocationRepository->getUnassignedAllocationIds($node_id);
+if (!in_array($allocation_id, $unassigned)) {
+    continue;  // 静默跳过！
+}
+```
+
+- 状态走向：事务提交 → ServerTransfer 存在但默认分配未预占 → Wings 拉取配置时发现该分配 server_id ≠ 本服务器 → 迁移失败回调 → 释放新分配（但本来就没预占）→ successful = false
+- **可直接重试：是**
+- **判断依据：** 失败回调已执行（successful = false），新分配预占已清理，旧分配完好
+
+**场景 B：部分附加分配被占用（默认分配空闲）**
+
+- 状态走向：部分附加分配预占成功，部分跳过 → 事务提交 → Wings 收到迁移指令 → 实际可用分配比预期少 → 可能成功也可能失败（取决于 Egg 是否强制需要所有端口）
+- **可直接重试：需先检查 ServerTransfer.successful**
+  - successful = NULL：进行中，**不可重试**，等待回调或超时
+  - successful = false：已失败，**可重试**
+  - successful = true：已成功但分配缺失，**需要人工补充分配**
+- **判断依据：** `Server::transfer()` 关系是否非空（查询 successful IS NULL）
+
+**场景 C：Wings notify 超时后目标分配被他人抢占**
+
+- 状态走向：Panel 侧事务回滚（认为未发起）→ 管理员重试 → 第二次验证时发现分配已被占用 → 验证失败
+- **可直接重试：是（换其他分配）**
+- **判断依据：** 无 ServerTransfer 记录，可直接重新选择分配
+
+**场景 D：迁移成功后旧节点删除失败**
+
+```php
+// success() 回调中
+try {
+    $this->daemonServerRepository->setServer($server)->setNode($transfer->oldNode)->delete();
+} catch (DaemonConnectionException $exception) {
+    Log::warning($exception, ['transfer_id' => $server->transfer->id]);
+}
+```
+
+- 状态走向：Panel 侧已全部切换成功 → 旧节点 Wings 删除请求失败（仅记日志）→ 旧节点上残留"幽灵实例"
+- **可直接重试：否**
+- **需要人工干预：** 检查旧节点实例状态，手动删除
+- **判断依据：** ServerTransfer.successful = true，但旧节点 Wings 上仍有该 UUID 的实例
+
+#### 5.5.4 可重试 vs 需人工干预的判断矩阵
+
+| 状态（ServerTransfer + 分配绑定） | 可直接重试？ | 判断依据 | 操作建议 |
+|----------------------------------|------------|---------|---------|
+| **无 ServerTransfer 记录** | ✅ 是 | 上次事务回滚或从未发起 | 重新选择分配后重试 |
+| **successful = NULL + 所有新分配 server_id = 目标服务器** | ❌ 否 | 迁移正在 Wings 侧进行 | 等待回调（最长约30分钟，取决于 Wings 超时设置） |
+| **successful = NULL + 部分新分配 server_id 为 NULL** | ⚠️ 谨慎 | 预占不完整，可能 Wing 侧也会失败 | 建议等待失败回调，不要强制重试 |
+| **successful = false** | ✅ 是 | 失败回调已完成清理 | 更换分配后重试 |
+| **successful = true + 旧节点实例已删除** | ✅ 已完成 | 迁移全流程成功 | 无需操作 |
+| **successful = true + 旧节点实例仍存在** | ❌ 否 | Panel 侧成功但 Wings 侧残留 | 人工登录旧节点手动删除实例 |
+| **successful = NULL + 超过1小时无回调** | ⚠️ 需人工 | Wings 可能崩溃或网络中断，状态未知 | 检查两个节点的实例状态，手动设置 successful = false 并清理预占 |
+
+#### 5.5.5 超时无回调的手动恢复步骤
+
+当 `successful = NULL` 超过合理时间（如 1 小时）且无任何回调时：
+
+1. 检查源节点 Wings：`GET /api/servers/{uuid}` 是否存在，状态是否在迁移中
+2. 检查目标节点 Wings：`GET /api/servers/{uuid}` 是否存在
+3. 若两端都不存在或只有源节点存在：
+   - 手动执行 `UPDATE server_transfers SET successful = false WHERE id = ?`
+   - 手动释放新节点分配：`UPDATE allocations SET server_id = NULL WHERE id IN (新分配列表)`
+4. 若目标节点已存在：
+   - 视为成功，手动执行成功回调的 SQL 更新
+   - 手动从源节点删除实例
+
 ---
 
 ## 6. 实例释放端口/地址回收机制
@@ -507,37 +675,93 @@ Panel 与 Wings 之间采用 **最终一致性** 而非强一致性：
 
 ## 10. 风险点与改进建议
 
-### 10.1 迁移预占时的静默跳过
+### 10.1 迁移预占时的静默跳过（高风险）
 
-**问题：** `ServerTransferController::assignAllocationsToServer()` 中，如果目标分配已被占用，代码只是跳过而不报错。这可能导致迁移成功后服务器缺少预期的分配。
+**问题：** `ServerTransferController::assignAllocationsToServer()` 中，如果目标分配已被占用，代码只是 `continue` 跳过而不报错，且不影响事务提交。
 
-**建议：** 在预占阶段验证所有请求的分配均为空闲，若有已被占用者应提前失败。
+```php
+foreach ($allocations as $allocation) {
+    if (!in_array($allocation, $unassigned)) {
+        continue;  // 静默跳过！无日志、无错误、无回滚
+    }
+    $updateIds[] = $allocation;
+}
+```
 
-### 10.2 分配更新无乐观锁
+**后果：**
+- ServerTransfer 记录创建成功（`successful = NULL`），迁移进入"进行中"状态
+- 但部分或全部新分配实际上没有预占
+- Wings 拉取配置时可能发现分配不属于本服务器，触发失败回调
+- 如果是默认分配被跳过，Wings 侧必然失败
+- 如果是附加分配被跳过，取决于 Egg 是否需要该端口，可能静默成功但实际缺少端口
+
+**根本原因：** 验证规则 `unique:servers` 只检查该分配是否是其他服务器的**默认分配**，不检查它是否被其他服务器作为**附加分配**占用。
+
+**建议：**
+1. 在预占阶段验证所有请求的分配 `server_id IS NULL`
+2. 若有任何分配已被占用，抛出异常中断事务
+3. 错误信息应明确指出哪个分配已被哪个服务器占用
+
+---
+
+### 10.2 事务内发起 HTTP 请求（架构反模式）
+
+**问题：** `ServerTransferController::transfer()` 将 `DaemonTransferRepository::notify()` 放在数据库事务内调用。
+
+**时序风险：**
+1. Panel 发起 HTTP POST 到 Wings
+2. Wings 接收请求并开始处理
+3. 网络超时或 Wings 响应缓慢
+4. Panel 侧抛出 `DaemonConnectionException`
+5. 数据库事务回滚（Panel 认为迁移未发起）
+6. Wings 侧继续执行迁移流程（实际上已开始）
+
+**脑裂状态：**
+- Panel：无 ServerTransfer 记录，服务器仍在旧节点
+- Wings（新节点）：正在创建实例
+- Wings（旧节点）：收到迁移指令可能开始打包
+- 新分配：预占已回滚（释放）→ 可能被其他服务器抢走
+
+**建议：**
+1. 提交事务后再调用 Wings notify
+2. 若 notify 失败，启动补偿流程（后台 Job 异步清理 ServerTransfer 和预占）
+3. 增加幂等性：Wings 收到重复迁移指令时检查状态
+
+---
+
+### 10.3 分配更新无乐观锁
 
 **问题：** `storeAssignedAllocations()` 直接 `UPDATE allocations SET server_id = ? WHERE id IN (...)`，不检查 `server_id` 是否仍为 NULL。虽然前置验证步骤通常能捕获冲突，但在高并发场景下存在 TOCTOU（Time-of-check to time-of-use）竞态。
 
 **建议：** 将 UPDATE 条件改为 `WHERE id IN (...) AND server_id IS NULL`，并通过影响行数验证是否全部更新成功。
 
-### 10.3 自动部署的随机选择无排序保证
+---
+
+### 10.4 自动部署的随机选择无排序保证
 
 **问题：** `AllocationRepository::getRandomAllocation()` 使用 `inRandomOrder()->first()`，在高并发场景下多个请求可能选中同一分配后产生冲突。
 
 **建议：** 使用 `SELECT ... FOR UPDATE SKIP LOCKED`（MySQL 8.0+）或 `lockForUpdate()` 实现行级锁定后再选择。
 
-### 10.4 迁移成功后旧节点清理的容错
+---
+
+### 10.5 迁移成功后旧节点清理的容错
 
 **问题：** 迁移成功后删除旧节点上的实例如果失败，仅记录日志。旧节点上可能残留"幽灵实例"。
 
 **建议：** 增加定期清理任务或管理员工具，检测并清理无对应 Panel 记录的 Wings 实例。
 
-### 10.5 端口范围无节点级差异化配置
+---
+
+### 10.6 端口范围无节点级差异化配置
 
 **问题：** 用户自服务自动分配的端口范围是全局配置（`PTERODACTYL_CLIENT_ALLOCATIONS_RANGE_START/END`），不同节点无法设置不同范围。
 
 **建议：** 将端口范围配置下沉到节点级别，支持每个节点定义自己的可用端口池。
 
-### 10.6 节点容量检查的实时性
+---
+
+### 10.7 节点容量检查的实时性
 
 **问题：** `FindViableNodesService` 通过 `SUM(servers.memory)` 计算已分配资源，但这是 Panel 侧的静态值，不考虑 Wings 侧实际运行时的资源使用。
 
