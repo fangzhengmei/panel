@@ -16,6 +16,7 @@
    5.5.0 [两类占用来源的本质区别](#550-两类占用来源的本质区别前置知识)
    5.5.1 [类型 A：目标分配是其他服务器的默认分配](#551-类型-a目标分配是其他服务器的默认分配)
    5.5.2 [类型 B：目标分配是其他服务器的附加分配](#552-类型-b目标分配是其他服务器的附加分配)
+   5.5.2.1 [跨服务器分配释放 Bug 深度分析](#5521-跨服务器分配释放-bug-深度分析)
    5.5.6 [可重试 vs 需人工干预的判断矩阵](#556-可重试-vs-需人工干预的判断矩阵)
    5.5.8 [排障 SQL 查询速查表](#558-排障-sql-查询速查表)
 6. [实例释放——端口/地址回收机制](#6-实例释放端口地址回收机制)
@@ -397,34 +398,37 @@ public function validateCurrentState() {
 
 #### 5.5.2 类型 B：目标分配是其他服务器的附加分配
 
+> ⚠️ **严重风险：此场景存在跨服务器分配释放 bug，详见 5.5.2.1 节**
+
 ```
 初始状态：分配X是服务器S2的附加分配
   → servers 表中无 allocation_id = X 的记录
-  → allocations.server_id = S2.id
+  → allocations.server_id = S2.id  ❗ 属于S2，不是空闲分配
     │
     ▼
-管理员发起迁移，选择分配X
+管理员为S1发起迁移，选择分配X
     │
     ▼
 【校验阶段：通过】
   'unique:servers' → SELECT servers WHERE allocation_id = X → 0条 → 验证通过
   'exists:allocations' → 存在 → 通过
-  Node.isViable() → 通过
-  validateTransferState() → 无活跃迁移
+  ❗ 缺少检查：allocations.server_id IS NULL
     │
     ▼
 【启动数据库事务】
   ├─ 1. INSERT server_transfers (successful = NULL)
+  │    new_allocation = X, new_additional_allocations = [...]
   ├─ 2. assignAllocationsToServer()
   │    ├─ getUnassignedAllocationIds(node_id)
   │    │   → SELECT id FROM allocations WHERE server_id IS NULL AND node_id = ?
   │    │   → 分配X不在此列表中（server_id = S2.id）
   │    └─ foreach: if (!in_array(X, unassigned)) continue;
   │       → 静默跳过！无日志、无错误
+  │       → X.server_id 保持为 S2.id，未被预占
   ├─ 3. 生成 JWT (15分钟)
   └─ 4. Wings notify()
        │
-       ├─ 【Wings 异常】→ 事务回滚 → 同5.5.1时序
+       ├─ 【Wings 异常】→ 事务回滚 → 无影响
        └─ 【Wings 200 OK】→ 事务提交
              │
              ▼
@@ -434,37 +438,133 @@ public function validateCurrentState() {
         │  • successful = NULL          │
         │  • 分配X.server_id = S2.id    │
         │    (未被预占，仍属于S2)       │
-        │  • 服务器进入"迁移中"状态      │
+        │  • 分配Y（附加）.server_id=S1 │
+        │    (预占成功)                 │
+        │  • S1进入"迁移中"状态          │
         └───────────────┬───────────────┘
                         │
                         ▼
                   Wings 侧执行迁移
                   拉取 Panel 配置
+                  → 发现分配X.server_id = S2 ≠ S1
                         │
-          ┌─────────────┴─────────────┐
-          │ Wings 发现分配X不属于本服务器  │
-          ▼                             ▼
-      迁移失败回调                     迁移"成功"但配置错误
-      POST /transfer/failure           (取决于 Egg 是否严格校验)
+                        ▼
+                  迁移失败回调
+          POST /api/remote/servers/{uuid}/transfer/failure
+                        │
+                        ▼
+              ┌──────────────────────────┐
+              │ processFailedTransfer    │
+              │ 事务内：                  │
+              │  1. successful = false   │
+              │  2. 无条件执行：          │
+              │     UPDATE allocations   │
+              │     SET server_id = NULL │
+              │     WHERE id IN (X, Y)   │
+              │     ❗ 无 server_id 过滤！│
+              └───────────┬──────────────┘
+                          │
+           ┌──────────────┴───────────────┐
+           ▼                               ▼
+    分配X.server_id = NULL         分配Y.server_id = NULL
+    ❗ S2 失去了自己的附加分配！     ✅ 正确释放预占
+    【数据损坏：需人工恢复】         【正常回收】
           │                               │
           ▼                               ▼
-    ┌──────────────────────┐       服务器启动时缺少端口
-    │ 事务内：              │       需人工补充分配
-    │  successful = false  │
-    │  释放新分配预占       │
-    │  (但X本来就没预占)   │
-    └──────────┬───────────┘
-               │
-               ▼
-          【可直接重试：✅ 是】
-          更换分配后重新发起
+    【不可直接重试：❌ 否】         【更换分配后可重试】
+    需先恢复S2的分配归属             只需重新选分配
 ```
 
 **类型 B 判定清单：**
 - ❌ 校验阶段无错误，管理员看到"迁移已开始"成功提示
 - ⚠️ `server_transfers` 有记录（successful = NULL 或 false）
-- ⚠️ 需检查 `allocations.server_id` 是否确实被预占
-- ✅ 回调失败后（successful = false）可重试
+- ⚠️ 需检查 `allocations.server_id` 字段——可能发生跨服务器数据损坏
+- ⚠️ 失败回调后**不可直接重试**，必须先检查并恢复其他服务器的分配归属
+
+---
+
+##### 5.5.2.1 跨服务器分配释放 Bug 深度分析
+
+**问题代码：**
+```php
+// processFailedTransfer() 第118-128行
+protected function processFailedTransfer(ServerTransfer $transfer): JsonResponse {
+    $this->connection->transaction(function () use (&$transfer) {
+        $transfer->forceFill(['successful' => false])->saveOrFail();
+
+        // ⚠️ BUG: 无条件 UPDATE，不检查 server_id 归属
+        $allocations = array_merge([$transfer->new_allocation], $transfer->new_additional_allocations);
+        Allocation::query()->whereIn('id', $allocations)->update(['server_id' => null]);
+    });
+    return new JsonResponse([], Response::HTTP_NO_CONTENT);
+}
+```
+
+**攻击/故障路径：**
+1. 分配 X 属于 S2（附加分配）
+2. 管理员为 S1 选择 X 发起迁移
+3. 静默跳过预占（X 仍属于 S2）
+4. 迁移失败 → 回调执行 `UPDATE ... SET server_id = NULL WHERE id IN (X, ...)`
+5. **X.server_id 被设为 NULL → S2 丢失分配！**
+
+**影响范围：**
+- 所有被静默跳过的分配（因附加占用）都会被错误释放
+- 涉及的服务器会意外丢失端口绑定
+- 用户自服务无法感知，需管理员手动排查
+
+**类似问题也存在于成功回调：**
+```php
+// success() 第82、86行
+$allocations = array_merge([$transfer->old_allocation], $transfer->old_additional_allocations]);
+Allocation::query()->whereIn('id', $allocations)->update(['server_id' => null]);
+```
+如果迁移过程中旧分配被手动转移给其他服务器，也会被错误释放。
+
+**正确修复：**
+```php
+// 失败回调修复：只释放属于当前服务器的分配
+Allocation::query()
+    ->whereIn('id', $allocations)
+    ->where('server_id', $transfer->server_id)  // 增加归属检查
+    ->update(['server_id' => null]);
+
+// 成功回调修复：只释放属于当前服务器的旧分配
+Allocation::query()
+    ->whereIn('id', $old_allocations)
+    ->where('server_id', $server->id)           // 增加归属检查
+    ->update(['server_id' => null]);
+```
+
+---
+
+##### 5.5.2.2 类型 B 故障后的手动恢复步骤
+
+1. **立即检查损坏情况**
+   ```sql
+   -- 查找被错误释放的分配（属于其他服务器但被置空）
+   SELECT 
+     a.id, a.ip, a.port, a.server_id as current_server,
+     st.server_id as transfer_server,
+     st.new_allocation,
+     st.new_additional_allocations
+   FROM server_transfers st
+   JOIN allocations a ON a.id = st.new_allocation 
+      OR FIND_IN_SET(a.id, REPLACE(st.new_additional_allocations, ' ', ''))
+   WHERE st.successful = false
+     AND st.updated_at >= NOW() - INTERVAL 1 HOUR
+     AND a.server_id IS NULL;
+   ```
+
+2. **恢复分配归属**（需要知道原所属服务器 ID）
+   ```sql
+   UPDATE allocations 
+   SET server_id = 原所属服务器ID 
+   WHERE id = 被错误释放的分配ID;
+   ```
+
+3. **同步 Wings**：通知受影响的服务器所属节点重新拉取配置
+
+4. **检查其他影响**：查询同一时间段内是否有其他迁移也触发了此 bug
 
 ---
 
@@ -560,12 +660,12 @@ public function validateCurrentState() {
 
 #### 5.5.5 目标分配被占用的四类细分场景
 
-| 场景类型 | 占用来源 | 拦截时机 | 管理员感知 | 可重试？ |
-|---------|---------|---------|----------|---------|
-| **场景1** | 其他服务器的默认分配 | 校验阶段 `unique:servers` | 明确错误提示 | ✅ 是 |
-| **场景2** | 其他服务器的附加分配 | 事务内静默跳过 | 显示"迁移已开始" | ⚠️ 看回调结果 |
-| **场景3** | notify 超时后被抢占 | 重试时校验失败 | 第二次重试才报错 | ✅ 换分配 |
-| **场景4** | 无占用（正常流程） | - | 正常进行 | - |
+| 场景类型 | 占用来源 | 拦截时机 | 管理员感知 | 可重试？ | 数据风险 |
+|---------|---------|---------|----------|---------|---------|
+| **场景1** | 其他服务器的默认分配 | 校验阶段 `unique:servers` | 明确错误提示 | ✅ 是 | 无 |
+| **场景2** | 其他服务器的附加分配 | 事务内静默跳过 | 显示"迁移已开始" | ❌ **否** | ⚠️ **高风险：跨服务器释放** |
+| **场景3** | notify 超时后被抢占 | 重试时校验失败 | 第二次重试才报错 | ✅ 换分配 | 低 |
+| **场景4** | 无占用（正常流程） | - | 正常进行 | - | 无 |
 
 **场景1（类型A）：默认分配被占用 → 校验拦截**
 ```
@@ -578,9 +678,9 @@ unique:servers 校验失败
 ✅ 无数据库变更 → 直接换分配重试
 ```
 
-**场景2（类型B）：附加分配被占用 → 静默跳过**
+**场景2（类型B）：附加分配被占用 → 静默跳过 + 跨服务器释放 Bug**
 ```
-管理员选分配X（S2的附加分配）
+管理员选分配X（S2的附加分配，X.server_id = S2.id）
     ↓
 unique:servers 校验通过（只查默认分配）
     ↓
@@ -588,11 +688,15 @@ unique:servers 校验通过（只查默认分配）
     ↓
 Wings notify 成功 → 事务提交
     ↓
-Wings拉配置发现X不属于本服务器 → 失败回调
+Wings拉配置发现X.server_id = S2 ≠ S1 → 失败回调
     ↓
-successful = false，预占释放
+processFailedTransfer 无条件执行：
+  UPDATE allocations SET server_id = NULL WHERE id IN (X, ...)
     ↓
-✅ 更换分配后可重试
+├─ X.server_id = NULL ❗ S2 丢失了自己的分配！
+└─ 其他预占分配正常释放
+    ↓
+❌ 不可直接重试！需先恢复 S2 的分配归属
 ```
 
 **场景3：notify 超时脑裂后分配被抢**
@@ -610,16 +714,17 @@ Panel事务回滚（认为未发起）
 
 #### 5.5.6 可重试 vs 需人工干预的判断矩阵
 
-| 状态（ServerTransfer + 分配绑定） | 可直接重试？ | 判断依据 | 操作建议 |
-|----------------------------------|------------|---------|---------|
-| **无 ServerTransfer 记录 + 有错误提示** | ✅ 是 | 类型A场景，校验阶段拦截 | 重新选择分配后重试 |
-| **无 ServerTransfer 记录 + 无错误提示** | ⚠️ 谨慎 | 可能是notify超时脑裂 | 检查 Wings 两侧是否有实例残留 |
-| **successful = NULL + 所有新分配 server_id = 目标服务器** | ❌ 否 | 迁移正在 Wings 侧进行 | 等待回调（最长约30分钟） |
-| **successful = NULL + 部分新分配 server_id 为 NULL** | ⚠️ 谨慎 | 类型B场景，预占不完整 | 建议等待失败回调，不要强制重试 |
-| **successful = false** | ✅ 是 | 失败回调已完成清理 | 更换分配后重试 |
-| **successful = true + 旧节点实例已删除** | ✅ 已完成 | 迁移全流程成功 | 无需操作 |
-| **successful = true + 旧节点实例仍存在** | ❌ 否 | Panel侧成功但Wings侧残留 | 人工登录旧节点手动删除实例 |
-| **successful = NULL + 超过1小时无回调** | ❌ 需人工 | Wings可能崩溃或网络中断 | 检查两端状态后手动清理 |
+| 状态（ServerTransfer + 分配绑定） | 可直接重试？ | 判断依据 | 数据风险 | 操作建议 |
+|----------------------------------|------------|---------|---------|---------|
+| **无记录 + 有错误提示** | ✅ 是 | 类型A场景，校验阶段拦截 | 无 | 重新选择分配后重试 |
+| **无记录 + 无错误提示** | ⚠️ 谨慎 | 可能是notify超时脑裂 | 低 | 先检查 Wings 两侧是否有实例残留 |
+| **successful=NULL + 所有新分配server_id=本服务器** | ❌ 否 | 迁移正在 Wings 侧进行 | 无 | 等待回调（最长约30分钟） |
+| **successful=NULL + 部分新分配server_id≠本服务器** | ⚠️ 谨慎 | 类型B场景，预占不完整 | ⚠️ **高** | 等待失败回调，**不要强制重试**，回调后需检查其他服务器分配是否被误释放 |
+| **successful=false + 无其他服务器受影响** | ✅ 是 | 正常失败，回调完成清理 | 无 | 更换分配后重试 |
+| **successful=false + 存在其他服务器分配被置空** | ❌ **否** | 触发了跨服务器释放 Bug | ⚠️ **已发生数据损坏** | **必须先恢复受影响服务器的分配归属，再重试** |
+| **successful=true + 旧节点实例已删除** | ✅ 已完成 | 迁移全流程成功 | 无 | 无需操作 |
+| **successful=true + 旧节点实例仍存在** | ❌ 否 | Panel侧成功但Wings侧残留 | 低 | 人工登录旧节点手动删除实例 |
+| **successful=NULL + 超过1小时无回调** | ❌ 需人工 | Wings可能崩溃或网络中断 | ⚠️ **未知** | 检查两端状态后手动清理，特别检查是否有分配被错误释放 |
 
 #### 5.5.7 超时无回调的手动恢复步骤
 
@@ -688,19 +793,49 @@ LEFT JOIN servers s ON a.server_id = s.id
 WHERE st.id = 迁移记录ID;
 ```
 
-**查询4：一键清理失败迁移残留**
+**查询4：排查跨服务器释放 Bug（紧急！每次迁移失败后必查）**
+```sql
+-- 查找最近1小时内失败迁移可能错误释放的分配
+SELECT 
+  st.id as transfer_id,
+  st.server_id as transfer_server_id,
+  s_transfer.name as transfer_server_name,
+  a.id as allocation_id,
+  a.ip,
+  a.port,
+  a.server_id as current_server_id,
+  COALESCE(s_current.name, 'NULL (已被释放)') as current_server_name,
+  '⚠️ 可能被错误释放' as warning
+FROM server_transfers st
+JOIN allocations a ON a.id = st.new_allocation 
+   OR FIND_IN_SET(a.id, REPLACE(st.new_additional_allocations, ' ', ''))
+LEFT JOIN servers s_transfer ON st.server_id = s_transfer.id
+LEFT JOIN servers s_current ON a.server_id = s_current.id
+WHERE st.successful = false
+  AND st.updated_at >= NOW() - INTERVAL 1 HOUR
+  AND (a.server_id IS NULL OR a.server_id != st.server_id);
+```
+
+**查询5：一键清理超时失败迁移残留（⚠️ 先修复 10.0 的 Bug 再使用！）**
 ```sql
 -- 先查询确认
 SELECT id, new_allocation, new_additional_allocations
 FROM server_transfers
 WHERE successful IS NULL AND created_at < NOW() - INTERVAL 1 HOUR;
 
--- 批量标记为失败
+-- 批量标记为失败（修复 Bug 后可安全使用）
 UPDATE server_transfers 
 SET successful = false
 WHERE successful IS NULL AND created_at < NOW() - INTERVAL 1 HOUR;
 
--- 批量释放预占（需要配合失败回调的分配列表）
+-- 手动安全释放预占（只释放属于当前服务器的分配）
+UPDATE allocations a
+JOIN server_transfers st ON a.id = st.new_allocation 
+   OR FIND_IN_SET(a.id, REPLACE(st.new_additional_allocations, ' ', ''))
+SET a.server_id = NULL
+WHERE st.successful = false
+  AND st.updated_at >= NOW() - INTERVAL 1 HOUR
+  AND a.server_id = st.server_id;  -- 关键：只释放属于当前服务器的！
 ```
 
 ---
@@ -852,25 +987,78 @@ Panel 与 Wings 之间采用 **最终一致性** 而非强一致性：
 
 ## 9. 冲突检测与回滚路径汇总
 
-| 场景 | 冲突检测机制 | 回滚路径 |
-|------|-------------|---------|
-| **批量注册端口** | `INSERT IGNORE` + UNIQUE KEY `(node_id, ip, port)` | 静默跳过已存在端口 |
-| **手动指定分配创建实例** | `allocation_id UNIQUE on servers` 验证规则 | 事务回滚 |
-| **自动部署选择分配** | `WHERE server_id IS NULL` + dedicated IP 过滤 | 无可用节点/分配时抛 NoViableNodeException / NoViableAllocationException |
-| **创建实例后Wings失败** | `DaemonConnectionException` 捕获 | `ServerDeletionService::withForce()` 全量清理 |
-| **迁移发起——目标分配被占用** | `getUnassignedAllocationIds()` 检查 | 静默跳过已占用分配（⚠️潜在问题） |
-| **迁移失败** | Wings 主动上报 `transfer/failure` | 释放新节点预占分配，旧分配不变 |
-| **迁移成功** | 新节点Wings上报 `transfer/success` | 释放旧节点分配，从旧节点删除实例 |
-| **迁移中状态保护** | `Server::validateCurrentState()` | 返回 HTTP 409，阻止并发操作 |
-| **删除实例** | 外键 `ON DELETE SET NULL` | MySQL自动将 `server_id` 置 NULL |
-| **添加分配（Build修改）** | `WHERE server_id IS NULL AND node_id = ?` | 只更新空闲分配，已占用的自然被排除 |
-| **删除默认分配** | 检查是否有新分配可回退 | 抛出 DisplayException 阻止操作 |
-| **用户自服务分配** | `lockForUpdate()` 行级排他锁 | 事务内锁定，防止并发绑定 |
-| **Wings同步失败** | `DaemonConnectionException` 捕获 | 仅记录日志，依赖 Wings 下次启动自愈 |
+| 场景 | 冲突检测机制 | 回滚路径 | 风险等级 |
+|------|-------------|---------|---------|
+| **批量注册端口** | `INSERT IGNORE` + UNIQUE KEY `(node_id, ip, port)` | 静默跳过已存在端口 | 低 |
+| **手动指定分配创建实例** | `allocation_id UNIQUE on servers` 验证规则 | 事务回滚 | 低 |
+| **自动部署选择分配** | `WHERE server_id IS NULL` + dedicated IP 过滤 | 无可用节点/分配时抛 NoViableNodeException / NoViableAllocationException | 中 |
+| **创建实例后Wings失败** | `DaemonConnectionException` 捕获 | `ServerDeletionService::withForce()` 全量清理 | 中 |
+| **迁移发起——目标分配是其他服务器的默认分配** | `unique:servers` 验证规则 | 校验阶段拦截，无数据库变更 | 低 |
+| **迁移发起——目标分配是其他服务器的附加分配** | `getUnassignedAllocationIds()` 检查 | 静默跳过（⚠️ 有严重副作用） | 🔴 **严重** |
+| **迁移失败回调释放分配** | 无归属检查 | ⚠️ **无条件释放！会误删其他服务器的分配** | 🔴 **严重** |
+| **迁移成功回调释放旧分配** | 无归属检查 | ⚠️ **无条件释放！迁移中被转移的分配会被误删** | 中 |
+| **迁移成功** | 新节点Wings上报 `transfer/success` | 释放旧节点分配，从旧节点删除实例 | 低 |
+| **迁移中状态保护** | `Server::validateCurrentState()` | 返回 HTTP 409，阻止并发操作 | 低 |
+| **删除实例** | 外键 `ON DELETE SET NULL` | MySQL自动将 `server_id` 置 NULL | 低 |
+| **添加分配（Build修改）** | `WHERE server_id IS NULL AND node_id = ?` | 只更新空闲分配，已占用的自然被排除 | 低 |
+| **删除默认分配** | 检查是否有新分配可回退 | 抛出 DisplayException 阻止操作 | 低 |
+| **用户自服务分配** | `lockForUpdate()` 行级排他锁 | 事务内锁定，防止并发绑定 | 低 |
+| **Wings同步失败** | `DaemonConnectionException` 捕获 | 仅记录日志，依赖 Wings 下次启动自愈 | 低 |
+
+> **🔴 严重风险说明：** 当目标分配是其他服务器的附加分配时，`assignAllocationsToServer()` 静默跳过预占，但 `processFailedTransfer()` 仍会**无条件**将该分配的 `server_id` 置空，导致**其他服务器意外丢失端口绑定**。详见 5.5.2.1 和 10.0 节。
 
 ---
 
 ## 10. 风险点与改进建议
+
+### 10.0 迁移失败回调无条件释放分配（严重数据损坏 Bug）
+
+**问题等级：🔴 严重 - 会导致跨服务器数据损坏**
+
+**问题代码位置：** `app/Http/Controllers/Api/Remote/Servers/ServerTransferController.php:118-128`
+
+**问题描述：** `processFailedTransfer()` 在释放新分配预占时，没有检查 `server_id` 归属，无条件地将 `new_allocation` 和 `new_additional_allocations` 列表中的所有分配的 `server_id` 置为 NULL。
+
+```php
+// ⚠️ BUG: 无条件 UPDATE，不检查 server_id 归属
+$allocations = array_merge([$transfer->new_allocation], $transfer->new_additional_allocations);
+Allocation::query()->whereIn('id', $allocations)->update(['server_id' => null]);
+```
+
+**触发条件：**
+1. 目标分配是其他服务器的**附加分配**（`allocations.server_id = 其他服务器ID` 但 `servers.allocation_id ≠ 该分配ID`）
+2. `assignAllocationsToServer()` 静默跳过该分配（不预占）
+3. 迁移失败触发失败回调
+
+**后果：**
+- 其他服务器的附加分配被错误释放（`server_id` 设为 NULL）
+- 受影响的服务器意外丢失端口绑定
+- 用户无法感知，需管理员手动排查恢复
+- 属于**静默数据损坏**，没有任何错误日志或告警
+
+**类似问题也存在于成功回调：** `success()` 第82、86行释放旧分配时同样没有 `server_id` 检查。
+
+**紧急修复：**
+```php
+// 失败回调修复
+Allocation::query()
+    ->whereIn('id', $allocations)
+    ->where('server_id', $transfer->server_id)  // 只释放属于当前服务器的分配
+    ->update(['server_id' => null]);
+
+// 成功回调修复
+Allocation::query()
+    ->whereIn('id', $old_allocations)
+    ->where('server_id', $server->id)           // 只释放属于当前服务器的旧分配
+    ->update(['server_id' => null]);
+```
+
+**临时缓解措施（修复前）：**
+1. 禁止迁移功能或严格审查每次迁移的分配选择
+2. 每次迁移失败后立即运行 5.5.8 节中的排查 SQL
+3. 建立定时任务监控 `allocations.server_id` 异常变更
+
+---
 
 ### 10.1 迁移预占时的静默跳过（高风险）
 
@@ -889,8 +1077,7 @@ foreach ($allocations as $allocation) {
 - ServerTransfer 记录创建成功（`successful = NULL`），迁移进入"进行中"状态
 - 但部分或全部新分配实际上没有预占
 - Wings 拉取配置时可能发现分配不属于本服务器，触发失败回调
-- 如果是默认分配被跳过，Wings 侧必然失败
-- 如果是附加分配被跳过，取决于 Egg 是否需要该端口，可能静默成功但实际缺少端口
+- **结合 10.0 的 Bug，会导致其他服务器的分配被错误释放**
 
 **根本原因：** 验证规则 `unique:servers` 只检查该分配是否是其他服务器的**默认分配**，不检查它是否被其他服务器作为**附加分配**占用。
 
@@ -898,6 +1085,7 @@ foreach ($allocations as $allocation) {
 1. 在预占阶段验证所有请求的分配 `server_id IS NULL`
 2. 若有任何分配已被占用，抛出异常中断事务
 3. 错误信息应明确指出哪个分配已被哪个服务器占用
+4. **必须与 10.0 的修复同时实施**
 
 ---
 
@@ -926,7 +1114,7 @@ foreach ($allocations as $allocation) {
 
 ---
 
-### 10.3 分配更新无乐观锁
+### 10.4 分配更新无乐观锁
 
 **问题：** `storeAssignedAllocations()` 直接 `UPDATE allocations SET server_id = ? WHERE id IN (...)`，不检查 `server_id` 是否仍为 NULL。虽然前置验证步骤通常能捕获冲突，但在高并发场景下存在 TOCTOU（Time-of-check to time-of-use）竞态。
 
@@ -934,7 +1122,7 @@ foreach ($allocations as $allocation) {
 
 ---
 
-### 10.4 自动部署的随机选择无排序保证
+### 10.5 自动部署的随机选择无排序保证
 
 **问题：** `AllocationRepository::getRandomAllocation()` 使用 `inRandomOrder()->first()`，在高并发场景下多个请求可能选中同一分配后产生冲突。
 
@@ -942,7 +1130,7 @@ foreach ($allocations as $allocation) {
 
 ---
 
-### 10.5 迁移成功后旧节点清理的容错
+### 10.6 迁移成功后旧节点清理的容错
 
 **问题：** 迁移成功后删除旧节点上的实例如果失败，仅记录日志。旧节点上可能残留"幽灵实例"。
 
@@ -950,7 +1138,7 @@ foreach ($allocations as $allocation) {
 
 ---
 
-### 10.6 端口范围无节点级差异化配置
+### 10.7 端口范围无节点级差异化配置
 
 **问题：** 用户自服务自动分配的端口范围是全局配置（`PTERODACTYL_CLIENT_ALLOCATIONS_RANGE_START/END`），不同节点无法设置不同范围。
 
@@ -958,7 +1146,7 @@ foreach ($allocations as $allocation) {
 
 ---
 
-### 10.7 节点容量检查的实时性
+### 10.8 节点容量检查的实时性
 
 **问题：** `FindViableNodesService` 通过 `SUM(servers.memory)` 计算已分配资源，但这是 Panel 侧的静态值，不考虑 Wings 侧实际运行时的资源使用。
 
