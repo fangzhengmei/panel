@@ -1,309 +1,286 @@
-# Pterodactyl Panel 控制台命令与电源动作 — 代码走向分析
+# Pterodactyl Panel 控制台命令与电源动作 — 代码走向全链路分析
 
-> **范围说明**：本仓库仅包含 **Panel**（PHP Laravel + React 前端）代码，不包含 Wings（Go 守护进程）。因此，文档将严格分为两部分：
-> - ✅ **Panel 可证实**：仓库内有对应代码，引用具体文件/行号
-> - ⚠️ **Wings 侧推断**：Panel 调用协议暗示的行为，无本地代码佐证，仅供参考
-
-## 0. 目录
-
-- [1. 架构概览（Panel 可证实部分）](#1-架构概览panel-可证实部分)
-- [2. 前端：电源按钮与命令输入框](#2-前端电源按钮与命令输入框)
-  - [2.1 电源按钮：PowerButtons.tsx](#21-电源按钮powerbuttonstsx)
-  - [2.2 命令输入框：Console.tsx](#22-命令输入框consoletsx)
-  - [2.3 前端 WebSocket 封装](#23-前端-websocket-封装)
-  - [2.4 WebSocket Token 获取与刷新](#24-websocket-token-获取与刷新)
-  - [2.5 前端状态模型（ServerStatus vs Server.status）](#25-前端状态模型serverstatus-vs-serverstatus)
-- [3. Panel 后端：路由注册与中间件管道](#3-panel-后端路由注册与中间件管道)
-  - [3.1 路由入口](#31-路由入口)
-  - [3.2 中间件栈](#32-中间件栈)
-- [4. 节流策略（Panel 可证实）](#4-节流策略panel-可证实)
-  - [4.1 全局限流](#41-全局限流)
-  - [4.2 资源级限流（仅 WebSocket）](#42-资源级限流仅-websocket)
-  - [4.3 前端 UI 防重](#43-前端-ui-防重)
-- [5. 白名单与语义鉴别（Panel 可证实）](#5-白名单与语义鉴别panel-可证实)
-  - [5.1 电源动作白名单](#51-电源动作白名单)
-  - [5.2 控制台命令白名单](#52-控制台命令白名单)
-  - [5.3 调度任务白名单](#53-调度任务白名单)
-- [6. 权限鉴权模型（Panel 可证实）](#6-权限鉴权模型panel-可证实)
-  - [6.1 请求层权限解析](#61-请求层权限解析)
-  - [6.2 权限判定策略（ServerPolicy）](#62-权限判定策略serverpolicy)
-  - [6.3 服务器状态门禁（AuthenticateServerAccess）](#63-服务器状态门禁authenticateserveraccess)
-- [7. Panel → Wings：REST HTTP 调用链（Panel 可证实）](#7-panel--wingsrest-http-调用链panel-可证实)
-  - [7.1 DaemonRepository 基类](#71-daemonrepository-基类)
-  - [7.2 DaemonPowerRepository：电源动作下发](#72-daemonpowerrepository电源动作下发)
-  - [7.3 DaemonCommandRepository：控制台命令下发](#73-daemoncommandrepository控制台命令下发)
-  - [7.4 Activity 审计日志埋点](#74-activity-审计日志埋点)
-- [8. Panel → Wings：WebSocket 通道（Panel 可证实）](#8-panel--wingswebsocket-通道panel-可证实)
-  - [8.1 JWT 签发服务（NodeJWTService）](#81-jwt-签发服务nodejwtservice)
-  - [8.2 WebSocket 事件枚举](#82-websocket-事件枚举)
-- [9. Wings 侧：接收约定与行为（⚠️ 推断）](#9-wings-侧接收约定与行为️-推断)
-  - [9.1 REST Endpoint 约定](#91-rest-endpoint-约定)
-  - [9.2 WebSocket Event 约定](#92-websocket-event-约定)
-  - [9.3 并发安全与内部实现（⚠️ 推断，无本地代码）](#93-并发安全与内部实现️-推断无本地代码)
-- [10. 调度系统：计划任务中的电源/命令（Panel 可证实）](#10-调度系统计划任务中的电源命令panel-可证实)
-  - [10.1 ProcessScheduleService：事务入队 + only_when_online](#101-processscheduleservice事务入队--only_when_online)
-  - [10.2 RunTaskJob：按序执行与失败降级](#102-runtaskjob按序执行与失败降级)
-- [11. 失败处理与状态回滚（Panel 可证实）](#11-失败处理与状态回滚panel-可证实)
-  - [11.1 DaemonConnectionException：异常封装](#111-daemonconnectionexception异常封装)
-  - [11.2 CommandController：502 → 用户可读错误](#112-commandcontroller502--用户可读错误)
-  - [11.3 电源动作失败：无回滚，乐观状态模型](#113-电源动作失败无回滚乐观状态模型)
-  - [11.4 调度任务失败：continue_on_failure 开关](#114-调度任务失败continue_on_failure-开关)
-  - [11.5 Panel 数据库：乐观设计，无状态回滚](#115-panel-数据库乐观设计无状态回滚)
-- [12. 客服视角：Power Action 语义对照表](#12-客服视角power-action-语义对照表)
-- [13. 关键文件索引（Panel 代码）](#13-关键文件索引panel-代码)
-- [14. 附：客服 FAQ 速查](#14-附客服-faq-速查)
+> **关于本仓库的范围声明**：此代码库仅包含 Panel（PHP Laravel + React 前端），不含 Wings 守护进程（Go）源码。凡是涉及 Wings 内部实现的描述，均在标题或段落开头明确标注【推断】，以示与 Panel 侧可确认代码的区别。
 
 ---
 
-## 1. 架构概览（Panel 可证实部分）
+## 0. 目录
+
+- [1. 整体架构概览](#1-整体架构概览)
+- [2. 前端：两条下发通道（Panel 代码可确认）](#2-前端两条下发通道panel-代码可确认)
+  - [2.1 电源按钮（WebSocket 通道）](#21-电源按钮websocket-通道)
+  - [2.2 控制台命令（WebSocket 通道）](#22-控制台命令websocket-通道)
+  - [2.3 WebSocket Token 获取（REST 桥）](#23-websocket-token-获取rest-桥)
+  - [2.4 REST API 通道（供外部 / 调度系统）](#24-rest-api-通道供外部--调度系统)
+- [3. Panel 后端：路由注册与中间件管道](#3-panel-后端路由注册与中间件管道)
+  - [3.1 路由入口（已精确核对）](#31-路由入口已精确核对)
+  - [3.2 全局限流（Rate Limiting）](#32-全局限流rate-limiting)
+  - [3.3 资源级节流（ResourceLimit Enum）](#33-资源级节流resourcelimit-enum)
+- [4. Panel 后端：白名单与语义鉴别](#4-panel-后端白名单与语义鉴别)
+  - [4.1 电源动作白名单](#41-电源动作白名单)
+  - [4.2 控制台命令白名单](#42-控制台命令白名单)
+  - [4.3 调度任务白名单](#43-调度任务白名单)
+- [5. Panel 后端：权限鉴权模型](#5-panel-后端权限鉴权模型)
+  - [5.1 请求层权限解析（ClientApiRequest::authorize）](#51-请求层权限解析clientapirequestauthorize)
+  - [5.2 权限判定策略（ServerPolicy）](#52-权限判定策略serverpolicy)
+  - [5.3 服务器状态门禁（AuthenticateServerAccess）](#53-服务器状态门禁authenticateserveraccess)
+- [6. Panel → Wings：HTTP 调用链（Panel 代码可确认）](#6-panel--wingshttp-调用链panel-代码可确认)
+  - [6.1 DaemonRepository 基类：Guzzle HTTP 客户端](#61-daemonrepository-基类guzzle-http-客户端)
+  - [6.2 DaemonPowerRepository：电源动作下发](#62-daemonpowerrepository电源动作下发)
+  - [6.3 DaemonCommandRepository：控制台命令下发](#63-daemoncommandrepository控制台命令下发)
+  - [6.4 Activity 审计日志埋点](#64-activity-审计日志埋点)
+- [7. Panel → Wings：WebSocket 通道（JWT 鉴权）](#7-panel--wingswebsocket-通道jwt-鉴权)
+  - [7.1 JWT 签发服务（NodeJWTService）](#71-jwt-签发服务nodejwtservice)
+  - [7.2 前端 WebSocket 封装（Websocket.ts + Sockette）](#72-前端-websocket-封装websockett--sockette)
+  - [7.3 事件枚举（前端发出 & 接收）](#73-事件枚举前端发出--接收)
+- [8. Wings 侧（标注：以下均为推断）](#8-wings-侧标注以下均为推断)
+  - [8.1 【推断】REST Endpoint 约定](#81-推断rest-endpoint-约定)
+  - [8.2 【推断】WebSocket Event 约定](#82-推断websocket-event-约定)
+  - [8.3 【推断】并发安全与节流](#83-推断并发安全与节流)
+- [9. 调度系统：计划任务中的电源/命令](#9-调度系统计划任务中的电源命令)
+  - [9.1 ProcessScheduleService：事务入队](#91-processscheduleservice事务入队)
+  - [9.2 RunTaskJob：按序执行与失败降级](#92-runtaskjob按序执行与失败降级)
+- [10. 失败处理与状态回滚（Panel 代码可确认）](#10-失败处理与状态回滚panel-代码可确认)
+  - [10.1 DaemonConnectionException：Wings 通讯异常封装](#101-daemonconnectionexceptionwings-通讯异常封装)
+  - [10.2 CommandController：502 → 用户可读错误](#102-commandcontroller502--用户可读错误)
+  - [10.3 电源动作失败：无数据库状态回滚](#103-电源动作失败无数据库状态回滚)
+  - [10.4 调度任务失败：continue_on_failure + failed() 释放锁](#104-调度任务失败continue_on_failure--failed-释放锁)
+- [11. 客服视角：Power Action 语义对照表](#11-客服视角power-action-语义对照表)
+- [12. 关键文件索引（Panel 侧可确认）](#12-关键文件索引panel-侧可确认)
+- [附：客服 FAQ 速查](#附客服-faq-速查)
+
+---
+
+## 1. 整体架构概览
 
 ```
  ┌─────────────────────────────────────────────────────────────────────┐
- │                    ✅ 浏览器前端 (React) — 代码可证实                  │
+ │                    浏览器前端 (React — Panel 代码)                    │
  │  ┌──────────────────────┐     ┌──────────────────────────────┐      │
  │  │  PowerButtons.tsx    │     │  Console.tsx                 │      │
- │  │  Start/Stop/         │     │  (命令输入框 + xterm.js)     │      │
- │  │  Restart/Kill        │     │                              │      │
+ │  │  (Start/Stop/        │     │  (命令输入框 + xterm.js)     │      │
+ │  │   Restart/Kill)      │     │                              │      │
  │  └──────────┬───────────┘     └──────────────┬───────────────┘      │
  │             │ WebSocket                        │ WebSocket          │
  │             │ "set state"                      │ "send command"     │
  │             ▼                                  ▼                    │
  │  ┌──────────────────────────────────────────────────────────┐       │
- │  │  Websocket.ts (Sockette 封装)                            │       │
+ │  │            Websocket.ts (Sockette 封装)                  │       │
+ │  │  - 鉴权：JWT (10min 过期, 自动刷新)                      │       │
  │  │  - 重连：最多 20 次, 指数退避                             │       │
  │  └───────────────────────┬──────────────────────────────────┘       │
- │                         │  REST (token 获取)                         │
- │                         ▼                                            │
- │          GET /api/client/servers/{uuid}/websocket                    │
- │          → 返回 JWT(10min) + socket URL                              │
- └─────────────────────────┬───────────────────────────────────────────┘
-                           │ HTTPS (withCredentials: true)
- ┌─────────────────────────┼───────────────────────────────────────────┐
- │              ✅ Panel (PHP Laravel) — 代码可证实                      │
- │  ┌──────────────────────▼──────────────────────────────┐            │
- │  │  throttle:api.client (256 req/min / user)           │            │
- │  └──────────────────────┬──────────────────────────────┘            │
- │          ┌──────────────┼─────────────────┐                          │
- │          ▼              ▼                 ▼                          │
- │  POST /power     POST /command    GET /websocket                     │
- │  PowerController CommandController WebsocketController               │
- │          │              │                 │                          │
- │          └──────────────┴─────────────────┘                          │
- │                         │                                            │
- │          ┌──────────────▼──────────────────┐                         │
- │          │ DaemonPowerRepository            │                         │
- │          │ DaemonCommandRepository          │                         │
- │          │ (Guzzle + Node Bearer Token)     │                         │
- │          └──────────────┬──────────────────┘                         │
+ │                          │                                          │
+ │          ┌───────────────┴───────────────┐                          │
+ │          │ REST GET /api/client/servers/ │                          │
+ │          │   /{uuid}/websocket           │                          │
+ │          │   (获取 JWT + socket URL)     │                          │
+ │          └───────────────┬───────────────┘                          │
  └──────────────────────────┼──────────────────────────────────────────┘
-                            │ HTTPS
- ┌──────────────────────────▼──────────────────────────────────────────┐
- │            ⚠️ Wings (Go 守护进程) — 本仓库无代码，以下为推断            │
- │  POST /api/servers/{uuid}/power                                      │
- │  POST /api/servers/{uuid}/commands                                   │
- │  GET  /api/servers/{uuid}/ws  (WebSocket Upgrade)                    │
- │         ↓                                                            │
- │  游戏服进程 (Docker)                                                  │
+                            │ HTTPS (withCredentials: true)
+ ┌──────────────────────────┼──────────────────────────────────────────┐
+ │                   Panel (PHP Laravel — 本仓库代码)                    │
+ │  ┌───────────────────────▼──────────────────────────────┐           │
+ │  │  RouteServiceProvider → throttle:api.client         │           │
+ │  │  (默认 256 req/min per user)                         │           │
+ │  └───────────────────────┬──────────────────────────────┘           │
+ │          ┌────────────────┼─────────────────┐                       │
+ │          ▼                ▼                 ▼                       │
+ │  POST /command    POST /power      GET /websocket                   │
+ │  CommandController PowerController  WebsocketController             │
+ │  (L30-L48)         (L25-L33)        (L33-L71)                       │
+ │          │                │                 │                       │
+ │          └────────────────┴─────────────────┘                       │
+ │                           │                                         │
+ │          ┌────────────────▼──────────────────┐                      │
+ │          │  DaemonPowerRepository             │                      │
+ │          │  DaemonCommandRepository           │                      │
+ │          │  (Guzzle + Node 对称加密密钥鉴权)    │                      │
+ │          └────────────────┬──────────────────┘                      │
+ └───────────────────────────┼──────────────────────────────────────────┘
+                             │ HTTPS (Bearer: Node.decrypted_key)
+ ┌───────────────────────────▼──────────────────────────────────────────┐
+ │                 Wings (Go 守护进程 — 【不在本仓库，以下均为推断】)      │
+ │  ┌─────────────────────────────────────────────────────────────┐     │
+ │  │  REST:   POST /api/servers/{uuid}/power                     │     │
+ │  │          POST /api/servers/{uuid}/commands                  │     │
+ │  │  WS:     /api/servers/{uuid}/ws                             │     │
+ │  └─────────────────────────────┬───────────────────────────────┘     │
+ │                                ▼                                     │
+ │                      游戏服进程 (Docker/Systemd) 【推断】              │
  └──────────────────────────────────────────────────────────────────────┘
 ```
 
+**代码可确认的设计原则**：
+1. **双轨下发**：电源/命令既可以走 REST（同步确认，供外部/调度），也可以走 WebSocket（实时双向，前端默认使用）。
+2. **JWT 短时令牌**：WebSocket 通信使用 10 分钟过期的 JWT，由 Panel 签发并嵌入权限列表，Wings 可本地校验而无需回查 Panel。
+3. **白名单优先**：`signal` 字段使用 `in:start,stop,restart,kill` 枚举验证，拒绝未知值。
+4. **乐观状态模型**：Panel 数据库不维护 `running/offline` 电源状态，完全依赖 Wings 推送的 WebSocket `status` 事件；失败时无"数据库回滚"。
+
 ---
 
-## 2. 前端：电源按钮与命令输入框
+## 2. 前端：两条下发通道（Panel 代码可确认）
 
-### 2.1 电源按钮：PowerButtons.tsx
+### 2.1 电源按钮（WebSocket 通道）
 
-**✅ Panel 可证实**：[PowerButtons.tsx](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/resources/scripts/components/server/console/PowerButtons.tsx)
+**组件位置**：[PowerButtons.tsx](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/resources/scripts/components/server/console/PowerButtons.tsx)
 
 ```tsx
-// L14-17: 取前端 store 中的 status（不是后端 Server.status）
-const status = ServerContext.useStoreState((state) => state.status.value);
+// 第 17-31 行：按钮点击核心逻辑
 const killable = status === 'stopping';
 
-// L23-30: 点击处理
 const onButtonClick = (action: PowerAction | 'kill-confirmed', e) => {
     e.preventDefault();
     if (action === 'kill') return setOpen(true);  // 二次确认弹窗
+
     if (instance) {
         setOpen(false);
-        // ✅ 直接走 WebSocket 发送 "set state" 事件
+        // 直接通过 WebSocket 发送 "set state" 事件
         instance.send('set state', action === 'kill-confirmed' ? 'kill' : action);
     }
 };
 ```
 
-**4 种 Power Action 语义**（前端类型定义见 [ServerConsoleContainer.tsx](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/resources/scripts/components/server/console/ServerConsoleContainer.tsx)）：
+**4 种 Power Action 语义**（前端类型定义见 [ServerConsoleContainer.tsx#L14](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/resources/scripts/components/server/console/ServerConsoleContainer.tsx#L14)）：
 
-| Action | 触发方式 | 实际发送值 |
-|--------|---------|-----------|
-| `start` | 点 Start 按钮 | `"start"` |
-| `restart` | 点 Restart 按钮 | `"restart"` |
-| `stop` | 点 Stop 按钮（status ≠ `stopping`） | `"stop"` |
-| `kill` | ① Stop 过程中按钮变为 Kill ② 或二次确认弹窗后 | `"kill"` |
+| Action | 触发方式 | 前端禁用条件（第 54/61/68 行） | 实际发送值 |
+|--------|---------|------------------------------|-----------|
+| `start` | 点击 Start | `status !== 'offline'` | `"start"` |
+| `restart` | 点击 Restart | `!status`（状态未知时） | `"restart"` |
+| `stop` | 点击 Stop（`status !== 'stopping'`） | `status === 'offline'` | `"stop"` |
+| `kill` | ① Stop 过程中点按钮（killable=true）② 或二次确认弹窗点 Continue | `status === 'offline'` | `"kill"` |
 
-**权限渲染控制**：[Can.tsx](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/resources/scripts/components/elements/Can.tsx)
-- Start：`<Can action={'control.start'}>`
-- Restart：`<Can action={'control.restart'}>`
-- Stop/Kill：`<Can action={'control.stop'}>`
+**前端权限渲染控制**（使用 [Can.tsx](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/resources/scripts/components/elements/Can.tsx) 组件）：
+- Start 按钮：`<Can action={'control.start'}>`（第 51 行）
+- Restart 按钮：`<Can action={'control.restart'}>`（第 60 行）
+- Stop/Kill 按钮：`<Can action={'control.stop'}>`（第 65 行）
 
-**Kill 二次确认**：使用 `Dialog.Confirm`，文案：
+**Kill 二次确认**：使用 `Dialog.Confirm`（第 41-50 行），文案：
 > "Forcibly stopping a server can lead to data corruption."
 
-### 2.2 命令输入框：Console.tsx
+### 2.2 控制台命令（WebSocket 通道）
 
-**✅ Panel 可证实**：[Console.tsx](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/resources/scripts/components/server/console/Console.tsx)
+**组件位置**：[Console.tsx](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/resources/scripts/components/server/console/Console.tsx)
 
 ```tsx
-// L97-124: 命令发送逻辑
+// 第 97-124 行：命令输入与发送
 const handleCommandKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
-    // ↑/↓ 翻历史命令，最多 32 条
-    if (e.key === 'ArrowUp') { /* ... */ }
-    if (e.key === 'ArrowDown') { /* ... */ }
+    // 历史命令：↑/↓ 翻页，最多保存 32 条，持久化到 localStorage
+    if (e.key === 'ArrowUp') { /* 取出历史上一条 */ }
+    if (e.key === 'ArrowDown') { /* 取出历史下一条 */ }
 
     const command = e.currentTarget.value;
     if (e.key === 'Enter' && command.length > 0) {
-        setHistory(prev => [command, ...prev!].slice(0, 32));  // localStorage 持久化
-        // ✅ WebSocket 发送 "send command" 事件
+        setHistory(prev => [command, ...prev!].slice(0, 32));
+
+        // 通过 WebSocket 发送 "send command" 事件
         instance && instance.send('send command', command);
         e.currentTarget.value = '';
     }
 };
 ```
 
-**渲染权限**（L66, L211）：
+**渲染权限控制**（第 66 行 + 第 211 行）：
 ```tsx
 const [canSendCommands] = usePermissions(['control.console']);
-// 无权限则不渲染输入框
+// 仅当拥有 control.console 权限时才渲染命令输入框
 {canSendCommands && <div className={...}><input ... onKeyDown={handleCommandKeyDown} /></div>}
 ```
 
-**禁用条件**（L218）：`disabled={!instance || !connected}` — WebSocket 未连接时不可发送。
+**输入框禁用条件**（第 218 行）：`disabled={!instance || !connected}` — WebSocket 未连接时无法发送。
 
-### 2.3 前端 WebSocket 封装
+### 2.3 WebSocket Token 获取（REST 桥）
 
-**✅ Panel 可证实**：[Websocket.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/resources/scripts/plugins/Websocket.ts)
+**核心组件**：[WebsocketHandler.tsx](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/resources/scripts/components/server/WebsocketHandler.tsx)
 
-```ts
-export class Websocket extends EventEmitter {
-    connect(url): this {
-        this.socket = new Sockette(url, {
-            timeout: 1000,
-            maxAttempts: 20,                  // 最多 20 次重连
-            onmessage: (e) => {
-                const { event, args } = JSON.parse(e.data);
-                args ? this.emit(event, ...args) : this.emit(event);
-            },
-            onopen: () => this.authenticate(),  // 连接建立后立即发 auth
-        });
-    }
-
-    // ✅ 发送协议：{ event: string, args: string[] }
-    send(event: string, payload?: string | string[]) {
-        this.socket?.json({ event, args: Array.isArray(payload) ? payload : [payload] });
-    }
-}
+连接流程（代码可确认）：
 ```
-
-### 2.4 WebSocket Token 获取与刷新
-
-**✅ Panel 可证实**：[WebsocketHandler.tsx](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/resources/scripts/components/server/WebsocketHandler.tsx)
-
-流程：
-```
-1. getWebsocketToken(uuid) → GET /api/client/servers/{uuid}/websocket
+1. getWebsocketToken(uuid)
+   → GET /api/client/servers/{uuid}/websocket
    → 返回 { token: JWT(10min), socket: "wss://node:.../api/servers/{uuid}/ws" }
 
 2. socket.setToken(token).connect(socket)
 
-3. SOCKET_OPEN → authenticate() → send("auth", token)
+3. SOCKET_OPEN 事件触发 authenticate()
+   → send("auth", token)
 
-4. Wings 校验通过 → "auth success"
+4. Wings 校验通过 → "auth success" → setConnectionState(true)
 
-5. Wings 推送 "token expiring"（剩 3 分钟时） → 重新取 token 并 setToken
+5. Wings 提前预警 → "token expiring"（剩 3 分钟时）
+   → 重新调用 getWebsocketToken() → setToken(newToken, true)
 ```
 
 **自动刷新关键代码**（[WebsocketHandler.tsx#L20-L30](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/resources/scripts/components/server/WebsocketHandler.tsx#L20-L30)）：
 ```ts
 const updateToken = (uuid, socket) => {
-    if (updatingToken) return;   // 防抖锁
+    if (updatingToken) return;         // 防抖锁，避免并发刷新
     updatingToken = true;
-    getWebsocketToken(uuid).then(data => socket.setToken(data.token, true));
+    getWebsocketToken(uuid)
+        .then(data => socket.setToken(data.token, true));
 };
 ```
 
-### 2.5 前端状态模型（ServerStatus vs Server.status）
+**重连策略**：[Websocket.ts#L22-L55](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/resources/scripts/plugins/Websocket.ts#L22-L55) 使用 Sockette 库：
+- `timeout: 1000ms`
+- `maxAttempts: 20`（最多重连 20 次）
+- 收到 Wings 关闭码 4400/4409（服务器挂起/暂停）时停止重连。
 
-**✅ Panel 可证实**：[state/server/index.ts#L11](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/resources/scripts/state/server/index.ts#L11)
+### 2.4 REST API 通道（供外部 / 调度系统）
 
-```ts
-export type ServerStatus = 'offline' | 'starting' | 'stopping' | 'running' | null;
-```
+前端默认不走 REST，但 Panel 提供了以下两个 REST 端点（见 [routes/api-client.php#L72-L73](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/routes/api-client.php#L72-L73)）：
 
-**关键区分**（Panel 代码证实的重要事实）：
+| 方法 | 路由 | Body | Controller |
+|------|------|------|-----------|
+| POST | `/api/client/servers/{server}/command` | `{"command": "..."}` | [CommandController@index](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Http/Controllers/Api/Client/Servers/CommandController.php#L30-L48) |
+| POST | `/api/client/servers/{server}/power` | `{"signal": "start\|stop\|restart\|kill"}` | [PowerController@index](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Http/Controllers/Api/Client/Servers/PowerController.php#L25-L33) |
 
-| 来源 | 类型 | 可能值 | 更新方式 |
-|------|------|--------|---------|
-| 前端 `state.status.value` | `ServerStatus` | `'offline' \| 'starting' \| 'stopping' \| 'running' \| null` | WebSocket `status` 事件驱动（[WebsocketHandler.tsx#L44](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/resources/scripts/components/server/WebsocketHandler.tsx#L44)）|
-| 后端 `Server.status`（数据库字段）| `string \| null` | `'installing' \| 'install_failed' \| 'reinstall_failed' \| 'suspended' \| 'restoring_backup' \| null` | Panel 数据库事务写入，**不存 running/offline** |
-
-> ⚠️ **客服/开发重要事实**：Panel 数据库 `servers.status` 字段**从来不存 running 或 offline**。游戏服的运行状态完全由 Wings 通过 WebSocket 推送到前端 store，Panel 自身不维护权威副本。
+**使用场景**：
+- 第三方脚本 / 客户端 API Key 调用
+- Panel 内部调度系统（Schedule）
+- 任何无法建立 WebSocket 长连接的场景
 
 ---
 
 ## 3. Panel 后端：路由注册与中间件管道
 
-### 3.1 路由入口
+### 3.1 路由入口（已精确核对）
 
-**✅ Panel 可证实**：[routes/api-client.php#L57-L74](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/routes/api-client.php#L57-L74)
+定义于 [routes/api-client.php#L66-L73](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/routes/api-client.php#L66-L73)，由 [RouteServiceProvider.php#L56-L59](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Providers/RouteServiceProvider.php#L56-L59) 挂载：
 
 ```php
-Route::group([
-    'prefix' => '/servers/{server}',
-    'middleware' => [
-        ServerSubject::class,              // Activity 日志：标记 server_id
-        AuthenticateServerAccess::class,   // ★ 核心鉴权中间件
-        ResourceBelongsToServer::class,    // 子资源归属校验
-    ],
-], function () {
-    Route::get('/websocket', Client\Servers\WebsocketController::class)
-        ->middleware([ResourceLimit::Websocket->middleware()]);
+// WebSocket 单独加了资源级节流
+Route::middleware([ResourceLimit::Websocket->middleware()])
+    ->get('/websocket', Client\Servers\WebsocketController::class)
+    ->name('api:client:server.ws');
 
-    // ✅ 路由归属：/command → CommandController
-    Route::post('/command', [Client\Servers\CommandController::class, 'index']);
-    // ✅ 路由归属：/power → PowerController
-    Route::post('/power',   [Client\Servers\PowerController::class, 'index']);
-    // ...
-});
+// 命令 & 电源
+Route::post('/command', [Client\Servers\CommandController::class, 'index']);  // ★ 精确核对：CommandController
+Route::post('/power',   [Client\Servers\PowerController::class, 'index']);    // ★ 精确核对：PowerController
 ```
 
-### 3.2 中间件栈
-
-**✅ Panel 可证实**：[Http/Kernel.php#L82-L85](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Http/Kernel.php#L82-L85)
-
+**Client API 全局中间件栈**（[HttpKernel.php#L82-L85](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Http/Kernel.php#L82-L85)）：
 ```
-throttle:api.client          ← 最外层：全局限流
-└─ api 组
-   ├─ EnsureStatefulRequests (Cookie/Session)
-   ├─ auth:sanctum           (用户鉴权)
-   ├─ IsValidJson
-   ├─ TrackAPIKey
-   ├─ RequireTwoFactorAuthentication
-   └─ AuthenticateIPAccess
-      └─ client-api 组
-         └─ SubstituteClientBindings (用 uuid 解析 Server 模型)
-            └─ servers/{server} 组
-               ├─ ServerSubject
-               ├─ AuthenticateServerAccess  ★ 服务器状态门禁
-               └─ ResourceBelongsToServer
+最外层:
+  └─ throttle:api.client                 // ★ 全局节流（见 3.2）
+api 组:
+  ├─ SubstituteBindings / ThrottleRequests
+  ├─ EnsureStatefulRequests              // Cookie/Session 激活
+  ├─ auth:sanctum                        // 用户鉴权 (Laravel Sanctum)
+  ├─ IsValidJson                         // 请求体 JSON 格式校验
+  ├─ TrackAPIKey                         // 活动日志：标记 API Key ID
+  ├─ RequireTwoFactorAuthentication
+  └─ AuthenticateIPAccess                // IP 白名单校验
+client-api 组:
+  ├─ SubstituteClientBindings            // 用 uuid/identifier 解析 Server 模型
+  └─ RequireClientApiKey                 // 可选：API Key 鉴权 + IP 白名单
+server 组 (嵌套在 /servers/{server} 下):
+  ├─ ServerSubject (Activity Log 埋点)   // 标记 server_id
+  ├─ AuthenticateServerAccess            // ★ 核心鉴权中间件（见 5.3）
+  └─ ResourceBelongsToServer             // 子资源归属校验
 ```
 
----
+### 3.2 全局限流（Rate Limiting）
 
-## 4. 节流策略（Panel 可证实）
-
-### 4.1 全局限流
-
-**✅ Panel 可证实**：[RouteServiceProvider.php#L93-L100](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Providers/RouteServiceProvider.php#L93-L100)
+定义于 [RouteServiceProvider.php#L93-L100](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Providers/RouteServiceProvider.php#L93-L100) + [config/http.php](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/config/http.php)：
 
 ```php
 RateLimiter::for('api.client', function (Request $request) {
@@ -315,26 +292,34 @@ RateLimiter::for('api.client', function (Request $request) {
 });
 ```
 
-**默认配置**（[config/http.php](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/config/http.php)）：
-- `client_period = 1` 分钟
-- `client = 256` 次
+**代码可确认的关键特性**：
+- **按用户优先**：已登录用户使用 `user.uuid` 作为限流 key，未登录用 IP。避免用户通过换 IP 绕过限流。
+- **默认值**：`APP_API_CLIENT_RATELIMIT=256` 次/分钟。
+- `api.application`（管理员端）同样是 256 次/分钟，key 生成方式相同。
 
-**限流 key 策略**：已登录用户优先使用 `user.uuid`，未登录使用 IP。避免用户通过换 IP 绕过限流。
+### 3.3 资源级节流（ResourceLimit Enum）
 
-### 4.2 资源级限流（仅 WebSocket）
-
-**✅ Panel 可证实**：[Enum/ResourceLimit.php](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Enum/ResourceLimit.php)
+定义于 [app/Enum/ResourceLimit.php](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Enum/ResourceLimit.php)：
 
 ```php
-enum ResourceLimit {
-    case Websocket;
-    // ...
+enum ResourceLimit
+{
+    case Websocket;   // 已使用：/api/client/servers/{server}/websocket
+    case Allocation;
+    case Backup;
+    case Database;
+    case Schedule;
+    case Subuser;
+    case FilePull;
 
     public function limit(): Limit {
         return match($this) {
-            self::Backup     => Limit::perMinutes(15, 3),
-            self::Websocket  => Limit::perMinute(5),  // ✅ WebSocket 握手：5 次/分钟/服务器
-            // ...
+            self::Backup     => Limit::perMinutes(15, 3),    // 15 分钟 3 个备份
+            self::Database   => Limit::perMinute(2),
+            self::FilePull   => Limit::perMinutes(10, 5),
+            self::Subuser    => Limit::perMinutes(15, 10),
+            self::Websocket  => Limit::perMinute(5),         // ★ 每台服务器每分钟 5 次 WS 握手
+            default          => Limit::perMinute(2),
         };
     }
 
@@ -342,104 +327,84 @@ enum ResourceLimit {
         foreach (self::cases() as $case) {
             RateLimiter::for($case->throttleKey(), function (Request $request) use ($case) {
                 $server = $request->route()->parameter('server');
-                return $case->limit()->by($server->uuid);  // ✅ 按 server_uuid 限流，非按用户
+                return $case->limit()->by($server->uuid);  // ★ 按 server_uuid 限流，非按用户
             });
         }
     }
 }
 ```
 
-**关键事实**：
-- `/power` 和 `/command` **没有**资源级限流，仅依赖全局 256/min。
-- WebSocket 握手按 `server_uuid` 限流 5/min，即同一台服务器所有用户共享配额（100 个标签页连接同一个服务器，共用 5 次/分钟）。
-
-### 4.3 前端 UI 防重
-
-**✅ Panel 可证实**：[PowerButtons.tsx#L52-L69](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/resources/scripts/components/server/console/PowerButtons.tsx#L52-L69)
-
-```tsx
-<Button.Success
-    disabled={status !== 'offline'}   // Start 仅在 offline 时可用
-    onClick={onButtonClick.bind(this, 'start')}
->Start</Button.Success>
-
-<Button.Text
-    disabled={!status}                // Restart 需要有已知状态
-    onClick={onButtonClick.bind(this, 'restart')}
->Restart</Button.Text>
-
-<Button.Danger
-    disabled={status === 'offline'}   // Stop/Kill 仅在非 offline 时可用
-    onClick={onButtonClick.bind(this, killable ? 'kill' : 'stop')}
->{killable ? 'Kill' : 'Stop'}</Button.Danger>
-```
+**代码可确认的要点**：
+- **Websocket 限流 5 次/分钟/服务器**：防止客户端疯狂重建 WebSocket 连接（正常情况 10 分钟一次刷新 token）。
+- **按 server 限流，不是按用户**：`by($server->uuid)` — 即使用户开 100 个标签页连同一个服务器，共享 5 次/分钟配额。
+- **电源 / 命令端点无资源级限流**：代码中 `/command` 和 `/power` 路由上没有附加 `ResourceLimit` 中间件，仅依赖全局 256 次/分钟限流。
 
 ---
 
-## 5. 白名单与语义鉴别（Panel 可证实）
+## 4. Panel 后端：白名单与语义鉴别
 
-### 5.1 电源动作白名单
+### 4.1 电源动作白名单
 
-**✅ Panel 可证实**：[SendPowerRequest.php](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Http/Requests/Api/Client/Servers/SendPowerRequest.php)
+**验证类**：[SendPowerRequest.php](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Http/Requests/Api/Client/Servers/SendPowerRequest.php)
 
 ```php
 class SendPowerRequest extends ClientApiRequest
 {
     public function permission(): string {
         switch ($this->input('signal')) {
-            case 'start':   return Permission::ACTION_CONTROL_START;    // control.start
+            case 'start':                  return Permission::ACTION_CONTROL_START;    // 'control.start'
             case 'stop':
-            case 'kill':    return Permission::ACTION_CONTROL_STOP;     // control.stop
-            case 'restart': return Permission::ACTION_CONTROL_RESTART;  // control.restart
+            case 'kill':                   return Permission::ACTION_CONTROL_STOP;     // 'control.stop'
+            case 'restart':                return Permission::ACTION_CONTROL_RESTART;  // 'control.restart'
         }
-        return '__invalid';  // ✅ 未知 signal：授权层会拒绝
+        return '__invalid';   // ★ 未知 signal：权限名无法匹配，授权层必然拒绝
     }
 
     public function rules(): array {
         return [
-            // ✅ 白名单：仅允许这 4 个值
+            // ★ 白名单：只允许这 4 个字符串
             'signal' => 'required|string|in:start,stop,restart,kill',
         ];
     }
 }
 ```
 
-**两层保护**：
-1. Laravel Validation `in:` — 非法值直接 422
-2. `permission()` 返回 `__invalid` — 即使绕过验证，Gate 也查不到该权限 → 403
+**两层保护（代码可确认）**：
+1. **Laravel Validation `in:`**：请求到达控制器前，若 `signal` 不在白名单内，直接返回 422（ValidationException）。
+2. **`permission()` 映射到 `__invalid`**：即使绕过了 validation（理论上不可能），授权层也会因为找不到 `__invalid` 权限而返回 403。
 
-### 5.2 控制台命令白名单
+### 4.2 控制台命令白名单
 
-**✅ Panel 可证实**：[SendCommandRequest.php](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Http/Requests/Api/Client/Servers/SendCommandRequest.php)
+**验证类**：[SendCommandRequest.php](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Http/Requests/Api/Client/Servers/SendCommandRequest.php)
 
 ```php
 class SendCommandRequest extends ClientApiRequest
 {
     public function permission(): string {
-        return Permission::ACTION_CONTROL_CONSOLE;  // control.console
+        return Permission::ACTION_CONTROL_CONSOLE;  // 'control.console'
     }
 
     public function rules(): array {
         return [
-            'command' => 'required|string|min:1',  // ✅ 无命令内容白名单
+            'command' => 'required|string|min:1',  // ★ 注意：无命令内容白名单！
         ];
     }
 }
 ```
 
-**关键事实**：
-- Panel **不做命令内容过滤**。原因：游戏服命令集差异极大（Minecraft `/op`、Source `sm_kick`、Rust `server.save` 等），Panel 无法穷举。
-- 权限门槛：仅需拥有 `control.console` 权限。
-- **命令过滤职责在 Wings**（⚠️ 推断：Wings Egg 的 `config.yml` 中通常配置了 disallow 黑名单）。
+**关键区别（代码可确认）**：
+- Panel 对命令**不做白名单过滤**。原因：游戏服控制台命令集千差万别（Minecraft `/op`、Source `sm_kick`、Rust `server.save` 等），Panel 无法穷举。
+- **权限门槛**：只需拥有 `control.console` 权限即可发送任意命令。
+- **命令过滤职责（【推断】）**：推测由 Wings 或 Egg 配置的 `config.yml` disallow 列表负责，Panel 侧无对应实现。
 
-### 5.3 调度任务白名单
+### 4.3 调度任务白名单
 
-**✅ Panel 可证实**：[StoreTaskRequest.php](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Http/Requests/Api/Client/Servers/Schedules/StoreTaskRequest.php)
+**验证类**：[StoreTaskRequest.php](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Http/Requests/Api/Client/Servers/Schedules/StoreTaskRequest.php)
 
 ```php
 public function rules(): array {
     return [
-        // ✅ action 白名单
+        // ★ 调度任务 action 白名单
         'action'              => 'required|in:command,power,backup',
         'payload'             => 'required_unless:action,backup|string|nullable',
         'time_offset'         => 'required|numeric|min:0|max:900',  // 最大延迟 15 分钟
@@ -448,43 +413,48 @@ public function rules(): array {
 }
 ```
 
-> ⚠️ 注意：`action=power` 时的 `payload`（start/stop/restart/kill）**仅在 Wings 侧校验**，Panel 的 StoreTaskRequest 不二次校验 payload 枚举。执行时才在 [RunTaskJob.php#L62-L63](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Jobs/Schedule/RunTaskJob.php#L62-L63) 交给 `DaemonPowerRepository::send()` 发出，由 Wings 验证。
+**代码可确认**：`action=power` 时，`payload` 的值（应为 `start|stop|restart|kill`）在 Panel 侧**不再二次校验白名单**，而是在 [RunTaskJob.php#L62-L63](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Jobs/Schedule/RunTaskJob.php#L62-L63) 直接交给 `DaemonPowerRepository::send()` 转发至 Wings。
 
 ---
 
-## 6. 权限鉴权模型（Panel 可证实）
+## 5. Panel 后端：权限鉴权模型
 
-### 6.1 请求层权限解析
+### 5.1 请求层权限解析（ClientApiRequest::authorize）
 
-**✅ Panel 可证实**：[ClientApiRequest.php](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Http/Requests/Api/Client/ClientApiRequest.php)
+**基类**：[ClientApiRequest.php](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Http/Requests/Api/Client/ClientApiRequest.php)
 
 ```php
 class ClientApiRequest extends ApplicationApiRequest
 {
     public function authorize(): bool {
+        // 若子类实现了 permission() 方法（或实现了 ClientPermissionsRequest 接口），用 Gate 校验
         if ($this instanceof ClientPermissionsRequest || method_exists($this, 'permission')) {
             $server = $this->route()->parameter('server');
+
             if ($server instanceof Server) {
-                return $this->user()->can($this->permission(), $server);  // → ServerPolicy
+                // 调用 ServerPolicy，传入 permission 字符串
+                return $this->user()->can($this->permission(), $server);
             }
-            return false;
+            return false;  // 路由参数里找不到 Server → 拒绝
         }
-        return true;
+        return true;  // 未定义 permission() 的请求默认通过
     }
 }
 ```
 
-### 6.2 权限判定策略（ServerPolicy）
+**权限检查失败的后果（代码可确认）**：Laravel Gate 返回 false → 抛出 `AuthorizationException` → 渲染为 HTTP 403。
 
-**✅ Panel 可证实**：[ServerPolicy.php](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Policies/ServerPolicy.php)
+### 5.2 权限判定策略（ServerPolicy）
+
+**策略类**：[ServerPolicy.php](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Policies/ServerPolicy.php)
 
 ```php
 class ServerPolicy
 {
+    // before() 优先级最高，短路判断
     public function before(User $user, string $ability, Server $server): ?bool {
-        // ✅ 管理员 / 服务器所有者：无条件放行
         if ($user->root_admin || $server->owner_id === $user->id) {
-            return true;
+            return true;   // ★ 管理员 / 服务器所有者：无条件放行
         }
         return $this->checkPermission($user, $server, $ability);
     }
@@ -492,46 +462,56 @@ class ServerPolicy
     protected function checkPermission(User $user, Server $server, string $permission): bool {
         $subuser = $server->subusers->where('user_id', $user->id)->first();
         if (!$subuser || empty($permission)) return false;
-        // ✅ 子用户权限：存储为 JSON/text 数组 ['control.start', ...]
+        // 子用户权限是数据库中存储的数组：['control.start', 'control.stop', ...]
         return in_array($permission, $subuser->permissions);
     }
+
+    // __call 魔术方法：避免 Laravel 因 policy 方法不存在而跳过 before()
+    public function __call(string $name, mixed $arguments) {}
 }
 ```
 
-**权限常量汇总**（[Permission.php#L18-L22](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Models/Permission.php#L18-L22)）：
+**权限常量汇总（代码可确认，见 [Permission.php#L18-L22](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Models/Permission.php#L18-L22)）**：
 
-| 常量 | 值 | 对应动作 |
-|------|-----|---------|
-| `ACTION_WEBSOCKET_CONNECT` | `websocket.connect` | 建立 WebSocket |
-| `ACTION_CONTROL_CONSOLE` | `control.console` | 发送命令 |
-| `ACTION_CONTROL_START` | `control.start` | Start |
-| `ACTION_CONTROL_STOP` | `control.stop` | Stop / Kill |
-| `ACTION_CONTROL_RESTART` | `control.restart` | Restart |
+| 常量 | 值 | 含义 |
+|------|-----|------|
+| `ACTION_WEBSOCKET_CONNECT` | `websocket.connect` | 建立 WebSocket（查看控制台的基础权限） |
+| `ACTION_CONTROL_CONSOLE` | `control.console` | 发送命令到控制台 |
+| `ACTION_CONTROL_START` | `control.start` | Start 服务器 |
+| `ACTION_CONTROL_STOP` | `control.stop` | Stop / Kill 服务器 |
+| `ACTION_CONTROL_RESTART` | `control.restart` | Restart 服务器 |
 
-### 6.3 服务器状态门禁（AuthenticateServerAccess）
+### 5.3 服务器状态门禁（AuthenticateServerAccess）
 
-**✅ Panel 可证实**：[AuthenticateServerAccess.php](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Http/Middleware/Api/Client/Server/AuthenticateServerAccess.php)
+**中间件**：[AuthenticateServerAccess.php](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Http/Middleware/Api/Client/Server/AuthenticateServerAccess.php)
 
 ```php
 public function handle(Request $request, \Closure $next): mixed
 {
-    // 1. 归属校验：非 owner/admin/subuser → 404（隐私保护，不让探测）
+    $user = $request->user();
+    $server = $request->route()->parameter('server');
+
+    // 1. 身份归属校验：owner / root_admin / subuser，否则 404（用 404 替代 403，避免被探测）
     if ($user->id !== $server->owner_id && !$user->root_admin) {
         if (!$server->subusers->contains('user_id', $user->id)) {
             throw new NotFoundHttpException();
         }
     }
 
-    // 2. 状态冲突校验
+    // 2. 状态冲突校验：Server::validateCurrentState()
     try {
         $server->validateCurrentState();
     } catch (ServerStateConflictException $exception) {
-        // 例外：允许查看 server 基本信息 / 资源使用情况
-        if (!$request->routeIs('api:client:server.view')
-            && !$request->routeIs('api:client:server.resources')) {
-            // WebSocket 也例外：管理员可连以查看安装/迁移日志
+        // 例外 1：view endpoint (GET /server) 允许查看状态
+        if (!$request->routeIs('api:client:server.view')) {
+            // 例外 2：suspended / node_maintenance 允许看 /resources
+            if (($server->isSuspended() || $server->node->isUnderMaintenance())
+                && !$request->routeIs('api:client:server.resources')) {
+                throw $exception;
+            }
+            // 例外 3：管理员可连 WebSocket（api:client:server.ws）
             if (!$user->root_admin || !$request->routeIs($this->except)) {
-                throw $exception;  // HTTP 409 Conflict
+                throw $exception;   // HTTP 409 Conflict
             }
         }
     }
@@ -539,34 +519,32 @@ public function handle(Request $request, \Closure $next): mixed
 }
 ```
 
-**`validateCurrentState()`**（[Server.php#L390-L401](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Models/Server.php#L390-L401)）：
+**`validateCurrentState()` 判定逻辑**（[Server.php#L390-L401](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Models/Server.php#L390-L401)，代码可确认）：
 
 ```php
 public function validateCurrentState()
 {
     if (
-        $this->isSuspended()                         // status = 'suspended'
-        || $this->node->isUnderMaintenance()         // node.maintenance_mode
-        || !$this->isInstalled()                     // status = installing/install_failed
+        $this->isSuspended()              // status = 'suspended'
+        || $this->node->isUnderMaintenance()  // node.maintenance_mode = true
+        || !$this->isInstalled()          // 未安装完成
         || $this->status === self::STATUS_RESTORING_BACKUP
-        || !is_null($this->transfer)                 // 跨节点迁移中
+        || !is_null($this->transfer)      // 正在跨节点迁移
     ) {
-        throw new ServerStateConflictException($this);  // 409
+        throw new ServerStateConflictException($this);  // 409 Conflict
     }
 }
 ```
 
-**结论**：
-- 服务器处于 `suspended / 维护中 / 安装中 / 还原备份 / 迁移中` 时，`/power` 和 `/command` **均被拒绝（409）**。
-- 唯一例外：管理员的 WebSocket 连接，用于查看安装/迁移日志。
+**结论（代码可确认）**：当服务器处于 suspended / 维护中 / 安装中 / 还原备份 / 迁移中时，**`/power` 和 `/command` 端点均拒绝请求（409）**。WebSocket 是唯一例外（仅管理员可连接，用于查看迁移/安装日志）。
 
 ---
 
-## 7. Panel → Wings：REST HTTP 调用链（Panel 可证实）
+## 6. Panel → Wings：HTTP 调用链（Panel 代码可确认）
 
-### 7.1 DaemonRepository 基类
+### 6.1 DaemonRepository 基类：Guzzle HTTP 客户端
 
-**✅ Panel 可证实**：[DaemonRepository.php](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Repositories/Wings/DaemonRepository.php)
+**基类**：[DaemonRepository.php](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Repositories/Wings/DaemonRepository.php)
 
 ```php
 abstract class DaemonRepository
@@ -575,12 +553,12 @@ abstract class DaemonRepository
         Assert::isInstanceOf($this->node, Node::class);
 
         return new Client([
-            'verify'          => $this->app->environment('production'),
+            'verify'          => $this->app->environment('production'),   // 生产环境强制 HTTPS 证书验证
             'base_uri'        => $this->node->getConnectionAddress(),
-            'timeout'         => config('pterodactyl.guzzle.timeout'),         // 默认 15s
-            'connect_timeout' => config('pterodactyl.guzzle.connect_timeout'), // 默认 5s
+            'timeout'         => config('pterodactyl.guzzle.timeout'),         // 默认 15 秒
+            'connect_timeout' => config('pterodactyl.guzzle.connect_timeout'), // 默认 5 秒
             'headers' => array_merge($headers, [
-                // ✅ 使用 Node 的加密密钥（AES-256-CBC 存储）作为 Bearer Token
+                // ★ 使用 Node 的解密后密钥（AES-256-CBC 存储，解密后作为 Bearer Token）
                 'Authorization' => 'Bearer ' . $this->node->getDecryptedKey(),
                 'Accept'        => 'application/json',
                 'Content-Type'  => 'application/json',
@@ -590,13 +568,13 @@ abstract class DaemonRepository
 }
 ```
 
-**超时配置**（[config/pterodactyl.php#L79-L82](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/config/pterodactyl.php#L79-L82)）：
-- `GUZZLE_TIMEOUT = 15` 秒（总请求）
-- `GUZZLE_CONNECT_TIMEOUT = 5` 秒（TCP 连接）
+**超时配置（[config/pterodactyl.php#L79-L82](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/config/pterodactyl.php#L79-L82)，代码可确认）**：
+- `GUZZLE_TIMEOUT=15`：总请求超时 15 秒
+- `GUZZLE_CONNECT_TIMEOUT=5`：TCP 连接超时 5 秒
 
-### 7.2 DaemonPowerRepository：电源动作下发
+### 6.2 DaemonPowerRepository：电源动作下发
 
-**✅ Panel 可证实**：[DaemonPowerRepository.php](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Repositories/Wings/DaemonPowerRepository.php)
+**文件**：[DaemonPowerRepository.php](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Repositories/Wings/DaemonPowerRepository.php)
 
 ```php
 public function send(string $action): ResponseInterface
@@ -606,19 +584,19 @@ public function send(string $action): ResponseInterface
     try {
         return $this->getHttpClient()->post(
             sprintf('/api/servers/%s/power', $this->server->uuid),
-            ['json' => ['action' => $action]]  // ✅ body: {"action": "start"|"stop"|"restart"|"kill"}
+            ['json' => ['action' => $action]]  // body: {"action": "start"}
         );
     } catch (TransferException $exception) {
-        throw new DaemonConnectionException($exception);
+        throw new DaemonConnectionException($exception);  // ★ 统一包装为面板可读异常
     }
 }
 ```
 
-对应 Wings Endpoint：`POST /api/servers/{uuid}/power`
+**代码可确认**：请求 Wings Endpoint = `POST /api/servers/{server.uuid}/power`，body = `{"action": "<signal>"}`。
 
-### 7.3 DaemonCommandRepository：控制台命令下发
+### 6.3 DaemonCommandRepository：控制台命令下发
 
-**✅ Panel 可证实**：[DaemonCommandRepository.php](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Repositories/Wings/DaemonCommandRepository.php)
+**文件**：[DaemonCommandRepository.php](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Repositories/Wings/DaemonCommandRepository.php)
 
 ```php
 public function send(array|string $command): ResponseInterface
@@ -627,7 +605,7 @@ public function send(array|string $command): ResponseInterface
         return $this->getHttpClient()->post(
             sprintf('/api/servers/%s/commands', $this->server->uuid),
             [
-                // ✅ 总是包装为数组
+                // ★ 支持批量：总是包装为 commands 数组
                 'json' => ['commands' => is_array($command) ? $command : [$command]],
             ]
         );
@@ -637,179 +615,200 @@ public function send(array|string $command): ResponseInterface
 }
 ```
 
-对应 Wings Endpoint：`POST /api/servers/{uuid}/commands`
+**代码可确认**：请求 Wings Endpoint = `POST /api/servers/{server.uuid}/commands`，body = `{"commands": ["cmd"]}`（即使是单条命令也包装为数组）。
 
-### 7.4 Activity 审计日志埋点
+### 6.4 Activity 审计日志埋点
 
-**✅ Panel 可证实**：
+**PowerController**（[PowerController.php#L31](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Http/Controllers/Api/Client/Servers/PowerController.php#L31)）：
+```php
+Activity::event(strtolower("server:power.{$request->input('signal')}"))->log();
+// 可能的事件名: server:power.start / server:power.stop / server:power.restart / server:power.kill
+```
 
-- 电源动作日志（[PowerController.php#L31](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Http/Controllers/Api/Client/Servers/PowerController.php#L31)）：
-  ```php
-  Activity::event(strtolower("server:power.{$request->input('signal')}"))->log();
-  // 事件名: server:power.start / .stop / .restart / .kill
-  ```
+**CommandController**（[CommandController.php#L46](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Http/Controllers/Api/Client/Servers/CommandController.php#L46)）：
+```php
+Activity::event('server:console.command')
+    ->property('command', $request->input('command'))  // ★ 记录具体命令内容！
+    ->log();
+```
 
-- 命令日志（[CommandController.php#L46](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Http/Controllers/Api/Client/Servers/CommandController.php#L46)）：
-  ```php
-  Activity::event('server:console.command')
-      ->property('command', $request->input('command'))  // ✅ 记录具体命令内容
-      ->log();
-  ```
-
-**写入时机**：Activity 记录在 **Wings 调用成功之后**（try 块外部）。如果 Wings 调用失败抛异常，Activity 不会被写入，避免假阳性。
+**代码可确认的关键点**：
+- 两处 `Activity::...->log()` 均位于 Wings 调用之后。若 Wings 调用抛出异常，PHP 会中断执行，Activity 不会被写入数据库。
+- 即：**Wings 调用成功后才记录审计日志**，避免假阳性记录。
 
 ---
 
-## 8. Panel → Wings：WebSocket 通道（Panel 可证实）
+## 7. Panel → Wings：WebSocket 通道（JWT 鉴权）
 
-### 8.1 JWT 签发服务（NodeJWTService）
-
-**✅ Panel 可证实**：[NodeJWTService.php](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Services/Nodes/NodeJWTService.php)
+### 7.1 JWT 签发服务（NodeJWTService）
 
 由 [WebsocketController.php#L55-L62](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Http/Controllers/Api/Client/Servers/WebsocketController.php#L55-L62) 调用：
 
 ```php
 $token = $this->jwtService
-    ->setExpiresAt(CarbonImmutable::now()->addMinutes(10))   // ✅ 10 分钟过期
+    ->setExpiresAt(CarbonImmutable::now()->addMinutes(10))   // 10 分钟过期
     ->setUser($request->user())
     ->setClaims([
         'server_uuid'  => $server->uuid,
-        'permissions'  => $permissions,   // ✅ 用户在该服务器的权限列表嵌入 JWT
+        'permissions'  => $permissions,   // ★ 用户在该服务器上的全部权限列表，嵌入 JWT
     ])
     ->handle($node, $user->id . $server->uuid);
 ```
 
-**JWT 结构（Panel 代码证实）**：
+**代码可确认的 JWT Claims 结构**（见 [NodeJWTService.php](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Services/Nodes/NodeJWTService.php)）：
 
 ```
 Header:
-  alg: HS256               // 对称加密，用 Node 的密钥签名
-  jti: md5(user_id + uuid) // 用于 deny-list（踢人/注销）
+  alg: HS256               // 对称加密，使用 Node 的密钥签名
 
-Payload:
-  iss: APP_URL             // 签发者
+Payload (Claims):
+  iss: config('app.url')   // 签发者 = APP_URL
   aud: node 连接地址       // 接收方
-  iat: 签发时间
-  nbf: iat - 5min          // 5 分钟时钟偏差
-  exp: iat + 10min         // ✅ 过期时间 10 分钟
+  iat: 签发时间戳
+  nbf: iat - 5min          // 允许 5 分钟时钟偏差
+  exp: iat + 10min         // 过期时间
   sub: 用户标识
   user_uuid: 用户 UUID
-  user_id: 用户 ID (兼容)
+  user_id: 用户自增 ID (兼容字段)
   server_uuid: 服务器 UUID
-  permissions: [ "websocket.connect", "control.start", ... ]  // ✅ Wings 自行鉴权
+  permissions: [ "websocket.connect", "control.start", ... ]  // ★ Wings 据此独立鉴权
   unique_id: Str::random() // 防重放
+  jti: md5(user_id + server_uuid)
 ```
 
-**设计含义**：Wings 收到 WebSocket 事件时，检查 JWT 中的 `permissions` 数组即可决定放行与否，**无需回查 Panel**，保证低延迟。
+**代码可确认的 Websocket 权限门槛**：
+- 在签发 JWT 前，[WebsocketController.php#L36-L38](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Http/Controllers/Api/Client/Servers/WebsocketController.php#L36-L38) 首先检查 `Permission::ACTION_WEBSOCKET_CONNECT`，无权限直接抛 403。
+- JWT 中的 `permissions` 列表是 Wings 侧独立鉴权的依据（如 `send command` 需 `control.console`、`set state` 需对应 `control.*`），无需回查 Panel。
 
-### 8.2 WebSocket 事件枚举
+### 7.2 前端 WebSocket 封装（Websocket.ts + Sockette）
 
-**✅ Panel 可证实**：[events.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/resources/scripts/components/server/events.ts)
+**文件**：[Websocket.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/resources/scripts/plugins/Websocket.ts)
 
 ```ts
-export enum SocketRequest {  // 前端 → Wings
-    SEND_LOGS = 'send logs',    // 拉取历史控制台缓冲
-    SEND_STATS = 'send stats',  // 请求立即发一次统计
-    SET_STATE = 'set state',    // ✅ 电源动作
+export class Websocket extends EventEmitter {
+    connect(url): this {
+        this.socket = new Sockette(url, {
+            timeout: 1000,
+            maxAttempts: 20,                  // 最多 20 次重连
+            onmessage: (e) => {
+                const { event, args } = JSON.parse(e.data);
+                // Wings → 前端: {event: string, args: string[]}
+                args ? this.emit(event, ...args) : this.emit(event);
+            },
+            onopen: () => this.authenticate(),  // 连接打开立即发 auth
+        });
+    }
+
+    // ★ 前端 → Wings 发送协议: { event: string, args: string[] }
+    send(event: string, payload?: string | string[]) {
+        this.socket?.json({ event, args: Array.isArray(payload) ? payload : [payload] });
+    }
+}
+```
+
+### 7.3 事件枚举（前端发出 & 接收）
+
+定义于 [events.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/resources/scripts/components/server/events.ts)：
+
+```ts
+export enum SocketRequest {  // 前端 → Wings（发出）
+    SEND_LOGS = 'send logs',   // 请求 Wings 推送历史控制台缓冲
+    SEND_STATS = 'send stats', // 请求立即发送一次统计数据
+    SET_STATE = 'set state',   // ★ 电源动作（注: Console.tsx 中的 "send command" 未列入此枚举，直接用字符串）
 }
 
-export enum SocketEvent {     // Wings → 前端
+export enum SocketEvent {     // Wings → 前端（接收）
     DAEMON_MESSAGE = 'daemon message',
     DAEMON_ERROR = 'daemon error',
     CONSOLE_OUTPUT = 'console output',
-    STATUS = 'status',           // ✅ 电源状态变化
+    STATUS = 'status',
     STATS = 'stats',
-    // 安装 / 迁移等
+    // ... 安装 / 迁移 / 备份 相关
 }
 ```
 
-> 注意：`"send command"` 事件未在枚举中定义，但 [Console.tsx#L121](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/resources/scripts/components/server/console/Console.tsx#L121) 直接用字符串字面量 `instance.send('send command', command)` 发送。
+---
+
+## 8. Wings 侧（标注：以下均为推断）
+
+> ⚠️ **重要声明**：本代码库仅包含 Panel，不含 Wings（Go 守护进程）。以下内容基于 Panel 代码中与 Wings 的交互协议（URL、body 结构、WebSocket 事件名）推导，非源码实证。
+
+### 8.1 【推断】REST Endpoint 约定
+
+基于 Panel 发出的 HTTP 调用结构推断：
+
+| Method | Path | Body | 推测 Wings 行为 |
+|--------|------|------|--------------|
+| POST | `/api/servers/{uuid}/power` | `{"action":"start\|stop\|restart\|kill"}` | 推测立即返回 204 No Content；内部异步改变进程状态 |
+| POST | `/api/servers/{uuid}/commands` | `{"commands":["cmd1","cmd2"]}` | 推测要求服务器处于 running 状态，否则返回 502 Bad Gateway；否则立即 204 |
+| GET | `/api/servers/{uuid}` | — | 推测返回 `{"state": "running\|offline\|...", ...}`（Panel 调度 `only_when_online` 检查依赖此接口） |
+| GET | `/api/servers/{uuid}/ws` | Upgrade | WebSocket 握手 |
+
+### 8.2 【推断】WebSocket Event 约定
+
+基于前端 WebSocket 代码推断：
+
+**Client → Wings（需携带 JWT 且 JWT claims 含对应权限）**：
+
+| Event | Args | 所需 JWT permission | 说明 |
+|-------|------|-------------------|------|
+| `auth` | `[jwt]` | — | 连接后第一条消息 |
+| `send logs` | `[]` | `websocket.connect` | 请求 Wings 推送历史控制台缓冲 |
+| `send stats` | `[]` | `websocket.connect` | 请求立即发送一次统计 |
+| `set state` | `["start"\|"stop"\|"restart"\|"kill"]` | 对应 `control.start\|stop\|restart` | 等同 REST /power |
+| `send command` | `["/op Notch"]` | `control.console` | 等同 REST /commands（单条命令） |
+
+**Wings → Client（前端监听）**：
+
+| Event | Args | 触发时机（推测） |
+|-------|------|----------------|
+| `auth success` | — | JWT 校验通过 |
+| `token expiring` | — | JWT 距过期 < 3 分钟时 |
+| `token expired` | — | JWT 已过期 |
+| `jwt error` | `[msg]` | JWT 校验失败 |
+| `status` | `["starting"]` | 电源状态迁移时 |
+| `console output` | `["[12:34] ..."]` | 游戏服 stdout 有新行时 |
+| `stats` | `[{"cpu":10.5,"memory_bytes":...}]` | 统计心跳（推测 1~2 秒一次） |
+
+### 8.3 【推断】并发安全与节流
+
+基于 Panel 的设计模式推断 Wings 侧可能采取的机制：
+- 电源动作串行化：推测用互斥锁避免 Start 与 Kill 同时到达导致进程孤儿
+- 控制台命令限频：推测使用令牌桶限频，防止通过 WebSocket `send command` 刷屏
+- 命令黑名单：推测读取 Egg 的 `config.yml` 中的 disallow 列表，拦截危险命令
+
+这些机制的具体实现（结构体、变量名、调用顺序）**无法从 Panel 代码确认**。
 
 ---
 
-## 9. Wings 侧：接收约定与行为（⚠️ 推断）
+## 9. 调度系统：计划任务中的电源/命令
 
-> **⚠️ 重要**：本仓库无 Wings 代码。本节内容仅依据 Panel 的调用协议（Endpoint 路径、请求体结构、JWT Claims、前端事件枚举等）**推断**，不保证与实际 Wings 实现完全一致。
+### 9.1 ProcessScheduleService：事务入队
 
-### 9.1 REST Endpoint 约定
-
-由 Panel 的 Repository 代码可推断 Wings 暴露以下接口：
-
-| Method | Path | Body（Panel 发送） | Panel 预期行为 |
-|--------|------|-------------------|--------------|
-| POST | `/api/servers/{uuid}/power` | `{"action":"start\|stop\|restart\|kill"}` | 204 No Content 立即返回 |
-| POST | `/api/servers/{uuid}/commands` | `{"commands":["cmd1",...]}` | 服务器必须 running，否则 502（Panel 有特判） |
-| GET | `/api/servers/{uuid}` | — | 返回 `{"state": "..." }` 数组，含 `state` 字段（调度 `only_when_online` 用）|
-
-### 9.2 WebSocket Event 约定
-
-由 Panel 前端代码可推断 Wings 支持以下 WebSocket 消息：
-
-**Client → Wings**（Panel 前端发送的事件）：
-
-| Event | Args | JWT 所需权限（推断） |
-|-------|------|---------------------|
-| `auth` | `[jwt]` | — |
-| `send logs` | `[]` | `websocket.connect` |
-| `send stats` | `[]` | `websocket.connect` |
-| `set state` | `["start"\|"stop"\|"restart"\|"kill"]` | 对应 `control.start\|stop\|restart` |
-| `send command` | `["/op Notch"]` | `control.console` |
-
-**Wings → Client**（Panel 前端监听的事件）：
-
-| Event | 触发时机（推断） |
-|-------|----------------|
-| `auth success` | JWT 校验通过 |
-| `token expiring` | JWT 距过期 < 3min |
-| `token expired` | JWT 已过期 |
-| `jwt error` | JWT 校验失败 |
-| `status` | 电源状态迁移（`"starting"\|"running"\|"stopping"\|"offline"`） |
-| `console output` | 游戏服 stdout 有新行 |
-| `stats` | CPU/内存/磁盘/网络统计心跳 |
-
-### 9.3 并发安全与内部实现（⚠️ 推断，无本地代码）
-
-以下内容**完全是基于架构常识的推断**，Panel 代码中无任何对应实现：
-
-- **电源动作并发控制**：推断 Wings 内部对每个 Server Instance 有互斥锁（如 Go `sync.Mutex`），避免 Start 与 Kill 同时到达导致进程孤儿
-- **Stop 流程**：按 Egg 配置的 `stop_command`（如 `/stop`）写入 stdin → 等待 `stop_timeout`（默认 30s）→ 超时再 SIGTERM → 再超时 SIGKILL
-- **Kill 流程**：直接 SIGKILL 容器进程组
-- **命令限频**：推断 Wings 内有令牌桶限频器（如 60 条/分钟/实例），防止命令刷屏
-- **控制台环形缓冲**：推断 Wings 维护一个最近 2MB 的控制台输出 ring buffer，用于 `send logs` 历史拉取
-
-> 以上推断如有疑问，需查阅 Pterodactyl Wings 仓库（Go 代码）确认。
-
----
-
-## 10. 调度系统：计划任务中的电源/命令（Panel 可证实）
-
-### 10.1 ProcessScheduleService：事务入队 + only_when_online
-
-**✅ Panel 可证实**：[ProcessScheduleService.php](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Services/Schedules/ProcessScheduleService.php)
+**服务**：[ProcessScheduleService.php](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Services/Schedules/ProcessScheduleService.php)
 
 ```php
 public function handle(Schedule $schedule, bool $now = false): void
 {
     $task = $schedule->tasks()->orderBy('sequence_id')->first();
 
-    // ✅ 数据库事务：标记 is_processing + is_queued
+    // ★ 数据库事务：标记 is_processing + is_queued，避免并发调度
     $this->connection->transaction(function () use ($schedule, $task) {
         $schedule->forceFill([
             'is_processing' => true,
-            'next_run_at'   => $schedule->getNextRunDate(),
+            'next_run_at'   => $schedule->getNextRunDate(),  // 提前计算下次运行
         ])->saveOrFail();
         $task->update(['is_queued' => true]);
     });
 
     $job = new RunTaskJob($task, $now);
     if ($schedule->only_when_online) {
-        // ✅ 调 Wings GET /api/servers/{uuid} 获取 state
+        // 调 Wings GET /api/servers/{uuid} 查 state
         try {
             $details = $this->serverRepository->setServer($schedule->server)->getDetails();
             $state = $details['state'] ?? 'offline';
-            // ✅ 只对 offline/stopping 做跳过
             if (in_array($state, ['offline', 'stopping'])) {
-                $job->failed();   // 默默标记完成，不抛异常
+                $job->failed();   // ★ 默默标记完成，不抛异常
                 return;
             }
         } catch (\Exception $exception) {
@@ -820,27 +819,26 @@ public function handle(Schedule $schedule, bool $now = false): void
             return;
         }
     }
-
-    // ✅ 延迟 time_offset 秒后执行
+    // → 入队，延迟 time_offset 秒
     if (!$now) {
         $this->dispatcher->dispatch($job->delay($task->time_offset));
     } else {
-        try { $this->dispatcher->dispatchNow($job); }
-        catch (\Exception $e) { $job->failed($e); throw $e; }
+        $this->dispatcher->dispatchNow($job);  // 立即同步执行
     }
 }
 ```
 
-### 10.2 RunTaskJob：按序执行与失败降级
+### 9.2 RunTaskJob：按序执行与失败降级
 
-**✅ Panel 可证实**：[RunTaskJob.php](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Jobs/Schedule/RunTaskJob.php)
+**任务**：[RunTaskJob.php](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Jobs/Schedule/RunTaskJob.php)
 
 ```php
-public function handle(DaemonCommandRepository $commandRepository,
-                       InitiateBackupService $backupService,
-                       DaemonPowerRepository $powerRepository)
-{
-    // ✅ 防御性检查：服务器状态不是 null（即 suspended/installing 等）
+public function handle(
+    DaemonCommandRepository $commandRepository,
+    InitiateBackupService $backupService,
+    DaemonPowerRepository $powerRepository,
+) {
+    // 防御性检查：调度入队后，服务器状态被改了（suspended 等）
     if (!is_null($server->status)) { $this->failed(); return; }
 
     try {
@@ -851,63 +849,81 @@ public function handle(DaemonCommandRepository $commandRepository,
                 $commandRepository->setServer($server)->send($this->task->payload); break;
             case Task::ACTION_BACKUP:  // "backup"
                 $backupService->...; break;
+            default:
+                throw new \InvalidArgumentException('Invalid task action: ' . $this->task->action);
         }
     } catch (\Exception $exception) {
-        // ✅ 唯一降级路径：continue_on_failure + DaemonConnectionException
+        // ★ 唯一失败降级：continue_on_failure=true + DaemonConnectionException（Wings 连不上）
         if (!($this->task->continue_on_failure && $exception instanceof DaemonConnectionException)) {
             throw $exception;   // 其他异常：任务链中断
         }
     }
 
     $this->markTaskNotQueued();
-    $this->queueNextTask();  // ✅ 取下一个 sequence_id，delay 后入队
+    $this->queueNextTask();   // → 取下一个 sequence_id，delay 后入队
+}
+
+// 失败钩子：释放 is_processing 锁，避免 Schedule 永久卡死
+public function failed(?\Exception $exception = null) {
+    $this->markTaskNotQueued();
+    $this->markScheduleComplete();
 }
 ```
 
-**任务链执行模型**：
-
+**任务链执行模型（代码可确认）**：
 ```
 Schedule (is_processing=true)
   ├─ Task #1 (sequence_id=1, time_offset=0)
-  │    ├─ success → markTaskNotQueued → dispatch Task #2
-  │    ├─ DaemonConnectionException + continue_on_failure=true → dispatch Task #2
-  │    └─ 其他异常 → failed()，中断链，释放 is_processing
+  │    └─ success → markTaskNotQueued → dispatch Task #2
+  │    └─ DaemonConnectionException + continue_on_failure=true → 静默跳过 → dispatch Task #2
+  │    └─ 其他异常 → failed() 钩子 → is_processing=false → 调度链中断
   ├─ Task #2 (sequence_id=2, time_offset=30)
   ...
-  └─ 最后一个 Task → markScheduleComplete (is_processing=false, last_run_at=now)
+  └─ 最后一个 Task 完成 → markScheduleComplete(is_processing=false, last_run_at=now)
 ```
 
 ---
 
-## 11. 失败处理与状态回滚（Panel 可证实）
+## 10. 失败处理与状态回滚（Panel 代码可确认）
 
-### 11.1 DaemonConnectionException：异常封装
+### 10.1 DaemonConnectionException：Wings 通讯异常封装
 
-**✅ Panel 可证实**：[DaemonConnectionException.php](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Exceptions/Http/Connection/DaemonConnectionException.php)
+**异常类**：[DaemonConnectionException.php](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Exceptions/Http/Connection/DaemonConnectionException.php)
 
 ```php
 public function __construct(GuzzleException $previous, bool $useStatusCode = true)
 {
     $response = method_exists($previous, 'getResponse') ? $previous->getResponse() : null;
-    $this->requestId = $response?->getHeaderLine('X-Request-Id'); // ✅ 关联 Wings 日志
+    $this->requestId = $response?->getHeaderLine('X-Request-Id'); // ★ 便于 Wings 侧日志排查
 
+    // 状态码映射：如果 2XX 却进入了异常（Wings panic 已写 header 后 crash），升级为 502 Bad Gateway
     if ($useStatusCode) {
         $this->statusCode = is_null($response) ? 504 : $response->getStatusCode();
-        if ($this->statusCode < 400) $this->statusCode = 502; // 2XX 却异常 → 升级为 502
+        if ($this->statusCode < 400) $this->statusCode = 502;
     }
 
-    // ✅ 日志分级：5XX（除 504）= ERROR，其余 = WARNING
+    // 日志分级：5XX（非 504）= ERROR 级别，其余 = WARNING 级别
     $level = $this->statusCode >= 500 && $this->statusCode !== 504
         ? DisplayException::LEVEL_ERROR
         : DisplayException::LEVEL_WARNING;
+
+    parent::__construct($message, $previous, $level);
+}
+
+// 自动写 Laravel 日志，附带 request_id
+public function report() {
+    Log::{$this->getErrorLevel()}($this->getPrevious(), ['request_id' => $this->requestId]);
 }
 ```
 
-**`report()` 方法**：自动写 Laravel Log，含 `request_id`，便于在 Wings 侧用同一 X-Request-Id 关联排查。
+**代码可确认的要点**：
+- 无响应（TCP 连接失败、超时）→ 状态码 504，提示 "Could not establish a connection..."
+- 非 5XX 错误（如 400/401/403/422）→ 尝试从 Wings 响应体解析 `error` 字段，返回给前端
+- `report()` 会自动调用，将异常堆栈 + `request_id` 写入 Laravel Log
 
-### 11.2 CommandController：502 → 用户可读错误
+### 10.2 CommandController：502 → 用户可读错误
 
-**✅ Panel 可证实**：[CommandController.php#L32-L44](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Http/Controllers/Api/Client/Servers/CommandController.php#L32-L44)
+[CommandController.php#L32-L44](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Http/Controllers/Api/Client/Servers/CommandController.php#L32-L44)：
 
 ```php
 try {
@@ -915,180 +931,118 @@ try {
 } catch (DaemonConnectionException $exception) {
     $previous = $exception->getPrevious();
     if ($previous instanceof BadResponseException) {
-        // ✅ Wings 返回 502 → 判断为游戏服未运行
+        // ★ Wings 返回 502：游戏服进程未运行（容器未启动 / stdin 管道关闭）
         if ($previous->getResponse()->getStatusCode() === Response::HTTP_BAD_GATEWAY) {
             throw new HttpException(
                 Response::HTTP_BAD_GATEWAY,
-                'Server must be online in order to send commands.',  // ✅ 用户可读
+                'Server must be online in order to send commands.',
                 $exception
             );
         }
     }
-    throw $exception;
+    throw $exception;  // 其他错误原样抛（500、504、4XX 等）
 }
 ```
 
-### 11.3 电源动作失败：无回滚，乐观状态模型
+**PowerController 无此特殊处理**：[PowerController.php#L27-L29](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Http/Controllers/Api/Client/Servers/PowerController.php#L27-L29) 中 `DaemonPowerRepository::send()` 的异常直接冒泡，无 catch。
 
-**✅ Panel 可证实**：[PowerController.php](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Http/Controllers/Api/Client/Servers/PowerController.php)
+### 10.3 电源动作失败：无数据库状态回滚
 
-`DaemonPowerRepository::send()` 抛出的 `DaemonConnectionException` **直接冒泡**，无 catch 处理。
+**代码可确认的事实**：
+1. Panel `Server` 模型的 `status` 字段仅用于以下值（非运行态）：`null`（正常）/ `suspended` / `installing` / `install_failed` / `restoring_backup` 等（见 [Server.php 模型常量](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Models/Server.php)）。**不存在** `running`、`offline`、`stopping`、`starting` 这类电源状态的数据库字段。
+2. 电源状态完全由 Wings 通过 WebSocket 的 `status` 事件推送给前端，Panel 数据库不做任何持久化。
+3. 因此：即使 `/power` 请求 Wings 失败，Panel 也**无数据库状态需要回滚**——没有"记录了 running 但实际没启动"的不一致。
 
-**为什么不需要"回滚状态"**（Panel 代码证实的核心设计）：
-1. Panel 数据库 `Server.status` 字段**不存** running/offline/starting/stopping（只存 installing/suspended/restoring_backup 等元状态）
-2. 电源运行状态完全由 Wings WebSocket 的 `status` 事件驱动前端 store
-3. 即使 Panel 发 Start 请求失败，只要服务器实际还是 offline，WebSocket 会把 `status=offline` 推给前端，Start 按钮重新可用
-4. **最终一致，而非强一致**
+**状态一致性模型**：最终一致（Eventual Consistency），权威数据源在 Wings，Panel 仅转发指令 + 展示 Wings 推送的状态。
 
-### 11.4 调度任务失败：continue_on_failure 开关
+### 10.4 调度任务失败：continue_on_failure + failed() 释放锁
 
-**✅ Panel 可证实**（汇总自上文代码）：
-
-| 场景 | 失败行为 |
-|------|---------|
-| `DaemonConnectionException` + `continue_on_failure=true` | 记录日志，**继续执行后续 Task** |
-| `DaemonConnectionException` + `continue_on_failure=false` | 抛异常 → Job 失败 → 调度链中断 |
-| 任何其他 Exception | 抛异常 → 调度链中断 |
+| 场景（代码可确认） | 失败行为 |
+|------------------|---------|
+| DaemonConnectionException（Wings 连不上）+ `continue_on_failure=true` | 静默跳过，继续执行后续 Task |
+| DaemonConnectionException + `continue_on_failure=false` | 抛异常 → Laravel Queue 调用 `failed()` 钩子 → 标记 `is_processing=false` → 链中断 |
+| 任何其他 Exception（Validation / Authorization / InvalidArgumentException） | 同上：`failed()` 释放锁 + 链中断 |
 | `only_when_online=true` + 服务器 offline | 默默标记完成，不抛异常 |
-| `server.status !== null`（suspended/installing 等）| Job 直接 failed() |
-
-**中断后的清理**：`RunTaskJob::failed()`（[L89-L93](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Jobs/Schedule/RunTaskJob.php#L89-L93)）会调用：
-- `markTaskNotQueued()` — 释放 task 锁
-- `markScheduleComplete()` — 释放 `schedules.is_processing` 锁，避免 Schedule 永久卡死
-
-### 11.5 Panel 数据库：乐观设计，无状态回滚
-
-整个电源/命令链路中，Panel 数据库只有以下写入（均为"事后记录"或"锁标记"）：
-
-| 写入点 | 数据 | 失败时行为 |
-|--------|------|-----------|
-| PowerController | Activity Log（`server:power.*`） | ✅ 异常未捕获则不写入 |
-| CommandController | Activity Log（`server:console.command`，含命令内容） | ✅ 异常未捕获则不写入 |
-| `ProcessScheduleService` | `schedules.is_processing`, `tasks.is_queued` | ✅ 在 DB 事务中，异常自动回滚 |
-| `RunTaskJob::failed()` | `is_processing=false`, `last_run_at=now` | 非事务，保证最终释放锁 |
-
-**无运行状态回滚的理由**：Panel 本质上是**控制平面**，游戏服实际运行状态在 Wings/容器中。Panel 只发指令 + 记日志，不维护权威状态副本。
+| 入队后服务器被 suspended（`!is_null($server->status)`） | 调用 `failed()` 释放锁，不抛异常 |
 
 ---
 
-## 12. 客服视角：Power Action 语义对照表
+## 11. 客服视角：Power Action 语义对照表
 
-> 针对客服把按钮当命令行的场景，整理"按钮按下 → 代码路径 → 用户体感"：
+> 针对客服把按钮当命令行的场景，整理"按钮按下 → Panel 代码行为 →（【推断】Wings 行为）→ 玩家体感"：
 
-| 按钮 | 前端发送值 | Panel 路径 | Wings Endpoint（推断） | 用户体感 | 风险 |
-|------|-----------|-----------|---------------------|---------|------|
-| **Start** | `"start"` | `POST /power` → `DaemonPowerRepository` | `POST /api/servers/{uuid}/power {"action":"start"}` | 服务器启动，数秒到数分钟后可进入 | 正常操作，风险极低 |
-| **Stop** | `"stop"` | 同上 | 同上 | 玩家收到关服提示，地图存档 | **优雅关闭**，应默认使用 |
-| **Restart** | `"restart"` | 同上 | 同上 | 玩家被踢出 → 等待重连 | 可能触发玩家被踢 |
-| **Kill** | `"kill"` | 同上 | 同上 | 瞬间掉线，无存档过程 | ⚠️ 可能损坏地图/世界，仅在 Stop 卡死时使用 |
+| 按钮 | 实际发送值（Panel 代码可确认） | 【推断】Wings 行为 | 玩家体感 | 风险（客服应知） |
+|------|-----------------------------|-----------------|---------|----------------|
+| **Start** | `"start"`（WebSocket `set state` 或 REST `signal`） | 【推断】启动容器并执行启动命令 | 服务器开始启动，数秒到数分钟后可进 | 正常操作，几乎无风险 |
+| **Stop** | `"stop"` | 【推断】先执行 Egg 配置的 `stop_command`（如 Minecraft `/stop`）→ 等待 `stop_timeout`（默认 30s）→ 未退出则 SIGTERM → SIGKILL | 玩家收到服务器关闭中提示，地图正常存档 | **优雅关闭，应默认使用** |
+| **Restart** | `"restart"` | 【推断】先 stop 完整流程，容器退出后自动 start | 玩家被踢出 → 等待重连 | 会导致玩家被踢 |
+| **Kill** | `"kill"` | 【推断】直接 SIGKILL 容器进程组，不走 stop_command | 瞬间掉线，**无存档提示** | ⚠️ 可能损坏地图/世界；仅在 Stop 卡死无响应时使用 |
 
-**客服操作原则**：
-1. 日常关服一律 **Stop**，不用 Kill
-2. Stop 超过 2 分钟控制台无任何响应，才升级到 Kill
-3. Kill 后建议检查最新存档时间戳，再执行 Start
-4. **按钮 ≠ 命令行**：游戏内命令（`/op`, `whitelist add` 等）必须使用 Console 下方的命令输入框
+**客服应传达的操作原则**：
+1. 日常维护一律用 **Stop**，不用 Kill
+2. 只有当 Stop 超过 2 分钟控制台仍无任何响应时，才升级到 Kill
+3. Kill 之后建议检查游戏服最新存档完整性，再执行 Start
+4. **按钮 = 电源动作，不是命令输入框**。要执行游戏内命令（`/op`, `whitelist add` 等），使用 Console 下方命令输入框
 
 ---
 
-## 13. 关键文件索引（Panel 代码）
+## 12. 关键文件索引（Panel 侧可确认）
 
-### 前端 (React/TypeScript)
+### 12.1 前端 (React/TypeScript)
 
 | 文件 | 职责 |
 |------|------|
 | [PowerButtons.tsx](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/resources/scripts/components/server/console/PowerButtons.tsx) | 电源按钮 UI + WebSocket "set state" 发送 |
-| [Console.tsx](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/resources/scripts/components/server/console/Console.tsx) | xterm 终端 + WebSocket "send command" + 历史记录 |
-| [WebsocketHandler.tsx](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/resources/scripts/components/server/WebsocketHandler.tsx) | WebSocket 生命周期 + JWT 自动刷新 + `status` 事件接收 |
+| [Console.tsx](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/resources/scripts/components/server/console/Console.tsx) | xterm.js 终端 + WebSocket "send command" 发送 + 命令历史 |
+| [WebsocketHandler.tsx](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/resources/scripts/components/server/WebsocketHandler.tsx) | WebSocket 生命周期管理 + JWT 自动刷新 |
 | [Websocket.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/resources/scripts/plugins/Websocket.ts) | Sockette 封装 + 协议序列化 |
-| [Can.tsx](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/resources/scripts/components/elements/Can.tsx) | 权限条件渲染组件 |
-| [events.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/resources/scripts/components/server/events.ts) | WebSocket 事件枚举 |
-| [state/server/index.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/resources/scripts/state/server/index.ts) | 前端状态定义（ServerStatus = `'offline'\|'starting'\|'stopping'\|'running'\|null`）|
+| [Can.tsx](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/resources/scripts/components/elements/Can.tsx) | 基于权限的条件渲染组件 |
+| [events.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/resources/scripts/components/server/events.ts) | WebSocket 事件名枚举 |
+| [ServerConsoleContainer.tsx](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/resources/scripts/components/server/console/ServerConsoleContainer.tsx) | 控制台页面容器 + `PowerAction` 类型定义 |
 | [getWebsocketToken.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/resources/scripts/api/server/getWebsocketToken.ts) | REST 请求 WebSocket JWT |
-| [http.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/resources/scripts/api/http.ts) | Axios 实例（withCredentials=true, 20s 超时） |
+| [http.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/resources/scripts/api/http.ts) | Axios 实例配置（withCredentials=true, 20s 超时） |
 
-### Panel 后端 (PHP Laravel)
+### 12.2 Panel 后端 (PHP Laravel)
 
 #### 路由 & 中间件
 
 | 文件 | 职责 |
 |------|------|
-| [routes/api-client.php](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/routes/api-client.php) | `/api/client/servers/{server}/*` 路由（/command → CommandController） |
-| [Http/Kernel.php](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Http/Kernel.php) | 中间件栈（client-api / api / throttle） |
-| [Providers/RouteServiceProvider.php](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Providers/RouteServiceProvider.php) | 路由挂载 + 全局限流器（256/min）+ ResourceLimit::boot() |
-| [Enum/ResourceLimit.php](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Enum/ResourceLimit.php) | 资源级限流（Websocket 5/min/server） |
-| [Middleware/.../AuthenticateServerAccess.php](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Http/Middleware/Api/Client/Server/AuthenticateServerAccess.php) | 归属校验 + 状态冲突门禁（409） |
+| [routes/api-client.php](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/routes/api-client.php) | `/api/client/servers/{server}/*` 路由定义（已核对：/command→CommandController, /power→PowerController） |
+| [Http/Kernel.php](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Http/Kernel.php) | 中间件栈定义 |
+| [Providers/RouteServiceProvider.php](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Providers/RouteServiceProvider.php) | 路由挂载 + 全局限流器（api.client: 256/min）+ ResourceLimit::boot() |
+| [Enum/ResourceLimit.php](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Enum/ResourceLimit.php) | 资源级限流器（Websocket 5/min/server） |
+| [Middleware/.../AuthenticateServerAccess.php](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Http/Middleware/Api/Client/Server/AuthenticateServerAccess.php) | 服务器归属 + 状态冲突门禁（409）|
 
 #### 控制器
 
 | 文件 | 职责 |
 |------|------|
-| [PowerController.php](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Http/Controllers/Api/Client/Servers/PowerController.php) | `POST /power` → DaemonPowerRepository + Activity |
-| [CommandController.php](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Http/Controllers/Api/Client/Servers/CommandController.php) | `POST /command` → DaemonCommandRepository + 502 转用户可读 + Activity |
-| [WebsocketController.php](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Http/Controllers/Api/Client/Servers/WebsocketController.php) | `GET /websocket` → 签发 10min JWT（含 permissions） |
+| [PowerController.php](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Http/Controllers/Api/Client/Servers/PowerController.php) | `POST /power` → DaemonPowerRepository + Activity Log |
+| [CommandController.php](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Http/Controllers/Api/Client/Servers/CommandController.php) | `POST /command` → DaemonCommandRepository + 502 转译 + Activity Log |
+| [WebsocketController.php](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Http/Controllers/Api/Client/Servers/WebsocketController.php) | `GET /websocket` → 签发 10min JWT（含 permissions 列表）+ 返回 WS URL |
 
 #### 请求验证（白名单）
 
 | 文件 | 职责 |
 |------|------|
-| [SendPowerRequest.php](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Http/Requests/Api/Client/Servers/SendPowerRequest.php) | `signal in:start,stop,restart,kill` + 权限映射 |
-| [SendCommandRequest.php](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Http/Requests/Api/Client/Servers/SendCommandRequest.php) | `command required\|min:1` + `control.console` 权限（无内容白名单）|
+| [SendPowerRequest.php](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Http/Requests/Api/Client/Servers/SendPowerRequest.php) | `signal in:start,stop,restart,kill` + 按 signal 映射权限 |
+| [SendCommandRequest.php](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Http/Requests/Api/Client/Servers/SendCommandRequest.php) | `command required\|min:1` + `control.console` 权限 |
 | [ClientApiRequest.php](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Http/Requests/Api/Client/ClientApiRequest.php) | `authorize()` → `user()->can(permission(), server)` |
-| [StoreTaskRequest.php](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Http/Requests/Api/Client/Servers/Schedules/StoreTaskRequest.php) | `action in:command,power,backup` + `time_offset max:900` |
+| [StoreTaskRequest.php](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Http/Requests/Api/Client/Servers/Schedules/StoreTaskRequest.php) | 调度任务 `action in:command,power,backup` + `time_offset max:900` |
 
 #### Wings 通信层
 
 | 文件 | 职责 |
 |------|------|
-| [DaemonRepository.php](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Repositories/Wings/DaemonRepository.php) | Guzzle 客户端 + Node Bearer Token + 超时配置（15s/5s）|
-| [DaemonPowerRepository.php](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Repositories/Wings/DaemonPowerRepository.php) | `POST /api/servers/{uuid}/power` body `{"action":...}` |
-| [DaemonCommandRepository.php](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Repositories/Wings/DaemonCommandRepository.php) | `POST /api/servers/{uuid}/commands` body `{"commands":[...]}` |
-| [DaemonServerRepository.php](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Repositories/Wings/DaemonServerRepository.php) | `GET /api/servers/{uuid}`（调度 only_when_online 用）|
-| [DaemonConnectionException.php](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Exceptions/Http/Connection/DaemonConnectionException.php) | Wings 异常封装 + X-Request-Id 关联 + 日志分级 |
+| [DaemonRepository.php](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Repositories/Wings/DaemonRepository.php) | Guzzle 客户端基类（Node Bearer Token + 超时 15s/5s） |
+| [DaemonPowerRepository.php](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Repositories/Wings/DaemonPowerRepository.php) | `POST /api/servers/{uuid}/power` body: `{"action": "..."}` |
+| [DaemonCommandRepository.php](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Repositories/Wings/DaemonCommandRepository.php) | `POST /api/servers/{uuid}/commands` body: `{"commands": [...]}` |
+| [DaemonServerRepository.php](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Repositories/Wings/DaemonServerRepository.php) | `GET /api/servers/{uuid}`（调度 only_when_online 检查用）|
+| [DaemonConnectionException.php](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Exceptions/Http/Connection/DaemonConnectionException.php) | Wings 异常封装 + X-Request-Id + 自动日志分级 |
 
 #### 权限 & 模型
 
 | 文件 | 职责 |
 |------|------|
-| [Permission.php](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Models/Permission.php) | 权限常量（control.* / websocket.connect）|
-| [Policies/ServerPolicy.php](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Policies/ServerPolicy.php) | Gate 判定：管理员/所有者放行，子用户查 permissions 数组 |
-| [Models/Server.php](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Models/Server.php) | `validateCurrentState()`（suspended/维护/安装/还原/迁移 → 409），`status` 仅存元状态 |
-| [Services/Nodes/NodeJWTService.php](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Services/Nodes/NodeJWTService.php) | HS256 JWT 签发，嵌入 permissions + server_uuid |
-
-#### 调度系统
-
-| 文件 | 职责 |
-|------|------|
-| [Services/Schedules/ProcessScheduleService.php](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Services/Schedules/ProcessScheduleService.php) | 事务入队 + only_when_online 检查 + 延迟分发 |
-| [Jobs/Schedule/RunTaskJob.php](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Jobs/Schedule/RunTaskJob.php) | 按 sequence_id 顺序执行 + continue_on_failure 降级 + failed() 释放锁 |
-| [Models/Task.php](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Models/Task.php) | Task::ACTION_POWER/COMMAND/BACKUP 常量 |
-
-#### 配置
-
-| 文件 | 职责 |
-|------|------|
-| [config/http.php](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/config/http.php) | API 限流阈值（client 256/min） |
-| [config/pterodactyl.php](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/config/pterodactyl.php) | Guzzle 超时（15s/5s） |
-
----
-
-## 14. 附：客服 FAQ 速查
-
-**Q1: 点 Stop 按钮等了好久都没反应怎么办？**
-A: Stop 是优雅关闭，先让游戏服自己存档。正常 10~30 秒。超过 2 分钟控制台无任何输出，说明游戏服进程卡死，才可升级到 **Kill** 按钮（会弹二次确认）。Kill 有未存档丢失风险。
-
-**Q2: Start 按钮灰的点不了？**
-A: 只有当 `state.status.value === 'offline'`（WebSocket 推送的前端状态）时 Start 才可用。检查 Console 页面左上角状态标签。
-
-**Q3: 命令输入框输 "stop" 回车 和点 Stop 按钮一样吗？**
-A: **完全不同！**
-- 命令输入框发的是**游戏服控制台命令**（Minecraft 里要输 `/stop` 才是关服，直接 `stop` 在大多数游戏里不是合法指令）。
-- Stop **按钮**走的是电源动作，由 Wings 负责完整优雅关闭流程，**推荐用按钮**。
-
-**Q4: Kill 和 Stop 到底有啥区别？**
-A: Stop = 给游戏服机会存档 + 正常退出（安全）；Kill = 直接杀死进程（等同拔电源）。Kill 只应在 Stop 卡死时用。用完建议检查存档后再 Start。
-
-**Q5: 服务器被暂停（suspended）了，能发命令吗？**
-A: Panel 后端 `AuthenticateServerAccess` 中间件会拒绝 `/power` 和 `/command` 请求（HTTP 409 Conflict）。即使 WebSocket 连上也只能看日志。先解除暂停。
-
-**Q6: 命令输入框没了？**
-A: 检查账号有没有 `control.console` 子用户权限（由所有者在 Users 标签页分配）。无权限时输入框不渲染，Wings 侧 JWT 权限校验也会拦截。
+| [Permission.php
