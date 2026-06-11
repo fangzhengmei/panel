@@ -1,200 +1,191 @@
-# Pterodactyl Panel 自动放置算法代码解析
+# Pterodactyl Panel 节点与自动放置算法代码解析
 
-## 一、整体架构与处理路径
+## 一、入口层：两条独立路径
 
-服务器创建流程涉及两条主要路径：**手动指定节点**与**自动部署（Auto-Deployment）**。当用户选择自动部署时，系统会依次经过以下核心服务层：
+Pterodactyl Panel 中创建服务器存在**两条独立且不对称**的路径：**管理端手动创建**与**Application API 自动部署**。两者在容量校验、参数入口、调用链路上都有显著差异。
 
-```
-请求入口（Admin UI / Application API）
-    ↓
-1. 表单/请求验证（ServerFormRequest / StoreServerRequest）
-    ↓
-2. ServerCreationService::handle()
-    ├─ 如果是自动部署 → configureDeployment()
-    │   ├─ FindViableNodesService → 筛选满足容量的节点
-    │   └─ AllocationSelectionService → 在候选节点中选择端口分配
-    ├─ 数据库事务：创建 Server 记录、绑定 Allocation、存储 Egg 变量
-    └─ DaemonServerRepository::create() → 下发给 Wings Daemon
-    ↓
-3. 失败回退：若 Wings 连接失败 → ServerDeletionService 清理数据库记录
-```
+### 1.1 管理端手动创建路径（Admin UI）
 
-### 关键文件索引
-
-| 文件 | 功能 |
-|------|------|
-| [FindViableNodesService.php](file:///d:/fz/0508-3/solo-dogfeeding/code/210-panel/app/Services/Deployment/FindViableNodesService.php) | 节点容量筛选核心算法 |
-| [AllocationSelectionService.php](file:///d:/fz/0508-3/solo-dogfeeding/code/210-panel/app/Services/Deployment/AllocationSelectionService.php) | Allocation 选择（端口/IP分配） |
-| [ServerCreationService.php](file:///d:/fz/0508-3/solo-dogfeeding/code/210-panel/app/Services/Servers/ServerCreationService.php) | 服务器创建编排，部署配置，失败回退 |
-| [Node.php](file:///d:/fz/0508-3/solo-dogfeeding/code/210-panel/app/Models/Node.php) | Node 模型（含 isViable() 容量校验方法） |
-| [AllocationRepository.php](file:///d:/fz/0508-3/solo-dogfeeding/code/210-panel/app/Repositories/Eloquent/AllocationRepository.php) | getRandomAllocation() 随机分配算法 |
-| [NodeRepository.php](file:///d:/fz/0508-3/solo-dogfeeding/code/210-panel/app/Repositories/Eloquent/NodeRepository.php) | getUsageStats() 使用率统计 |
-| [BuildModificationService.php](file:///d:/fz/0508-3/solo-dogfeeding/code/210-panel/app/Services/Servers/BuildModificationService.php) | Allocation 增减、default 回退 |
-| [DeploymentObject.php](file:///d:/fz/0508-3/solo-dogfeeding/code/210-panel/app/Models/Objects/DeploymentObject.php) | 部署参数对象（locations / ports / dedicated） |
-| [StoreServerRequest.php](file:///d:/fz/0508-3/solo-dogfeeding/code/210-panel/app/Http/Requests/Api/Application/Servers/StoreServerRequest.php) | API 层部署参数解析（getDeploymentObject） |
-| [DaemonServerRepository.php](file:///d:/fz/0508-3/solo-dogfeeding/code/210-panel/app/Repositories/Wings/DaemonServerRepository.php) | Wings Daemon 通信（POST /api/servers） |
-| [ServerDeletionService.php](file:///d:/fz/0508-3/solo-dogfeeding/code/210-panel/app/Services/Servers/ServerDeletionService.php) | 失败回退时清理资源 |
-| [NodeDeploymentController.php](file:///d:/fz/0508-3/solo-dogfeeding/code/210-panel/app/Http/Controllers/Api/Application/Nodes/NodeDeploymentController.php) | API 部署节点查询端点 |
-
----
-
-## 二、入口层：请求验证与部署参数解析
-
-### 2.1 Admin UI 路径（CreateServerController）
-
-Admin 面板通过 [CreateServerController::store()](file:///d:/fz/0508-3/solo-dogfeeding/code/210-panel/app/Http/Controllers/Admin/Servers/CreateServerController.php#L70-L83) 处理表单：
+**入口控制器**：[CreateServerController::store()](file:///d:/fz/0508-3/solo-dogfeeding/code/210-panel/app/Http/Controllers/Admin/Servers/CreateServerController.php#L70-L83)
 
 ```php
-// 第 78 行：直接调用 creationService，未传 DeploymentObject
+// 第 78 行：仅传 $data，不传 DeploymentObject
 $server = $this->creationService->handle($data);
 ```
 
-Admin UI 使用 `auto_deploy` 标志字段（在 [ServerFormRequest::withValidator()](file:///d:/fz/0508-3/solo-dogfeeding/code/210-panel/app/Http/Requests/Admin/ServerFormRequest.php#L26-L57) 中验证）：
+**关键事实**：
+- 管理端 UI（`new.blade.php`）**没有**「自动部署/Auto Deploy」选项，只有下拉式节点选择 + 端口分配选择
+- 虽然 `ServerFormRequest::withValidator()` 中存在 `auto_deploy` 的条件验证逻辑，但 UI 上没有对应输入框，该字段目前为**预留接口**
+- 手动路径下 `node_id` 和 `allocation_id` 为必填
+- **手动创建不做容量校验**：直接进入数据库事务创建服务器，不经过 FindViableNodesService
 
-- **`auto_deploy = false`**（默认）：`node_id` 与 `allocation_id` 必选，手动指定
-- **`auto_deploy = true`**：不需要 `node_id`/`allocation_id`，由自动部署逻辑接管
-
-### 2.2 Application API 路径（ServerController）
-
-通过 [StoreServerRequest::getDeploymentObject()](file:///d:/fz/0508-3/solo-dogfeeding/code/210-panel/app/Http/Requests/Api/Application/Servers/StoreServerRequest.php#L138-L150) 解析 `deploy` 字段：
-
-```php
-$object = new DeploymentObject();
-$object->setDedicated($this->input('deploy.dedicated_ip', false));
-$object->setLocations($this->input('deploy.locations', []));
-$object->setPorts($this->input('deploy.port_range', []));
+**手动路径调用链**：
+```
+CreateServerController::store()
+    ↓ 表单验证（ServerFormRequest）
+ServerCreationService::handle($data)
+    ├─ 直接使用传入的 node_id / allocation_id
+    ├─ 数据库事务：创建 Server + 绑定 Allocation + 存储 Egg 变量
+    └─ DaemonServerRepository::create() → 下发 Wings
+        └─ 失败 → ServerDeletionService::withForce() 回退清理
 ```
 
-部署参数结构体 [DeploymentObject](file:///d:/fz/0508-3/solo-dogfeeding/code/210-panel/app/Models/Objects/DeploymentObject.php)：
+### 1.2 Application API 自动部署路径
 
-| 字段 | 类型 | 含义 |
-|------|------|------|
-| `dedicated` | bool | 是否独占 IP（dedicated_ip） |
-| `locations` | int[] | 候选位置 ID 数组 |
-| `ports` | string[] | 端口或端口范围（如 `25565` 或 `25565-25570`） |
+**入口控制器**：[ServerController::store()](file:///d:/fz/0508-3/solo-dogfeeding/code/210-panel/app/Http/Controllers/Api/Application/Servers/ServerController.php#L56-L63)
+
+```php
+// 第 58 行：第二个参数 $request->getDeploymentObject() 触发自动部署
+$server = $this->creationService->handle(
+    $request->validated(),
+    $request->getDeploymentObject()
+);
+```
+
+**部署参数解析**：[StoreServerRequest::getDeploymentObject()](file:///d:/fz/0508-3/solo-dogfeeding/code/210-panel/app/Http/Requests/Api/Application/Servers/StoreServerRequest.php#L138-L150) 从请求的 `deploy` 字段解析出 [DeploymentObject](file:///d:/fz/0508-3/solo-dogfeeding/code/210-panel/app/Models/Objects/DeploymentObject.php)：
+
+| `deploy` 子字段 | 对应 DeploymentObject 属性 | 含义 |
+|----------------|--------------------------|------|
+| `deploy.locations` | `$locations` (int[]) | 候选位置 ID，空数组表示全位置 |
+| `deploy.dedicated_ip` | `$dedicated` (bool) | 是否独占 IP |
+| `deploy.port_range` | `$ports` (string[]) | 端口或端口范围，如 `["25565", "25570-25580"]` |
+
+**验证规则**：`deploy` 与 `allocation.default` 互斥——有 `deploy` 时不需要指定 allocation；没有 `deploy` 时 `allocation.default` 必选。
+
+### 1.3 两条路径的核心差异
+
+| 维度 | 管理端手动创建 | API 自动部署 |
+|------|-------------|-----------|
+| 入口 | `POST /admin/servers/new` | `POST /api/application/servers` |
+| 触发标志 | 无（纯手动） | `deploy` 字段存在 |
+| 节点选择 | 手动指定 `node_id` | FindViableNodesService 自动筛选 |
+| 端口选择 | 手动指定 `allocation_id` | AllocationSelectionService 随机抽取 |
+| 容量校验 | ❌ 不做校验 | ✅ SQL 级 HAVING 校验 |
+| 节点可见性 | 所有节点（含 public=0） | 仅 public=1 的节点 |
+| 失败回退 | Wings 失败 → force 删除 | Wings 失败 → force 删除 |
 
 ---
 
-## 三、第一阶段：FindViableNodesService — 节点容量筛选
+## 二、第一阶段：FindViableNodesService — 候选节点筛选
 
-### 3.1 SQL 查询结构
+[FindViableNodesService::handle()](file:///d:/fz/0508-3/solo-dogfeeding/code/210-panel/app/Services/Deployment/FindViableNodesService.php#L69-L99) 是自动部署的第一关，通过单条 SQL 完成全部筛选。
 
-[FindViableNodesService::handle()](file:///d:/fz/0508-3/solo-dogfeeding/code/210-panel/app/Services/Deployment/FindViableNodesService.php#L69-L99) 是自动放置算法的核心，通过单条 SQL 完成筛选：
+### 2.1 过滤条件（由严到宽）
 
 ```php
 $query = Node::query()->select('nodes.*')
     ->selectRaw('IFNULL(SUM(servers.memory), 0) as sum_memory')
     ->selectRaw('IFNULL(SUM(servers.disk), 0) as sum_disk')
     ->leftJoin('servers', 'servers.node_id', '=', 'nodes.id')
-    ->where('nodes.public', 1);                              // 条件①：public=1 的节点
+    ->where('nodes.public', 1);        // 条件①：仅公开节点
 
 if (!empty($this->locations)) {
-    $query = $query->whereIn('nodes.location_id', $this->locations);  // 条件②：位置过滤
+    $query->whereIn('nodes.location_id', $this->locations);  // 条件②：位置过滤
 }
 
 $results = $query->groupBy('nodes.id')
-    // 条件③：内存容量校验
+    // 条件③：内存容量上限
     ->havingRaw('(IFNULL(SUM(servers.memory), 0) + ?) 
                 <= (nodes.memory * (1 + (nodes.memory_overallocate / 100)))', [$this->memory])
-    // 条件④：磁盘容量校验
+    // 条件④：磁盘容量上限
     ->havingRaw('(IFNULL(SUM(servers.disk), 0) + ?) 
                 <= (nodes.disk * (1 + (nodes.disk_overallocate / 100)))', [$this->disk]);
 ```
 
-### 3.2 容量计算公式（标准）
+### 2.2 容量计算公式
 
-**节点容量上限 = 基础容量 × (1 + overallocate 百分比)**
+**通用公式**：
 
 ```
-内存上限 = nodes.memory × (1 + nodes.memory_overallocate / 100)
-磁盘上限 = nodes.disk   × (1 + nodes.disk_overallocate / 100)
+已用资源 + 新增请求资源 ≤ 节点基础容量 × (1 + overallocate 百分比 / 100)
 ```
 
-**已使用量 = 该节点下所有 servers 表记录的 memory/disk 字段之和**（通过 LEFT JOIN + SUM 聚合）。
+**已用资源**：通过 `LEFT JOIN servers + SUM()` 聚合该节点下所有服务器的 memory/disk 字段之和。**所有状态的服务器都计入**（suspended / installing / install_failed 全部占用配额）。
 
-**判定条件**：`已使用量 + 新增服务器请求量 ≤ 节点容量上限`
+### 2.3 overallocate 值的完整语义
 
-### 3.3 overallocate（超售）值的语义
+`memory_overallocate` 与 `disk_overallocate` 的设计意图与代码实现存在**不一致**，需要特别注意。
 
-在 [Node.php](file:///d:/fz/0508-3/solo-dogfeeding/code/210-panel/app/Models/Node.php#L107-L109) 验证规则中：
+#### 设计意图（文档/注释层面）
 
-| `memory_overallocate` 值 | 含义 |
-|-------------------------|------|
-| `-1` | **无限超售**：公式 `(1 + (-1/100)) = 0.99`，但在 SQL 中实际表现为上限非常宽松。⚠️ 该值在 `numeric|min:-1` 中允许，具体语义依赖面板文档 |
-| `0`  | **禁止超售**：上限 = 100% 基础容量 |
-| `50` | **允许超售 50%**：上限 = 基础容量 × 1.5 |
-| `100`| **允许超售 100%**：上限 = 基础容量 × 2.0 |
+在 [nodes/new.blade.php](file:///d:/fz/0508-3/solo-dogfeeding/code/210-panel/resources/views/admin/nodes/new.blade.php#L124) 注释中明确说明：
+> "To disable checking for overallocation enter `-1` into the field."
 
-> **注意**：SQL 使用的是 `1 + (overallocate / 100)` 而非 `1 + (overallocate / 100 * sign)`，当 `overallocate = -1` 时上限会略低于基础容量（99%），这是一个需要注意的边界行为。
+[MakeNodeCommand.php](file:///d:/fz/0508-3/solo-dogfeeding/code/210-panel/app/Console/Commands/Node/MakeNodeCommand.php#L58) 也提到：
+> "-1 will disable checking"
 
-### 3.4 模型层辅助校验：Node::isViable()
+即设计意图是：**`-1` = 禁用容量检查 = 无限超售**。
 
-在 [Node.php::isViable()](file:///d:/fz/0508-3/solo-dogfeeding/code/210-panel/app/Models/Node.php#L242-L249) 中提供了相同算法的 PHP 版本，用于非 SQL 场景（如单节点检查）：
+#### 代码实际行为
 
-```php
-public function isViable(int $memory, int $disk): bool
-{
-    $memoryLimit = $this->memory * (1 + ($this->memory_overallocate / 100));
-    $diskLimit   = $this->disk   * (1 + ($this->disk_overallocate   / 100));
+| overallocate 值 | FindViableNodesService / Node::isViable() | NodeRepository 统计显示 | 与设计意图是否一致 |
+|----------------|------------------------------------------|----------------------|----------------|
+| `-1` | 上限 = 基础 × 0.99（更严格） | 上限 = 基础 × 1.0（与 0 相同） | ❌ 不一致，且三处互异 |
+| `0`  | 上限 = 基础 × 1.0（不超售） | 上限 = 基础 × 1.0 | ✅ 一致 |
+| `50` | 上限 = 基础 × 1.5 | 上限 = 基础 × 1.5 | ✅ 一致 |
+| `100` | 上限 = 基础 × 2.0 | 上限 = 基础 × 2.0 | ✅ 一致 |
 
-    return ($this->sum_memory + $memory) <= $memoryLimit
-        && ($this->sum_disk   + $disk)   <= $diskLimit;
-}
-```
+**三处实现的具体代码**：
 
-### 3.5 结果输出
+1. **容量判断（FindViableNodesService SQL + Node::isViable）**：
+   ```php
+   // 无条件地使用公式 1 + (overallocate / 100)
+   $memoryLimit = $this->memory * (1 + ($this->memory_overallocate / 100));
+   ```
+   当 overallocate = -1 时，结果为 `0.99 × 基础容量`，相当于「比不超售还严格 1%」。
 
-- 如果结果集为空 → 抛出 **[NoViableNodeException](file:///d:/fz/0508-3/solo-dogfeeding/code/210-panel/app/Exceptions/Service/Deployment/NoViableNodeException.php)**（用户可翻译消息 `exceptions.deployment.no_viable_nodes`）
-- 结果中每条 Node 记录会额外携带 `sum_memory` 与 `sum_disk` 动态属性（通过 selectRaw 注入）
-- 支持分页：`handle($perPage, $page)`，默认不分页
+2. **统计显示（NodeRepository::getUsageStats）**：
+   ```php
+   if ($node->{$key . '_overallocate'} > 0) {  // 注意是 > 0
+       $maxUsage = $node->{$key} * (1 + ($node->{$key . '_overallocate'} / 100));
+   }
+   // overallocate <= 0 时，maxUsage = 基础容量
+   ```
+   当 overallocate = -1 时，条件 `> 0` 不成立，max 显示为基础容量（与 0 相同）。
 
-> **⚠️ 重要**：此阶段结果**未按资源使用率排序**，仅为满足条件的节点集合（SQL 默认按主键或 groupBy 顺序）。「资源最少节点优先」的排序在当前代码中**并未实现**——选择哪个节点实际是由下一个阶段的 Allocation 随机选择间接决定的。
+> **⚠️ 重要结论**：`overallocate = -1` 在当前代码中既不是「无限超售」（设计意图），也不是一个固定且自洽的行为——容量判断是 99% 上限，UI 显示是 100% 上限，二者不一致。运维在使用 `-1` 值时需特别谨慎。
+
+### 2.4 筛选结果
+
+- 结果集包含 `sum_memory`、`sum_disk` 两个动态属性（通过 selectRaw 注入）
+- 结果**未做排序**，默认按 `GROUP BY` 顺序（通常即节点主键升序）
+- 空结果集 → 抛出 [NoViableNodeException](file:///d:/fz/0508-3/solo-dogfeeding/code/210-panel/app/Exceptions/Service/Deployment/NoViableNodeException.php)
+- 支持分页（`handle($perPage, $page)`），供 API 列表查询端点使用
 
 ---
 
-## 四、第二阶段：AllocationSelectionService — 端口/IP 分配
+## 三、第二阶段：AllocationSelectionService — 端口与 IP 抽取
 
-### 4.1 选择流程
+[AllocationSelectionService::handle()](file:///d:/fz/0508-3/solo-dogfeeding/code/210-panel/app/Services/Deployment/AllocationSelectionService.php#L85-L94) 将上一阶段筛选出的节点 ID 列表传入 AllocationRepository，抽取一个空闲 Allocation 作为服务器主分配。
 
-[AllocationSelectionService::handle()](file:///d:/fz/0508-3/solo-dogfeeding/code/210-panel/app/Services/Deployment/AllocationSelectionService.php#L85-L94) 将 FindViableNodesService 返回的节点 ID 列表传入 AllocationRepository：
+### 3.1 抽取算法（AllocationRepository::getRandomAllocation）
 
-```php
-$allocation = $this->repository->getRandomAllocation(
-    $this->nodes,      // 上一阶段筛选出的节点 ID 数组
-    $this->ports,      // 用户指定的端口范围
-    $this->dedicated   // 是否独占 IP
-);
-```
-
-### 4.2 AllocationRepository::getRandomAllocation()
-
-[AllocationRepository::getRandomAllocation()](file:///d:/fz/0508-3/solo-dogfeeding/code/210-panel/app/Repositories/Eloquent/AllocationRepository.php#L59-L99) 算法步骤：
+[AllocationRepository::getRandomAllocation()](file:///d:/fz/0508-3/solo-dogfeeding/code/210-panel/app/Repositories/Eloquent/AllocationRepository.php#L59-L99) 逐步收窄范围：
 
 ```php
-$query = Allocation::query()->whereNull('server_id');  // 条件①：未被分配
+$query = Allocation::query()->whereNull('server_id');      // 条件①：未分配
 
 if (!empty($nodes)) {
-    $query->whereIn('node_id', $nodes);                 // 条件②：节点范围限制
+    $query->whereIn('node_id', $nodes);                    // 条件②：候选节点
 }
 
 if (!empty($ports)) {
-    $query->where(function (Builder $inner) use ($ports) {
-        // 条件③：端口匹配（单端口 IN + 端口范围 BETWEEN）
+    $query->where(function (Builder $inner) use ($ports) { // 条件③：端口范围
         foreach ($ports as $port) {
             if (is_array($port)) {
-                $inner->orWhereBetween('port', $port);  // [25565, 25570]
+                $inner->orWhereBetween('port', $port);      // 端口范围 BETWEEN
             } else {
-                $whereIn[] = $port;                     // 单个端口
+                $whereIn[] = $port;                         // 单端口 IN
             }
         }
         if (!empty($whereIn)) $inner->orWhereIn('port', $whereIn);
     });
 }
 
-if ($dedicated) {
+if ($dedicated) {                                           // 条件④：独占 IP
     $discard = $this->getDiscardableDedicatedAllocations($nodes);
     if (!empty($discard)) {
-        // 条件④：独占 IP 过滤 — 排除已有服务器的 (node_id, ip) 组合
+        // 排除已有服务器占用的 (node_id, ip) 组合
         $query->whereNotIn(
             $this->getBuilder()->raw('CONCAT_WS("-", node_id, ip)'),
             $discard
@@ -202,107 +193,59 @@ if ($dedicated) {
     }
 }
 
-return $query->inRandomOrder()->first();  // ⚠️ 随机取第一条
+return $query->inRandomOrder()->first();                    // ⚠️ 随机取第一条
 ```
 
-### 4.3 关键机制：如何间接实现「资源最少优先」
+### 3.2 关键机制说明
 
-由于 `inRandomOrder()` 是**完全随机**选择，代码本身没有实现「资源最少节点优先」。但：
+**独占 IP（dedicated_ip）的判定粒度**：
+- 通过 `CONCAT_WS("-", node_id, ip)` 组合键判断
+- 同一 IP 下，只要有任意一个端口已分配给某个服务器，整个 IP 段对 dedicated 请求失效
+- 粒度是「每个 IP 地址」，不是「每个节点」也不是「每个端口段」
 
-1. **FindViableNodesService 结果集的大小**决定了每个节点被选中的概率
-2. 节点中**空闲 Allocation 数量多**意味着被抽中的概率更高（因为在 allocations 表中有更多条记录参与抽奖）
-3. 在实际使用中，「资源少的节点」通常创建的服务器少，空闲 Allocation 也更充足——这形成了一种**间接的、统计意义上的弱均衡**
+**随机选择的实际效果**：
+- 使用 `inRandomOrder()` 完全随机
+- 空闲 Allocation 条目数多的节点，被抽中的概率更高（统计意义上的间接均衡）
+- **不按「资源使用率」排序**，即「资源最少的节点优先」在当前代码中并未实现
 
-> **扩容建议**：如果希望严格按 `sum_memory + sum_disk` 最小优先，需要在 FindViableNodesService::handle() 后增加 `ORDER BY (sum_memory + sum_disk) ASC`，并在 AllocationSelectionService 中优先选择第一个节点，而非全节点随机。
+### 3.3 失败条件
 
-### 4.4 失败条件
-
-- 如果 `getRandomAllocation()` 返回 `null` → 抛出 **[NoViableAllocationException](file:///d:/fz/0508-3/solo-dogfeeding/code/210-panel/app/Exceptions/Service/Deployment/NoViableAllocationException.php)**
-- 这意味着：节点有容量，但所有满足条件的 IP/端口都被占用了
+- 返回 `null` → 抛出 [NoViableAllocationException](file:///d:/fz/0508-3/solo-dogfeeding/code/210-panel/app/Exceptions/Service/Deployment/NoViableAllocationException.php)
+- 场景：节点容量够，但所有满足条件的 IP/端口都被占满了
+- 与 NoViableNodeException 是**独立**的两层异常，不会自动降级
 
 ---
 
-## 五、容量使用量的计算口径
+## 四、第三阶段：数据库持久化与 Wings 下发
 
-### 5.1 NodeRepository::getUsageStats() 可视化统计
+### 4.1 ServerCreationService 主流程
 
-[NodeRepository::getUsageStats()](file:///d:/fz/0508-3/solo-dogfeeding/code/210-panel/app/Repositories/Eloquent/NodeRepository.php#L22-L49) 在管理后台显示节点使用量，使用相同的计算口径：
-
-```php
-$maxUsage = $node->{$key};
-if ($node->{$key . '_overallocate'} > 0) {
-    $maxUsage = $node->{$key} * (1 + ($node->{$key . '_overallocate'} / 100));
-}
-$percent = ($value / $maxUsage) * 100;
-```
-
-信号灯阈值（self::THRESHOLD_PERCENTAGE_LOW / MEDIUM）：
-- `≤ LOW` → **green**（健康）
-- `(LOW, MEDIUM]` → **yellow**（注意）
-- `> MEDIUM` → **red**（告警）
-
-### 5.2 使用量包含哪些服务器？
-
-SQL 通过 `LEFT JOIN servers ON servers.node_id = nodes.id` 聚合——**所有 node_id 匹配的 servers 记录都计入**，不论：
-- 服务器状态（installing / suspended / install_failed 都占用容量）
-- 服务器是否正在被删除（软删除除外）
-
-这意味着**暂停（suspended）的服务器仍占用容量配额**，不会因为无法运行而释放资源。
-
----
-
-## 六、失败回退（Fallback）与事务保证
-
-### 6.1 ServerCreationService 的事务+回滚结构
-
-[ServerCreationService::handle()](file:///d:/fz/0508-3/solo-dogfeeding/code/210-panel/app/Services/Servers/ServerCreationService.php#L52-L107) 采用「**先持久化，后调用 Wings，失败则清理**」的策略：
+[ServerCreationService::handle()](file:///d:/fz/0508-3/solo-dogfeeding/code/210-panel/app/Services/Servers/ServerCreationService.php#L52-L107) 的执行顺序是：**先写库，后调 Wings**。
 
 ```php
-// 步骤 1：数据库事务创建服务器（重试 5 次）
+// 步骤 1：数据库事务（重试 5 次）
 $server = $this->connection->transaction(function () use ($data, $eggVariableData) {
-    $server = $this->createModel($data);           // INSERT servers
-    $this->storeAssignedAllocations($server, $data);  // UPDATE allocations SET server_id
-    $this->storeEggVariables($server, $eggVariableData);  // INSERT server_variables
+    $server = $this->createModel($data);              // INSERT servers
+    $this->storeAssignedAllocations($server, $data);   // UPDATE allocations SET server_id
+    $this->storeEggVariables($server, $eggVariableData); // INSERT server_variables
     return $server;
 }, 5);
 
 // 步骤 2：调用 Wings Daemon
 try {
-    $this->daemonServerRepository->setServer($server)->create($startOnCompletion);
+    $this->daemonServerRepository->setServer($server)->create(
+        Arr::get($data, 'start_on_completion', false) ?? false
+    );
 } catch (DaemonConnectionException $exception) {
-    // ⚠️ 失败回退：强制删除已写库的服务器
+    // ⚠️ 失败回退：强制删除已持久化的服务器
     $this->serverDeletionService->withForce()->handle($server);
     throw $exception;
 }
 ```
 
-### 6.2 ServerDeletionService 清理细节
+### 4.2 Wings 下发细节
 
-[ServerDeletionService::handle()](file:///d:/fz/0508-3/solo-dogfeeding/code/210-panel/app/Services/Servers/ServerDeletionService.php#L43-L86)：
-
-```php
-try {
-    $this->daemonServerRepository->setServer($server)->delete();  // 尝试告诉 Wings 删除
-} catch (DaemonConnectionException $exception) {
-    // withForce=true 时：忽略 Daemon 404，不忽略其他错误
-    if (!$this->force && $exception->getStatusCode() !== 404) {
-        throw $exception;
-    }
-}
-
-$this->connection->transaction(function () use ($server) {
-    // 清理关联数据库（含 force 降级策略：删不掉 host 上的 DB 就只删面板记录）
-    foreach ($server->databases as $database) { ... }
-    // 清空 allocations.notes（防止备注泄露）
-    $server->allocations()->update(['notes' => null]);
-    // 删除 servers 记录 → allocations.server_id 将通过外键/模型层被置空
-    $server->delete();
-});
-```
-
-### 6.3 Daemon 通信端点
-
-[DaemonServerRepository::create()](file:///d:/fz/0508-3/solo-dogfeeding/code/210-panel/app/Repositories/Wings/DaemonServerRepository.php#L42-L56) 发送：
+[DaemonServerRepository::create()](file:///d:/fz/0508-3/solo-dogfeeding/code/210-panel/app/Repositories/Wings/DaemonServerRepository.php#L42-L56) 只发送基础信息：
 
 ```
 POST {node.getConnectionAddress()}/api/servers
@@ -312,107 +255,202 @@ POST {node.getConnectionAddress()}/api/servers
 }
 ```
 
-Wings 收到后会从 Panel 拉取完整配置（包括资源限制、挂载、启动命令等），所以此处不传细节。
+Wings 收到后会**主动回拉**完整配置（资源限制、挂载、启动命令、Egg 变量等），所以此处不传细节。
 
 ---
 
-## 七、与现有 Allocation 的相互影响
+## 五、失败回退：ServerDeletionService 分级处理
 
-### 7.1 Allocation 生命周期
+当 Wings 调用失败时，`ServerCreationService` 会调用 `ServerDeletionService::withForce()->handle($server)` 进行清理。
 
-| 阶段 | allocations.server_id | 说明 |
-|------|----------------------|------|
-| 创建（AssignmentService） | `NULL` | 由 [AssignmentService::handle()](file:///d:/fz/0508-3/solo-dogfeeding/code/210-panel/app/Services/Allocations/AssignmentService.php) 批量导入，CIDR / 端口范围校验 |
-| 分配给服务器 | `= server.id` | `storeAssignedAllocations()` → `UPDATE allocations SET server_id = ? WHERE id IN (?)` |
-| 服务器删除 | → `NULL` | 通过 ServerDeletionService 事务级联 |
-| Build 修改（增/删 Allocation） | 切换 | [BuildModificationService::processAllocations()](file:///d:/fz/0508-3/solo-dogfeeding/code/210-panel/app/Services/Servers/BuildModificationService.php#L82-L130) |
+[ServerDeletionService::handle()](file:///d:/fz/0508-3/solo-dogfeeding/code/210-panel/app/Services/Servers/ServerDeletionService.php#L43-L86) 采用「**三级降级**」策略：
 
-### 7.2 Default Allocation 回退机制
-
-在修改服务器 Allocation（Build 页面）时，[BuildModificationService::processAllocations()](file:///d:/fz/0508-3/solo-dogfeeding/code/210-panel/app/Services/Servers/BuildModificationService.php#L103-L129) 有一层重要的**安全回退**：
+### 5.1 第一级：Wings 端删除（可降级）
 
 ```php
-if (!empty($data['remove_allocations'])) {
-    foreach ($data['remove_allocations'] as $allocation) {
-        // 若用户要删除默认分配（default allocation）
-        if ($allocation === ($data['allocation_id'] ?? $server->allocation_id)) {
-            if (empty($freshlyAllocated)) {
-                // ❌ 没有新增 Allocation 可替代 → 拒绝操作
-                throw new DisplayException(
-                    'You are attempting to delete the default allocation 
-                     for this server but there is no fallback allocation to use.'
-                );
-            }
-            // ✅ 自动回退到第一个新增的 Allocation 作为新 default
-            $data['allocation_id'] = $freshlyAllocated;
+try {
+    $this->daemonServerRepository->setServer($server)->delete();
+} catch (DaemonConnectionException $exception) {
+    if (!$this->force && $exception->getStatusCode() !== Response::HTTP_NOT_FOUND) {
+        throw $exception;  // 非 force 且非 404 → 中止删除
+    }
+    Log::warning($exception); // force 模式或 404 → 记日志，继续
+}
+```
+
+| 场景 | 非 force 模式 | force 模式 |
+|------|-------------|-----------|
+| Wings 正常删除（2XX） | ✅ 继续 | ✅ 继续 |
+| Wings 返回 404 | ✅ 继续（视为已不存在） | ✅ 继续 |
+| Wings 连接失败 / 5XX / 其他错误 | ❌ 抛出异常，中止删除 | ✅ 记 warning 日志，继续面板清理 |
+
+### 5.2 第二级：数据库 host 上的数据库（可降级）
+
+```php
+foreach ($server->databases as $database) {
+    try {
+        $this->databaseManagementService->delete($database); // 真实删 host 上的 DB
+    } catch (\Exception $exception) {
+        if (!$this->force) {
+            throw $exception;  // 非 force → 中止
         }
+        $database->delete();    // force → 只删面板记录，host 上留 dangling DB
+        Log::warning($exception);
     }
 }
 ```
 
-### 7.3 自动部署对 Allocation 池的影响
+force 模式下会留下「悬挂数据库」（dangling database），这是已知行为（见代码注释中的 issue #2085）。
 
-自动部署流程使用 `getRandomAllocation()` 的 SQL 满足：
+### 5.3 第三级：面板数据库清理（必执行）
 
-- **`server_id IS NULL`**：仅从空闲池选取
-- **`whereIn('node_id', $nodes)`**：限定在容量达标节点
-- **dedicated_ip 过滤**：通过 `CONCAT_WS(node_id, ip)` 排除已有服务器占用的整段 IP——即：同一 IP 下只要有一个端口被分配，整个 IP 对 dedicated 请求不可用
-- **`inRandomOrder()`**：避免端口热点（但会让节点选择也变得随机）
+```php
+// 清空 Allocation 备注（防止信息泄露）
+$server->allocations()->update(['notes' => null]);
 
-### 7.4 Allocation 与容量计算的独立性
+// 删除 Server 记录（级联影响：
+//   - allocations.server_id → 通过外键/模型事件置空
+//   - server_variables / subusers / schedules 等关联数据级联删除
+// )
+$server->delete();
+```
 
-**重要区别**：
-- **FindViableNodesService** 使用 `servers.memory / servers.disk` 聚合 → 关注**资源使用量**
-- **AllocationSelectionService** 使用 `allocations` 表 → 关注**IP/端口可用性**
-
-两者是**独立**的。存在理论边界情况：节点资源充足但所有 Allocation 都被占用 → `NoViableAllocationException`；或有空闲端口但容量不足 → `NoViableNodeException`。两种异常会分别抛出，不会自动交叉降级。
+> **注意**：Allocation 的 `server_id` 被置空后，该端口重新回到可分配池中。notes 被清空是为了防止前一个服务器的备注信息泄露给后续分配到该端口的服务器。
 
 ---
 
-## 八、扩容建议：实现「资源最少节点优先」
+## 六、与现有 Allocation 的相互影响
 
-如前所述，当前实现是**随机均衡**而非**资源最少优先**。若需改造，建议在以下两处修改：
+### 6.1 Allocation 生命周期
 
-### 改造点 1：FindViableNodesService 增加排序
+| 阶段 | `allocations.server_id` | 触发方式 |
+|------|----------------------|---------|
+| 初始创建 | `NULL` | [AssignmentService::handle()](file:///d:/fz/0508-3/solo-dogfeeding/code/210-panel/app/Services/Allocations/AssignmentService.php) 批量导入 |
+| 分配给服务器 | `= server.id` | `storeAssignedAllocations()` → `UPDATE allocations SET server_id = ?` |
+| 服务器删除 | → `NULL` | ServerDeletionService 事务中 `$server->delete()` 级联 |
+| Build 修改（增/减端口） | 切换 | [BuildModificationService::processAllocations()](file:///d:/fz/0508-3/solo-dogfeeding/code/210-panel/app/Services/Servers/BuildModificationService.php#L82-L130) |
 
-在 [FindViableNodesService.php](file:///d:/fz/0508-3/solo-dogfeeding/code/210-panel/app/Services/Deployment/FindViableNodesService.php) 的 `$query->groupBy('nodes.id')` 之后增加：
+### 6.2 Default Allocation 的安全回退
 
-```php
-->orderByRaw('(IFNULL(SUM(servers.memory), 0) / (nodes.memory * (1 + (nodes.memory_overallocate / 100))) 
-             + IFNULL(SUM(servers.disk), 0)   / (nodes.disk   * (1 + (nodes.disk_overallocate   / 100)))) ASC');
-```
+在修改服务器 Build 配置（增减 Allocation）时，有一层**重要的安全回退**机制：
 
-该排序按「**内存使用率 + 磁盘使用率**」之和升序排列，综合负载最低的节点排在最前。
-
-### 改造点 2：AllocationSelectionService 优先从前若干节点选择
-
-在 [AllocationSelectionService.php](file:///d:/fz/0508-3/solo-dogfeeding/code/210-panel/app/Services/Deployment/AllocationSelectionService.php) 中，将全部节点一次性传入改为：先尝试前 N（如前 3 个）节点，如果没有合适 Allocation，再放宽到全部节点。
+[BuildModificationService::processAllocations()](file:///d:/fz/0508-3/solo-dogfeeding/code/210-panel/app/Services/Servers/BuildModificationService.php#L103-L129)：
 
 ```php
-// 伪代码思路
-$tier1 = array_slice($this->nodes, 0, 3);
-$allocation = $this->repository->getRandomAllocation($tier1, $this->ports, $this->dedicated);
-if (!$allocation) {
-    $allocation = $this->repository->getRandomAllocation($this->nodes, $this->ports, $this->dedicated);
+// 如果用户试图删除默认分配（default allocation）
+if ($allocation === ($data['allocation_id'] ?? $server->allocation_id)) {
+    if (empty($freshlyAllocated)) {
+        // ❌ 没有可替代的新分配 → 拒绝操作
+        throw new DisplayException(
+            'You are attempting to delete the default allocation 
+             for this server but there is no fallback allocation to use.'
+        );
+    }
+    // ✅ 自动回退到第一个新增的 Allocation 作为新 default
+    $data['allocation_id'] = $freshlyAllocated;
 }
 ```
 
-这样既优先填满最空闲的节点，又保证不会因头部节点端口耗尽而阻塞部署。
+即：删除默认端口时，如果同时有新增端口，自动用第一个新增端口作为新的默认端口；没有新增端口则禁止删除。
+
+### 6.3 自动部署对 Allocation 池的影响
+
+自动部署使用 `getRandomAllocation()` 从池中随机抽取，对 Allocation 池的影响与手动分配一致：
+- 选中后通过 `storeAssignedAllocations()` 标记 `server_id`
+- 服务器删除后自动回到池中
+- dedicated_ip 模式下，分配后该 IP 对其他 dedicated 请求不可见
+
+### 6.4 容量计算与 Allocation 的独立性
+
+**两个维度相互独立**：
+- **容量维度**（memory / disk）→ 通过 `servers` 表聚合计算，与 Allocation 数量无关
+- **端口维度**（IP / port）→ 通过 `allocations` 表判断，与服务器资源无关
+
+可能出现的边界场景：
+- 「容量够但端口不够」→ `NoViableAllocationException`
+- 「端口够但容量不够」→ `NoViableNodeException`
+- 两种异常独立抛出，不会交叉降级
 
 ---
 
-## 九、异常体系与诊断
+## 七、完整调用链总图
 
-| 异常类 | 触发场景 | 含义 |
-|--------|---------|------|
-| [NoViableNodeException](file:///d:/fz/0508-3/solo-dogfeeding/code/210-panel/app/Exceptions/Service/Deployment/NoViableNodeException.php) | FindViableNodesService 返回空 | 所有位置的 public 节点容量都不足 |
-| [NoViableAllocationException](file:///d:/fz/0508-3/solo-dogfeeding/code/210-panel/app/Exceptions/Service/Deployment/NoViableAllocationException.php) | getRandomAllocation() 返回 null | 有容量但 IP/端口池耗尽 |
-| DaemonConnectionException | Wings 无法访问 / 返回非 2xx | 下发失败，触发 ServerDeletionService 回退 |
-| ValidationException (auto_deploy=false 时) | node_id / allocation_id 不存在或已占用 | 手动指定参数不合法 |
-| CidrOutOfRangeException / PortOutOfRangeException | 创建 Allocation 池时 | 管理员导入 CIDR 或端口范围错误 |
+```
+┌───────────────────────────────────────────────────────────────────┐
+│                     Application API 自动部署路径                   │
+├───────────────────────────────────────────────────────────────────┤
+│  POST /api/application/servers                                    │
+│    (带 deploy: { locations, dedicated_ip, port_range })          │
+│         ↓                                                          │
+│  StoreServerRequest::validate()                                   │
+│    └─ getDeploymentObject() → DeploymentObject                   │
+│         ↓                                                          │
+│  ServerController::store()                                        │
+│         ↓                                                          │
+│  ServerCreationService::handle($data, $deployment)                │
+│    ├─ configureDeployment()                                       │
+│    │   ├─ FindViableNodesService                                  │
+│    │   │   └─ SQL: public=1 + location IN + capacity HAVING       │
+│    │   │      → 返回 Node 集合（含 sum_memory / sum_disk）         │
+│    │   └─ AllocationSelectionService                              │
+│    │       └─ AllocationRepository::getRandomAllocation()         │
+│    │          → 返回单个随机 Allocation                            │
+│    ├─ DB 事务（重试 5 次）                                         │
+│    │   ├─ createModel() → INSERT servers                         │
+│    │   ├─ storeAssignedAllocations() → UPDATE allocations        │
+│    │   └─ storeEggVariables() → INSERT server_variables          │
+│    └─ DaemonServerRepository::create() → POST Wings              │
+│       └─ 失败 → ServerDeletionService::withForce() 回退清理       │
+└───────────────────────────────────────────────────────────────────┘
 
-排查自动部署失败的推荐顺序：
-1. 查看异常类型 → 定位是「容量问题」还是「端口问题」
-2. 容量问题 → 在 `nodes` 表检查 `memory / disk / memory_overallocate / disk_overallocate / public` 字段
-3. 端口问题 → 在 `allocations` 表按 `node_id` 查询 `server_id IS NULL` 的记录数
-4. Wings 通信问题 → 检查 Wings 日志、节点 `fqdn` / `scheme` / `daemonListen` 配置，以及防火墙
+┌───────────────────────────────────────────────────────────────────┐
+│                      管理端 UI 手动创建路径                        │
+├───────────────────────────────────────────────────────────────────┤
+│  POST /admin/servers/new                                          │
+│    (带 node_id + allocation_id + allocation_additional)           │
+│         ↓                                                          │
+│  ServerFormRequest::validate()                                    │
+│    └─ auto_deploy 字段预留（UI 上不存在）                           │
+│         ↓                                                          │
+│  CreateServerController::store()                                  │
+│         ↓                                                          │
+│  ServerCreationService::handle($data)                             │
+│    ├─ 直接使用传入的 node_id / allocation_id                      │
+│    ├─ ❌ 不经过 FindViableNodesService（无容量校验）               │
+│    ├─ DB 事务（重试 5 次）                                         │
+│    └─ DaemonServerRepository::create() → POST Wings              │
+│       └─ 失败 → ServerDeletionService::withForce() 回退清理       │
+└───────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 八、异常诊断速查表
+
+| 异常 | 触发阶段 | 根因方向 | 排查命令/字段 |
+|------|---------|---------|-------------|
+| `NoViableNodeException` | FindViableNodesService | 所有 public 节点容量不足 | `SELECT memory, disk, memory_overallocate, disk_overallocate, public FROM nodes` |
+| `NoViableAllocationException` | AllocationSelectionService | 合格节点的空闲端口耗尽 | `SELECT COUNT(*) FROM allocations WHERE node_id IN (...) AND server_id IS NULL` |
+| `DaemonConnectionException` | Wings 调用 | Wings 不可达 / 返回错误 | 检查 Wings 日志、`daemonListen`、`scheme`、防火墙 |
+| `ValidationException` | 请求验证 | 参数缺失 / 不合法 | 检查 `deploy` 与 `allocation` 是否互斥 |
+| `DataValidationException` | Model 保存 | 数据不满足字段规则 | 查看 Server 模型 `getRules()` |
+
+---
+
+## 九、关键文件索引
+
+| 文件 | 职责 |
+|------|------|
+| [FindViableNodesService.php](file:///d:/fz/0508-3/solo-dogfeeding/code/210-panel/app/Services/Deployment/FindViableNodesService.php) | 节点容量筛选（SQL HAVING） |
+| [AllocationSelectionService.php](file:///d:/fz/0508-3/solo-dogfeeding/code/210-panel/app/Services/Deployment/AllocationSelectionService.php) | Allocation 抽取封装 |
+| [AllocationRepository.php](file:///d:/fz/0508-3/solo-dogfeeding/code/210-panel/app/Repositories/Eloquent/AllocationRepository.php) | getRandomAllocation() 实际算法 |
+| [ServerCreationService.php](file:///d:/fz/0508-3/solo-dogfeeding/code/210-panel/app/Services/Servers/ServerCreationService.php) | 创建编排 + Wings 调用 + 失败回退 |
+| [ServerDeletionService.php](file:///d:/fz/0508-3/solo-dogfeeding/code/210-panel/app/Services/Servers/ServerDeletionService.php) | 删除与 force 降级逻辑 |
+| [Node.php](file:///d:/fz/0508-3/solo-dogfeeding/code/210-panel/app/Models/Node.php) | Node 模型 + isViable() 方法 |
+| [NodeRepository.php](file:///d:/fz/0508-3/solo-dogfeeding/code/210-panel/app/Repositories/Eloquent/NodeRepository.php) | 使用率统计（与容量判断公式不一致） |
+| [DeploymentObject.php](file:///d:/fz/0508-3/solo-dogfeeding/code/210-panel/app/Models/Objects/DeploymentObject.php) | 部署参数对象 |
+| [StoreServerRequest.php](file:///d:/fz/0508-3/solo-dogfeeding/code/210-panel/app/Http/Requests/Api/Application/Servers/StoreServerRequest.php) | API 层 deploy 参数解析 |
+| [CreateServerController.php](file:///d:/fz/0508-3/solo-dogfeeding/code/210-panel/app/Http/Controllers/Admin/Servers/CreateServerController.php) | 管理端创建入口（无自动部署） |
+| [ServerController.php](file:///d:/fz/0508-3/solo-dogfeeding/code/210-panel/app/Http/Controllers/Api/Application/Servers/ServerController.php) | API 服务器创建入口 |
+| [DaemonServerRepository.php](file:///d:/fz/0508-3/solo-dogfeeding/code/210-panel/app/Repositories/Wings/DaemonServerRepository.php) | Wings Daemon 通信 |
+| [DaemonConnectionException.php](file:///d:/fz/0508-3/solo-dogfeeding/code/210-panel/app/Exceptions/Http/Connection/DaemonConnectionException.php) | Wings 连接异常（含 getStatusCode） |
