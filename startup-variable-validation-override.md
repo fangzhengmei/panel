@@ -1,4 +1,4 @@
-# Pterodactyl Panel 启动变量校验、覆盖优先级与下发流程
+# 启动变量覆盖与校验全链路分析（startup variable validation & override）
 
 本文档通过代码走查，系统梳理 Pterodactyl Panel 中游戏服启动变量从 Egg 模板定义、管理员与用户分别可配置范围、校验规则、覆盖优先级，到最终下发至 Wings 守护进程并参与启动命令组装的完整代码走向。
 
@@ -272,59 +272,174 @@ foreach ($results as $result) {
 - 处于状态②的变量（原本是空串）：有匹配行 → 更新为表单当前值。如果用户什么也没改，表单提交的就是之前回填的值，见下一节。
 - 处于状态③的变量（Egg 新增、还没记录）：无匹配行 → **新插入一行**，值为表单中该 input 的值。保存之后这台服务器对该变量就**从③退不回 Egg 默认了**。
 
-### 5.4 界面回填逻辑：后台 vs 客户端 —— "显示默认"不等于"实际会回退"
+### 5.4 界面显示逻辑全景：后台 vs 客户端、三种控件的差异
 
-**后台启动页（Blade + jQuery）：**
+这一节是全文档最容易混淆的部分。`$server_value ?? $default_value` 这个后端表达式很简单，但**前端有多少种控件、就有多少套显示策略**，再乘以两种管理入口，组合出的差异很容易把用户和运维一起绕晕。
 
-[ServerViewController.php#L71-L87](file:///d:/fz/0508-3/solo-dogfeeding/code/202-panel/app/Http/Controllers/Admin/Servers/ServerViewController.php#L71-L87) 向 JS 注入 `Pterodactyl.server_variables`：
+先交代一个前提：后端数据的两种出口形态不同。
 
-```php
-$variables = $this->environmentService->handle($server);
-$this->plainInject(['server_variables' => $variables]);
-```
+- **后台启动页**数据来源：`EnvironmentService::handle($server)` 的输出，即已经用 `??` 算过一遍的"最终运行时值"（注入到 `Pterodactyl.server_variables`）
+- **客户端 API**数据来源：[EggVariableTransformer.php](file:///d:/fz/0508-3/solo-dogfeeding/code/202-panel/app/Transformers/Api/Client/EggVariableTransformer.php#L23-L31) 传出的是**原始分开的** `server_value` 和 `default_value` 两个字段，由前端自己决定怎么用
 
-EnvironmentService 的 Step 1 就已经用 `server_value ?? default_value` 跑过一次，所以注入的是"运行时会使用的最终值"（不是原始 DB 值）。
+---
 
-[startup.blade.php#L151-L170](file:///d:/fz/0508-3/solo-dogfeeding/code/202-panel/resources/views/admin/servers/view/startup.blade.php#L151-L170) 回填：
+#### 5.4.1 后台启动页（Blade + jQuery）：一种控件，口径一致
+
+后台所有 Egg 变量统一渲染成 `<input type="text">`，不区分开关/下拉，由 [startup.blade.php#L151-L170](file:///d:/fz/0508-3/solo-dogfeeding/code/202-panel/resources/views/admin/servers/view/startup.blade.php#L151-L170) 控制：
 
 ```js
-$.each(_.get(objectChain, 'variables', []), function (i, item) {
-    var setValue = _.get(Pterodactyl.server_variables, item.env_variable, item.default_value);
-    $('#egg_variable_' + item.env_variable).val(setValue);
-});
+var setValue = _.get(Pterodactyl.server_variables, item.env_variable, item.default_value);
+$('#egg_variable_' + item.env_variable).val(setValue);
 ```
 
-三种状态在后台 Input 里显示的值：
+由于 `Pterodactyl.server_variables` 就是 EnvironmentService 的输出（已跑过 `??`），所以后台 input 里显示的值**等于运行时实际会用到的值**，所见即所得。
 
-| 状态 | EnvironmentService 产出 `Pterodactyl.server_variables[env]` | Input 显示 | 含义 |
-|------|--------------------------------------------------------------|------------|------|
-| ① 非空值 | 非空字符串原值 | 原值 | 直观正确 |
-| ② 空串记录 | `'' ?? default_value` → **仍是 `''`**（`??` 不触发） | 空（用户看到一个空白输入框） | ❗ 这里显示空，**不**是显示 default，因为 `??` 没生效。但实际运行时也确实用 `''`，所以显示和运行一致 |
-| ③ 无记录（Egg 新增） | `null ?? default_value` → **Egg default** | Egg 当前的 `default_value` | ✅ 显示 default，运行时也用 default，一致 |
+| 状态 | EnvironmentService 产出 | Input 显示值 | 与运行时是否一致 |
+|------|------------------------|-------------|-----------------|
+| ① 有记录、值非空 | 原值 | 原值 | ✅ 一致 |
+| ② 有记录、值 = `''` | `'' ?? default` → **仍是 `''`**（空串不是 null，`??` 不触发） | 空框 | ✅ 一致（运行时也用空串） |
+| ③ 无记录（Egg 新增） | `null ?? default` → **`default_value`** | Egg 当前 default 值 | ✅ 一致 |
 
-**用户控制台前端（React）：**
+**保存行为**：后台提交表单时，input 的 `value` 属性就是 `setValue` 的值。对状态③来说，显示的值是 Egg default → 提交的值也是 Egg default → 保存后 `updateOrCreate` 把这个值写进 `server_variables` → 从状态③**固化为状态①**，值为保存那一刻的 Egg default。从此以后 Egg 再改 default 也不会影响这台服了。
 
-[VariableBox.tsx#L114-L123](file:///d:/fz/0508-3/solo-dogfeeding/code/202-panel/resources/scripts/components/server/startup/VariableBox.tsx#L114-L123)：
+---
+
+#### 5.4.2 客户端控制台（React）：三种控件，三套策略
+
+客户端 [VariableBox.tsx](file:///d:/fz/0508-3/solo-dogfeeding/code/202-panel/resources/scripts/components/server/startup/VariableBox.tsx) 会根据 Egg 变量的 `rules` 自动选择三种控件之一：
+
+1. **Switch 开关**：规则包含 `boolean` / `in:0,1` / `in:1,0` / `in:true,false` / `in:false,true`
+2. **Select 下拉框**：规则包含 `in:val1,val2,...` 且**不**是 Switch 类（即不是纯布尔二值）
+3. **普通 Input**：其他所有情况（text / number / regex 等）
+
+三种控件的 `defaultValue` / `defaultChecked` 策略完全不同，必须分别分析。
+
+##### ① 普通 Input 控件（最常见）
 
 ```tsx
 <Input
-    defaultValue={variable.serverValue ?? ''}
-    placeholder={variable.defaultValue}
+    defaultValue={variable.serverValue ?? ''}   // L122
+    placeholder={variable.defaultValue}         // L123
 />
 ```
 
-后端通过 [EggVariableTransformer.php#L23-L31](file:///d:/fz/0508-3/solo-dogfeeding/code/202-panel/app/Transformers/Api/Client/EggVariableTransformer.php#L23-L31) 传出**原始**的 `server_value` 和 `default_value`，前端自己处理：
+`defaultValue` 是 input 里真正预填的值，`placeholder` 只是没值时的灰色提示文字（不算真实值）。
 
-| 状态 | `variable.serverValue` | Input 显示 | placeholder（灰色提示） | 含义 |
-|------|------------------------|------------|-------------------------|------|
-| ① 非空值 | 非空字符串 | 原值 | Egg default | 直观正确 |
-| ② 空串记录 | `''`（JS 里不是 null） | **空字符串**（显示一个空框） | Egg default | ❗ 运行时用 `''`，但 placeholder 会"假装"显示 default。**这是唯一一处界面会"显示默认值"但运行时并不会回退的情况**，用户极易被误导：灰色提示的 default 是假的，实际启动用的是空串 |
-| ③ 无记录（Egg 新增） | `null` → `null ?? ''` = `''` | **空框** | Egg default | 运行时用的是 Egg default，但前端展示成了空框。显示与实际不一致 |
+| 状态 | `serverValue` | `defaultValue`（input 显示） | `placeholder`（灰色字） | 与运行时是否一致 |
+|------|---------------|-------------------------------|-------------------------|-----------------|
+| ① 非空 | `'1.20.1'` | `'1.20.1'` | `'1.19.4'`（Egg default） | ✅ 一致 |
+| ② 空串 | `''` | `'' ?? ''` → **空框** | Egg default | ⚠️ **外观像 default，实际是空串**。placeholder 只是视觉提示，运行时用 `''`，与**显示空白的 input 一致**，但用户容易误以为灰色字就是当前值 |
+| ③ 无记录（Egg 新增） | `null` | `null ?? ''` → **空框** | Egg default | ❌ **不一致**。运行时用的是 Egg default（`null ?? default`），但界面显示空框。用户看到空白 input + 灰色提示，直觉会觉得"还没设置，用默认"，但实际上运行时确实在用默认——只是显示上没体现出来 |
 
-**前后端对比的关键结论：**
+**关键区分**：状态②和状态③在客户端普通 Input 上**长得一模一样**（都是空框 + 灰色 default），但运行时行为完全不同（②用空串，③用 default）。用户靠肉眼完全无法分辨。
 
-- **后台启动页**：对状态②显示空、对状态③显示 default —— 与实际运行时的行为一致
-- **用户控制台**：对状态②显示空框但 placeholder 显示 default（**placeholder 不是真实值**），对状态③也显示空框 placeholder 显示 default（但实际运行时真的会用 default）—— 两种状态在用户界面长得一样，实际行为天差地别
+##### ② Select 下拉控件
+
+```tsx
+<Select
+    defaultValue={variable.serverValue ?? variable.defaultValue}  // L99
+    // ...options 来自 rules 的 in: 值列表
+/>
+```
+
+Select 跟普通 Input 的策略**不一样**：它的 `defaultValue` 用的是 `serverValue ?? defaultValue`，**直接把 Egg 默认值作为兜底显示**，没有 placeholder 概念。
+
+| 状态 | `serverValue` | `defaultValue`（Select 选中项） | 与运行时是否一致 |
+|------|---------------|--------------------------------|-----------------|
+| ① 非空 | `'vanilla'` | `'vanilla'` | ✅ 一致 |
+| ② 空串 | `''` | `'' ?? default` → **`''`（空串）** | ⚠️ 要看 `options` 里有没有空串选项。Egg 的 `in:` 规则通常不会包含空串，所以 Select 很可能显示为**空白/无选中项**，运行时用空串 → **显示空白但值就是空，行为一致**，但用户体验差（看不到选中项） |
+| ③ 无记录（Egg 新增） | `null` | `null ?? default` → **Egg default** | ✅ 一致 |
+
+Select 控件在状态②（空串）时体验最差：既没有 placeholder 提示，又因为 options 里没有空串而显示空白，用户不知道当前值是什么。
+
+##### ③ Switch 开关控件
+
+```tsx
+<Switch
+    defaultChecked={
+        isStringSwitch
+            ? variable.serverValue === 'true'
+            : variable.serverValue === '1'   // L78-L80
+    }
+/>
+```
+
+Switch 是**三种控件里最极端的**：完全没有 fallback 到 default_value 的逻辑，只跟 `serverValue` 比字符串。`null` 和 `''` 都会被判成 false。
+
+| 状态 | `serverValue` | `defaultChecked`（开关显示） | 与运行时是否一致 |
+|------|---------------|-----------------------------|-----------------|
+| ① `'1'` / `'true'` | `'1'` / `'true'` | ✅ 开 | ✅ 一致 |
+| ② `''`（空串） | `''` | ❌ 关（`'' !== '1'` 且 `'' !== 'true'`） | ⚠️ 如果 Egg default 就是 `0` / `false` → 一致；如果 Egg default 是 `1` / `true` → **不一致**（运行时用空串，但空串不是真值，所以其实运行时也等价于 false……要看 Egg 里该变量的语义，是否把空串当默认启用） |
+| ③ `null`（无记录，Egg 新增） | `null` | ❌ 关（`null !== '1'` 且 `null !== 'true'`） | ❌ **不一致，且是三种控件里最严重的不一致**。运行时 `null ?? default` → 取 Egg default；如果 Egg 的 default 是 `'1'` / `'true'`，那运行时是启用，但界面显示关闭。用户看到开关是"关"，服务器实际用的是"开" |
+
+**Switch 控件坑点总结**：
+- 状态③ + Egg default 为真 → 界面显示关、实际运行开 → 表里不一
+- 状态② + Egg default 为真 → 界面显示关、运行时是空串（大多数程序会把空串当 false 处理，所以实际效果通常也是关 → 巧合一致，但不是因为逻辑正确）
+- Switch 没有"显示默认值"的概念，也没有灰色提示。用户只能看到开关是开还是关
+
+---
+
+#### 5.4.3 两界面对比总表（一眼找差异）
+
+| 状态 | 运行时实际值 | 后台 Input | 客户端 Input | 客户端 Select | 客户端 Switch（假设 Egg default=真） |
+|------|-------------|-----------|-------------|--------------|-------------------------------------|
+| ① 非空（值为真） | 原值（真） | 原值 | 原值 | 原值 | 开 ✅ |
+| ① 非空（值为假） | 原值（假） | 原值 | 原值 | 原值 | 关 ✅ |
+| ② 空串 | `''` | 空框（一致） | 空框 + 灰色 default（显示误导） | 空白/无选中（体验差） | 关（巧合一致，因空串被当假） |
+| ③ 无记录 | Egg default | Egg default（一致 ✅） | 空框 + 灰色 default（不一致 ❌，实际在用 default 但显示空） | Egg default（一致 ✅） | 关（不一致 ❌，若 Egg default=真则表里完全相反） |
+
+#### 5.4.4 "显示默认"和"真实默认"的四种含义
+
+"默认值"这个词在上下文中至少有四种不同的语义，讨论时必须先对齐：
+
+| 语义 | 含义 | 场景 |
+|------|------|------|
+| Egg 模板默认值 | `egg_variables.default_value` 字段 | 数据库里写死的模板默认 |
+| 运行时实际值 | `server_value ?? default_value` 最终计算结果 | 下发给 Wings、进容器 env、替换 `{{}}` 的真实值 |
+| 界面显示默认值（placeholder 型） | 灰色提示文字，不是真实值 | 客户端普通 Input 的 `placeholder` |
+| 界面选中默认值（控件选中型） | 控件真正的 `defaultValue` / `defaultChecked` | 后台 input 的 val、客户端 Select 的 defaultValue、客户端 Switch 的 defaultChecked |
+
+最容易踩的坑：**客户端普通 Input 的 placeholder 显示着 "latest"，用户以为当前值是 latest，但真实运行时值是空串（状态②）**，或者虽然真实运行时确实是 latest 但界面没体现（状态③）——两种情况用户都搞不清。
+
+---
+
+#### 5.4.5 保存后的固化行为
+
+无论哪一种界面、哪一种控件，保存操作最终都落到 `StartupModificationService` 的 `updateOrCreate`：
+
+```php
+['variable_value' => $result->value ?? '']
+```
+
+保存动作的后果是**单向**的：
+
+- 状态① → 保存 → 还是状态①（值可能变）
+- 状态② → 保存 → 还是状态②或①（取决于提交的值）
+- 状态③ → 保存 → **必然变成状态①或②**，从此失去"动态跟随 Egg default"的特性
+
+对状态③来说，"什么都不改、只点保存"也会产生副作用：把**当前界面显示的值**固化写入 server_variables。而界面显示的值在不同入口、不同控件下可能不一样：
+
+| 保存入口 | 状态③时界面显示的值 | 保存后写入 DB 的值 | 与 Egg default 是否一致 |
+|----------|---------------------|-------------------|----------------------|
+| 后台启动页 | EnvironmentService 回退到的 Egg default | Egg default | ✅ 一致 |
+| 客户端普通 Input | 空（`null ?? ''`） | 空串 `''` | ❌ 不一致！保存后从"跟随 default"变成"值为空串" |
+| 客户端 Select | Egg default（`null ?? default`） | Egg default | ✅ 一致 |
+| 客户端 Switch | 关（`defaultChecked = false`） | **值为 `'0'` 或 `'false'`（取决于 toggle 后的发送值）** | ❌ 若 Egg default 为真，保存后变成了假，值被永久改了 |
+
+⚠️ **这是一个非常隐蔽的坑**：对 Egg 新增的 boolean 变量（状态③），用户在客户端看到开关是"关"的，但实际运行时是开（Egg default=真）。如果用户顺手把开关点一下再点回来（或者什么都不动但触发表单提交），值就从"动态跟随 default=真"变成"固化为假"，行为永久改变。
+
+---
+
+#### 5.4.6 哪些判断只适用于"Egg 后加变量"（状态③）
+
+以下现象/结论**仅在状态③（Egg 模板在服务器创建之后新增的变量）下成立**，其他状态下不适用：
+
+1. "Egg 改 default_value 会影响这台服的运行时值" — 只有状态③才会动态跟随
+2. "保存一次就固化了，Egg 再改也不生效" — 只有状态③→①/② 这个转变才有"固化"效应，状态①/②保存本来就是更新自己的值
+3. "后台启动页显示的值与运行时一致" — 其实对三种状态都一致，但状态③下后台显示的是 Egg default 而不是空，这个特性在③的时候最容易被误认为"后台怎么和我客户端看到的不一样"
+4. "客户端 Switch 控件显示与实际相反" — 只有状态③且 Egg default 为真时才会显示关但运行开
+5. "什么都没改点了保存，值就变了" — 只有状态③（特别是 Switch 控件）会因为保存而从动态跟随变成一个固定值
+6. "服务器创建时间晚于 egg_variables.created_at" — 这个判断方法仅用于识别状态③
 
 ### 5.5 真正的优先级总表（含状态分支）
 
@@ -554,26 +669,95 @@ if ($original !== $request->input('value')) {
 
 **症状：启动参数被"强行重置"**
 
-排查顺序：
-1. 查 `server_variables` 表中该 `server_id` + 对应 `variable_id` 是否有记录？值是什么？
-2. 查 `egg_variables.default_value` 近期是否被 Egg 维护者更新？
-3. 查 `servers.startup` 字段是否被管理员切换 Egg 或修改启动命令模板？
-4. 查 Activity Log 中 `server:startup.edit` 事件，看谁何时改了值
-5. 确认该变量的 `user_viewable` / `user_editable` 标记，确认用户侧是否真的能改到
-6. 如果 Wings 侧显示的是旧值，确认服务器是否重启过（Wings 只在启动前拉配置）
+### 9.1 一步定位 SQL：判断三种状态
 
-**核心代码索引：**
+直接跑这个 SQL，拿到某服所有变量的真实状态三要素：
+
+```sql
+SELECT
+    ev.env_variable,
+    ev.default_value      AS egg_default,
+    sv.variable_value     AS instance_value,
+    CASE
+        WHEN sv.id IS NULL THEN 'state_3_no_record'
+        WHEN sv.variable_value = '' THEN 'state_2_empty_string'
+        ELSE 'state_1_has_value'
+    END                   AS reality_state,
+    -- 模拟 PHP 中 `??` 的真实运行时值（不是 COALESCE 语义！）
+    CASE
+        WHEN sv.id IS NULL THEN ev.default_value   -- 无记录，走 Egg 默认
+        ELSE sv.variable_value                     -- 有记录，哪怕是空串也用原值
+    END                   AS runtime_actual_value,
+    ev.created_at         AS egg_var_created_at,
+    s.created_at          AS server_created_at
+FROM egg_variables ev
+CROSS JOIN servers s
+LEFT JOIN server_variables sv
+       ON sv.variable_id = ev.id AND sv.server_id = s.id
+WHERE s.id = <YOUR_SERVER_ID>
+  AND ev.egg_id = s.egg_id
+ORDER BY ev.env_variable;
+```
+
+SQL 关键理解：`runtime_actual_value` 是下发给 Wings 时真正会使用的值；`egg_var_created_at > server_created_at` 的行**极大概率**是 状态（无记录）（Egg 在服务器创建之后新增的变量）。
+
+### 9.2 典型症状 → 根因 → 处理对照表
+
+以下所有场景中的状态编号对应 5.2 节定义：①=有记录非空、②=有记录空串、③=无记录（仅 Egg 后加变量才会出现）。
+
+| # | 用户/运维观察到的现象 | reality_state | 控件类型 | 代码根因 | 建议处理 |
+|---|---------------------|---------------|----------|----------|----------|
+| 1 | 创建时没填某变量，之后一直是空白，Egg 改了 default 也完全没反应 | ② 空串 | 后台 Input / 客户端 Input | 服务器创建流程 `storeEggVariables` 已为所有 Egg 变量插入空行 `''`；空串不是 null，`??` 不会走 Egg 的 default | 正常行为。**注意：这不是"被重置"，是一直就是空串**。如果希望让这台服跟随 Egg default：`DELETE FROM server_variables WHERE server_id=? AND variable_id=?`（慎用，更推荐手动在后台/客户端填值显式声明） |
+| 2 | Egg 管理员新增了某变量 X，老服重启后"值变了"（没人改过） | ③ 无记录 | 所有 | server_variables 表无该 variable_id 行 → 走 `null ?? default_value` → 动态读取 Egg 当前 default。Egg 维护者改了 default 就会自动跟随 | **这是唯一会出现"无人修改但值变动"的场景，且仅适用于 Egg 后加变量**。若希望稳定不跟随：打开该服务器后台启动页，点一次保存（哪怕不改值），StartupModificationService 会把当前 default 固化入 server_variables 表 |
+| 3 | 点了一次保存后，Egg 再改 default 就不生效了 | ③ → ① 或 ② | 所有 | 保存操作的 `updateOrCreate` 把当时显示的值写进了 DB。对状态③来说是从"动态跟随"变成"有记录"，永不回退 | 正常预期（仅对状态③是"固化"，状态①②保存本来就是更新值）。需要更新时手动改该服务器的值 |
+| 4 | 用户控制台某变量 Input 框是空白，但灰色提示字显示着 "latest"，实际启动日志中用的是空串 | ② 空串 | 客户端 Input | [VariableBox.tsx#L122-L123](file:///d:/fz/0508-3/solo-dogfeeding/code/202-panel/resources/scripts/components/server/startup/VariableBox.tsx#L122-L123) `defaultValue={variable.serverValue ?? ''}` 绑的是空串，而 `placeholder={variable.defaultValue}` 只是视觉提示，**placeholder 不会作为真实值**。运行时走 `''` | 典型界面误导。告诉用户灰色字只是建议，必须真正在输入框内敲字并回车才会改值；或者在后台保存一次（会填入当前运行时值） |
+| 5 | 用户控制台某 Select 下拉框一片空白，看不到选中项 | ② 空串 | 客户端 Select | Select 的 `defaultValue` 是 `serverValue ?? defaultValue`，状态②空串时 `'' ?? default` 还是 `''`；但 Egg 的 `in:` 选项里通常没有空串，导致没有 option 被选中，显示空白 | 体验问题而非逻辑问题。让用户选一个值保存即可。或者检查 Egg 规则是否允许空值，必要时在 `in:` 里加上默认选项 |
+| 6 | 用户控制台某开关显示"关"，但实际服务器运行时是启用的 | ③ 无记录（Egg 新增）且 Egg default=真 | 客户端 Switch | Switch 的 `defaultChecked` 只跟 `serverValue` 比，**完全不回退 default**。状态③时 `serverValue=null` → 显示关；但运行时 `null ?? default` → 用 Egg default=真 → 实际是开的 | **表里不一，必须修**。方法一：用户点一下开关再切回来（副作用是固化值）；方法二：管理员在后台启动页保存一次（会正确填入 Egg default） |
+| 7 | 后台启动页某变量显示 "v1.20"，Egg 的 default 明明已经改成 "v1.21" 了 | ① 或 ② | 后台 Input | 服务器有自己的实例值，永不回退。后台显示的是 EnvironmentService 计算后的真实运行值，显示完全正确 | 正常。想同步到 Egg 新 default，直接在后台把值改成 "v1.21" 并保存（清空保存会变空串，**不会**自动回退到 Egg 新 default） |
+| 8 | 后台显示的值和客户端显示的值**不一样** | 视情况 | 对比：后台 Input vs 客户端对应控件 | 后台用 EnvironmentService 的输出（即运行时最终值）；客户端按控件类型各自有不同的 fallback 策略。状态②和状态③在很多控件上显示得都跟后台不一样 | 以**后台**为准，后台显示的就是实际运行时值。客户端显示差异请对照 5.4.3 的对照表判断是哪一类偏差 |
+| 9 | 一批老服务器某变量同时"变值"，没人动过它们各自的启动页 | ③ 无记录（多台服同时） | 所有 | Egg 管理员最近在模板上新增了一个变量，且这批老服都没保存过 → 全部动态跟随 Egg 的 default。Egg 维护者改了 default_value 导致集体变化 | 对这批服批量锁定：<br>批量 `INSERT INTO server_variables (server_id, variable_id, variable_value) SELECT s.id, ev.id, ev.default_value FROM servers s JOIN egg_variables ev ON ev.egg_id = s.egg_id AND ev.env_variable = 'X' WHERE s.node_id = ? AND NOT EXISTS (SELECT 1 FROM server_variables sv WHERE sv.server_id = s.id AND sv.variable_id = ev.id)` |
+| 10 | 改了 Egg 里**老变量**的 default，老服完全没变化 | ① 或 ② | 所有 | 服务器创建时该 variable 已存在 → server_variables 必然有行。`??` 永不触发，老服不会感知到 default 的更新 | 正常。**改老变量的 default 只影响在这之后新创建的服务器**；对既有老服无效，得批量 UPDATE server_variables 才行 |
+| 11 | 某变量在客户端说改成功了，刷新又变回旧值 | 任意 | 所有 | 客户端 StartupController 要求 `user_editable = true` 才允许改，否则抛 403。如果 API 响应被前端吞了，看起来就像"没保存" | 查该变量的 `egg_variables.user_editable`。false 的话让管理员在后台启动页改，或授权用户 `startup.update` 权限 + 变量设 `user_editable=true` |
+| 12 | 改完变量立即看服务器详情页还是旧值 | 任意 | 所有 | StartupModificationService **不调用** `DaemonServerRepository.sync()`。Wings 只在启动服务器、自身重启、收到 sync HTTP 请求时拉新配置 | 正常。必须重启服务器（`/api/client/servers/:uuid/power` = restart）才会用新环境变量。构建参数（内存/CPU/端口）改了会自动 sync |
+
+### 9.3 通用排查顺序（逐步收敛）
+
+1. **先看真实状态**：跑 9.1 的 SQL，确认所有变量的 `reality_state` 和 `runtime_actual_value`，判断属于①/②/③哪一种
+2. **看时间戳**：`egg_var_created_at > server_created_at` 的 variable 对这台服大概率是状态③（除非手动补过数据）。**状态③的所有"动态变化"结论都只适用于 Egg 后加变量**
+3. **确定用户用的是哪个入口**：后台启动页还是客户端控制台？后台永远是对的（EnvironmentService 输出 = 运行时值），客户端要分控件类型
+4. **判断控件类型**：
+   - 变量规则含 `boolean` / `in:0,1` / `in:true,false` → Switch 控件（最容易表里不一）
+   - 变量规则含 `in:` 且不是上面那些 → Select 下拉控件
+   - 其他 → 普通 Input（最容易被 placeholder 误导）
+5. **对照 5.4.3 的两界面对比总表**：看显示值与运行时是否一致，是哪一类偏差
+6. **看启动命令 vs 环境变量**：`StartupCommandService`（组装 invocation 字符串里 `{{...}}` 的替换）和 `EnvironmentService`（Docker 容器 env 注入）都走同一套 `??` 逻辑，值是一致的。用 `php artisan tinker` → `app(EnvironmentService::class)->handle(Server::find(id))` 打印实际下发数组
+7. **查数据库行级 audit**：Activity Log 看 `server:startup.edit`；server_variables 本身没有 created_at/updated_at 历史，必要时开 binlog 或临时加触发器
+8. **确认权限**：某些变量的 `user_viewable=false` 或 `user_editable=false`，客户端看不到/改不了，必须管理员走后台或 Application API
+9. **确认 Wings 侧是否收到**：最后在 Wings 节点上 `docker inspect <容器ID>` 看 `Config.Env`，如果和 Panel 上 EnvironmentService 输出不一致 → 是服务器没重启（容器用的是老环境变量）；如果和 Panel 一致 → 是游戏服自身读错了
+
+---
+
+## 10. 核心代码索引
 
 | 关注点 | 文件 |
 |--------|------|
 | 变量模型 | [EggVariable.php](file:///d:/fz/0508-3/solo-dogfeeding/code/202-panel/app/Models/EggVariable.php)、[ServerVariable.php](file:///d:/fz/0508-3/solo-dogfeeding/code/202-panel/app/Models/ServerVariable.php) |
-| 服务器变量关联 | [Server.php#L288-L301](file:///d:/fz/0508-3/solo-dogfeeding/code/202-panel/app/Models/Server.php#L288-L301) |
-| 变量校验 | [VariableValidatorService.php](file:///d:/fz/0508-3/solo-dogfeeding/code/202-panel/app/Services/Servers/VariableValidatorService.php) |
-| 启动变量修改 | [StartupModificationService.php](file:///d:/fz/0508-3/solo-dogfeeding/code/202-panel/app/Services/Servers/StartupModificationService.php) |
-| 启动命令组装 | [StartupCommandService.php](file:///d:/fz/0508-3/solo-dogfeeding/code/202-panel/app/Services/Servers/StartupCommandService.php) |
-| 环境变量生成（下发用） | [EnvironmentService.php](file:///d:/fz/0508-3/solo-dogfeeding/code/202-panel/app/Services/Servers/EnvironmentService.php) |
-| Wings 配置结构 | [ServerConfigurationStructureService.php](file:///d:/fz/0508-3/solo-dogfeeding/code/202-panel/app/Services/Servers/ServerConfigurationStructureService.php) |
-| Wings 拉取接口 | [ServerDetailsController.php](file:///d:/fz/0508-3/solo-dogfeeding/code/202-panel/app/Http/Controllers/Api/Remote/Servers/ServerDetailsController.php) |
-| Panel→Wings sync 调用 | [DaemonServerRepository.php#L63-L72](file:///d:/fz/0508-3/solo-dogfeeding/code/202-panel/app/Repositories/Wings/DaemonServerRepository.php#L63-L72) |
-| 客户端更新接口 | [StartupController.php（客户端）](file:///d:/fz/0508-3/solo-dogfeeding/code/202-panel/app/Http/Controllers/Api/Client/Servers/StartupController.php) |
-| 管理员更新接口 | [StartupController.php（应用 API）](file:///d:/fz/0508-3/solo-dogfeeding/code/202-panel/app/Http/Controllers/Api/Application/Servers/StartupController.php)、[ServersController@saveStartup](file:///d:/fz/0508-3/solo-dogfeeding/code/202-panel/app/Http/Controllers/Admin/ServersController.php#L178-L197) |
+| 服务器变量关联（LEFT JOIN server_value） | [Server.php#L288-L301](file:///d:/fz/0508-3/solo-dogfeeding/code/202-panel/app/Models/Server.php#L288-L301) |
+| 变量校验服务（管理员返回所有 EggVariable） | [VariableValidatorService.php](file:///d:/fz/0508-3/solo-dogfeeding/code/202-panel/app/Services/Servers/VariableValidatorService.php) |
+| 创建时批量插入 server_variables（所有变量插空行） | [ServerCreationService.php#L188-L201](file:///d:/fz/0508-3/solo-dogfeeding/code/202-panel/app/Services/Servers/ServerCreationService.php#L188-L201) |
+| 启动变量修改（updateOrCreate 固化） | [StartupModificationService.php](file:///d:/fz/0508-3/solo-dogfeeding/code/202-panel/app/Services/Servers/StartupModificationService.php) |
+| 启动命令占位符替换（`server_value ?? default_value`） | [StartupCommandService.php](file:///d:/fz/0508-3/solo-dogfeeding/code/202-panel/app/Services/Servers/StartupCommandService.php) |
+| 环境变量生成（下发用，5 级优先级同 key put） | [EnvironmentService.php](file:///d:/fz/0508-3/solo-dogfeeding/code/202-panel/app/Services/Servers/EnvironmentService.php) |
+| 后台启动页 Blade 模板（统一 Input 控件） | [startup.blade.php#L151-L170](file:///d:/fz/0508-3/solo-dogfeeding/code/202-panel/resources/views/admin/servers/view/startup.blade.php#L151-L170) |
+| 后台启动页控制器（注入 EnvironmentService 输出） | [ServerViewController.php#L71-L87](file:///d:/fz/0508-3/solo-dogfeeding/code/202-panel/app/Http/Controllers/Admin/Servers/ServerViewController.php#L71-L87) |
+| 客户端 VariableBox 总入口（三种控件分发） | [VariableBox.tsx#L54-L128](file:///d:/fz/0508-3/solo-dogfeeding/code/202-panel/resources/scripts/components/server/startup/VariableBox.tsx#L54-L128) |
+| 客户端普通 Input 控件（defaultValue vs placeholder） | [VariableBox.tsx#L114-L123](file:///d:/fz/0508-3/solo-dogfeeding/code/202-panel/resources/scripts/components/server/startup/VariableBox.tsx#L114-L123) |
+| 客户端 Select 下拉控件（`serverValue ?? defaultValue`） | [VariableBox.tsx#L96-L110](file:///d:/fz/0508-3/solo-dogfeeding/code/202-panel/resources/scripts/components/server/startup/VariableBox.tsx#L96-L110) |
+| 客户端 Switch 开关控件（完全不回退 default） | [VariableBox.tsx#L75-L90](file:///d:/fz/0508-3/solo-dogfeeding/code/202-panel/resources/scripts/components/server/startup/VariableBox.tsx#L75-L90) |
+| 客户端 API 数据 Transformer（原始 server_value/default_value 分离） | [EggVariableTransformer.php#L23-L31](file:///d:/fz/0508-3/solo-dogfeeding/code/202-panel/app/Transformers/Api/Client/EggVariableTransformer.php#L23-L31) |
+| Wings 配置结构组装 | [ServerConfigurationStructureService.php](file:///d:/fz/0508-3/solo-dogfeeding/code/202-panel/app/Services/Servers/ServerConfigurationStructureService.php) |
+| Wings 拉取接口（被动触发配置同步） | [ServerDetailsController.php](file:///d:/fz/0508-3/solo-dogfeeding/code/202-panel/app/Http/Controllers/Api/Remote/Servers/ServerDetailsController.php) |
+| Panel→Wings sync 调用（只有 BuildModificationService 在用） | [DaemonServerRepository.php#L63-L72](file:///d:/fz/0508-3/solo-dogfeeding/code/202-panel/app/Repositories/Wings/DaemonServerRepository.php#L63-L72) |
+| 客户端单变量更新接口（含 user_editable 二次校验） | [StartupController.php（客户端）](file:///d:/fz/0508-3/solo-dogfeeding/code/202-panel/app/Http/Controllers/Api/Client/Servers/StartupController.php) |
+| 管理员 Application API 更新接口 | [StartupController.php（应用 API）](file:///d:/fz/0508-3/solo-dogfeeding/code/202-panel/app/Http/Controllers/Api/Application/Servers/StartupController.php) |
+| 后台 Web 保存启动页入口（ServersController 内部调用） | [ServersController@saveStartup](file:///d:/fz/0508-3/solo-dogfeeding/code/202-panel/app/Http/Controllers/Admin/ServersController.php#L178-L197) |
