@@ -50,8 +50,8 @@ Pterodactyl Panel 实际上存在**两条完全独立**的消息记录流水线�
 | 活动日志服务 | [app/Services/Activity/ActivityLogService.php](file:///d:/fz/0508-3/solo-dogfeeding/code/203-panel/app/Services/Activity/ActivityLogService.php) | 活动日志核心服务 |
 | 活动日志主表模型 | [app/Models/ActivityLog.php](file:///d:/fz/0508-3/solo-dogfeeding/code/203-panel/app/Models/ActivityLog.php) | 对应 `activity_logs` 表 |
 | 活动日志关联模型 | [app/Models/ActivityLogSubject.php](file:///d:/fz/0508-3/solo-dogfeeding/code/203-panel/app/Models/ActivityLogSubject.php) | 对应 `activity_log_subjects` 表 |
-| 活动日志 API 入口 | [app/Http/Controllers/Api/Client/ActivityLogController.php](file:///d:/fz/0508-3/solo-dogfeeding/code/203-panel/app/Http/Controllers/Api/Client/ActivityLogController.php) | `/api/client/account/activity` |
-| 服务器活动日志 API 入口 | [app/Http/Controllers/Api/Client/Servers/ActivityLogController.php](file:///d:/fz/0508-3/solo-dogfeeding/code/203-panel/app/Http/Controllers/Api/Client/Servers/ActivityLogController.php) | `/api/client/servers/{server}/activity` |
+| 活动日志 API 入口 | [app/Http/Controllers/Api/Client/ActivityLogController.php](file:///d:/fz/0508-3/solo-dogfeeding/code/203-panel/app/Http/Controllers/Api/Client/ActivityLogController.php) | 单动作控制器，`__invoke()` 方法处理 `/api/client/account/activity` |
+| 服务器活动日志 API 入口 | [app/Http/Controllers/Api/Client/Servers/ActivityLogController.php](file:///d:/fz/0508-3/solo-dogfeeding/code/203-panel/app/Http/Controllers/Api/Client/Servers/ActivityLogController.php) | 单动作控制器，`__invoke()` 方法处理 `/api/client/servers/{server}/activity` |
 | 活动日志前端容器 | [resources/scripts/components/dashboard/activity/ActivityLogContainer.tsx](file:///d:/fz/0508-3/solo-dogfeeding/code/203-panel/resources/scripts/components/dashboard/activity/ActivityLogContainer.tsx) | 活动日志展示页面 |
 | 活动日志 API 封装 | [resources/scripts/api/account/activity.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/203-panel/resources/scripts/api/account/activity.ts) | `useActivityLogs()` Hook |
 | 队列配置 | [config/queue.php](file:///d:/fz/0508-3/solo-dogfeeding/code/203-panel/config/queue.php) | 队列连接、失败任务配置 |
