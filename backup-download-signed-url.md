@@ -304,20 +304,45 @@ S3 预签名 URL 的行为由 AWS SDK 与 S3 服务端协议保证：
 
 ### 5.6.1 日志记录时机与代码位置
 
-`server:backup.download` 活动日志的记录位置在 [BackupController.php:179](file:///d:/fz/0508-3/solo-dogfeeding/code/209-panel/app/Http/Controllers/Api/Client/Servers/BackupController.php#L179)：
+备份下载相关的 Activity 日志有两种独立事件，分别对应不同的代码路径：
+
+**事件 A：`server:backup.download`（用户主动下载备份）**
+
+记录位置在 [BackupController.php:179](file:///d:/fz/0508-3/solo-dogfeeding/code/209-panel/app/Http/Controllers/Api/Client/Servers/BackupController.php#L179)：
 
 ```php
-// 1. 生成签名 URL（可能是 Wings JWT 或 S3 预签名）
+// 1. 生成签名 URL（Wings JWT 或 S3 预签名）
 $url = $this->downloadLinkService->handle($backup, $request->user());
 
-// 2. 记录 Activity 日志（此处已写入数据库）
+// 2. 记录 Activity 日志
 Activity::event('server:backup.download')->subject($backup)->property('name', $backup->name)->log();
 
-// 3. 返回 JSON 响应给客户端
+// 3. 返回 JSON 响应给客户端（用户浏览器随后跳转）
 return new JsonResponse(['object' => 'signed_url', 'attributes' => ['url' => $url]]);
 ```
 
-**关键事实**：日志记录发生在 **URL 生成后、返回 JSON 响应给客户端前**。此时文件还未开始传输，下载行为完全没有发生。浏览器（或客户端）是否实际访问 URL、是否完整下载文件，Panel 端完全不可知。
+**事件 B：`server:backup.restore`（用户恢复备份，仅 S3 模式生成下载链接）**
+
+记录位置在 [BackupController.php:210-226](file:///d:/fz/0508-3/solo-dogfeeding/code/209-panel/app/Http/Controllers/Api/Client/Servers/BackupController.php#L210-L226)：
+
+```php
+$log = Activity::event('server:backup.restore')
+    ->subject($backup)
+    ->property(['name' => $backup->name, 'truncate' => $request->input('truncate')]);
+
+$log->transaction(function () use ($backup, $server, $request) {
+    // S3 模式下：内部生成下载链接传给 Wings，**不返回给用户**
+    if ($backup->disk === Backup::ADAPTER_AWS_S3) {
+        $url = $this->downloadLinkService->handle($backup, $request->user());
+    }
+    $server->update(['status' => Server::STATUS_RESTORING_BACKUP]);
+    $this->daemonRepository->setServer($server)->restore($backup, $url ?? null, ...);
+});
+```
+
+> **注意**：restore 流程中虽然 S3 模式也调用了 `downloadLinkService->handle()` 生成下载链接，但**没有独立的 `server:backup.download` 日志**，此 URL 仅用于 Wings 内部拉取，不暴露给用户。整个恢复动作统一记录为 `server:backup.restore` 事件。
+
+**两个事件的共同关键事实**：日志记录发生在 **URL 生成后、操作发起前**。此时文件传输（下载或恢复拉取）**尚未开始**。Wings/S3 端是否实际执行、是否成功完成，Panel 端 Activity 日志完全不可知。
 
 ### 5.6.2 Activity 日志字段级详解（`server:backup.download` 场景）
 
@@ -883,3 +908,88 @@ if ($server->node_id !== $node->id) {
 | 前端：下载 URL API 封装 | [getBackupDownloadUrl.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/209-panel/resources/scripts/api/server/backups/getBackupDownloadUrl.ts) |
 | 前端：恢复 API 封装 | [backups/index.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/209-panel/resources/scripts/api/server/backups/index.ts) |
 | 前端：权限组件（Can） | [Can.tsx](file:///d:/fz/0508-3/solo-dogfeeding/code/209-panel/resources/scripts/components/elements/Can.tsx) |
+
+---
+
+## 附录 A：历次文档修正记录
+
+本附录记录本文档在多次代码分析中发现的**最初结论与代码实际不符之处**，作为审计迭代的追溯记录。
+
+### 修正一：restore() 放行条件（初始误判）
+
+**最初结论**：restore() 接口只允许 `is_successful = true` 的备份，拒绝所有非成功备份。
+
+**代码实际**（[BackupController.php:202-206](file:///d:/fz/0508-3/solo-dogfeeding/code/209-panel/app/Http/Controllers/Api/Client/Servers/BackupController.php#L202-L206)）：
+```php
+if (!$backup->is_successful && is_null($backup->completed_at)) {
+    throw new BadRequestHttpException('备份尚未完成或已失败，无法恢复。');
+}
+```
+**条件真值表拆解**：只拒绝「is_successful=false 且 completed_at=null」= **备份仍在进行中**。其他三种组合（成功、失败但已完成、成功但未完成）均放行。
+
+### 修正二：download() 完全无备份状态校验（严重误判）
+
+**最初结论**：download() 与 restore() 共享相同的完成状态校验逻辑。
+
+**代码实际**（[BackupController.php:167-185](file:///d:/fz/0508-3/solo-dogfeeding/code/209-panel/app/Http/Controllers/Api/Client/Servers/BackupController.php#L167-L185)）：`download()` 方法中**不存在任何** `is_successful` 或 `completed_at` 的条件判断。只要备份存在（路由模型绑定成功）且通过权限校验，就可生成下载链接。进行中、失败、成功的备份**均可下载**。
+
+### 修正三：前端按钮限制 ≠ 后端实际校验（初始混淆）
+
+**最初结论**：若前端按钮被隐藏，则后端也无法调用对应接口。
+
+**代码实际**：
+- 前端基于 `backup.isSuccessful` 控制按钮可见性（[BackupContextMenu.tsx:165](file:///d:/fz/0508-3/solo-dogfeeding/code/209-panel/resources/scripts/components/server/backups/BackupContextMenu.tsx#L165)）
+- 后端 `download()` 完全无此校验，`restore()` 只拒绝进行中
+- 直接调用 API 即可绕过前端限制
+
+### 修正四：Activity 日志语义（初始混淆"签发"与"下载"）
+
+**最初结论**：`server:backup.download` 日志代表"用户已成功下载备份文件"。
+
+**代码实际**：日志写入位置在 [BackupController.php:179](file:///d:/fz/0508-3/solo-dogfeeding/code/209-panel/app/Http/Controllers/Api/Client/Servers/BackupController.php#L179)，位于「URL 生成后、返回 JSON 响应前」。此时文件传输**尚未开始**。日志记录的是「**签发了下载链接**」事件，而非「下载成功」事件。
+
+### 修正五：S3 路径完全不带用户身份（初始遗漏分支差异）
+
+**最初结论**：$user 参数用于生成所有备份下载链接的身份标识。
+
+**代码实际**（[DownloadLinkService.php:26-39](file:///d:/fz/0508-3/solo-dogfeeding/code/209-panel/app/Services/Backups/DownloadLinkService.php#L26-L39)）：
+- S3 分支：`return $this->getS3BackupUrl($backup)` —— **完全不传递 $user**，函数签名只接收 Backup 参数
+- Wings 分支：`setUser($user)` + `identifiedBy` —— $user 参与 JWT Claims 和 jti 生成
+- AWS SigV4 预签名 URL 的 Query 参数集合为协议标准，**不提供扩展接口注入 Panel 用户标识**
+
+### 修正六：Activity 日志中 properties 字段范围（初始过度推断）
+
+**最初结论**：properties 字段可能包含 user_uuid、backup_uuid 等详细审计信息。
+
+**代码实际**（[BackupController.php:179](file:///d:/fz/0508-3/solo-dogfeeding/code/209-panel/app/Http/Controllers/Api/Client/Servers/BackupController.php#L179) + [ActivityLogTransformer.php](file:///d:/fz/0508-3/solo-dogfeeding/code/209-panel/app/Transformers/Api/Client/ActivityLogTransformer.php)）：
+- 备份下载日志的 properties 只有 `{"name": "备份名称"}`，通过 `property('name', $backup->name)` 注入
+- JWT 级信息（user_uuid、unique_id、backup_uuid 等）**完全不存入 Activity 日志**
+- 关联表 `activity_log_subjects` 只存储 backup 的数字 ID（非 UUID）
+
+### 修正七：Activity 日志审计边界字段级分析（初始不够详尽）
+
+**最初不足**：仅说明日志记录时机，未展开字段级分析和异常场景枚举。
+
+**补充内容**：
+- 逐字段详解了 9 个数据库字段的取值来源、备份下载场景实际值、含义（§5.6.2）
+- 发现翻译字符串误导：activity.php 中 "Downloaded the :name backup" 使用过去完成时，给人"已完成下载"错觉（§5.6.3）
+- 完整枚举 6 种「签发了链接但未实际完成下载」异常场景（§5.6.4）：
+  1. 用户取消下载
+  2. URL 从未被访问
+  3. 链接泄露后第三方匿名下载
+  4. 同一 URL 被多次重复使用
+  5. 下载被 Wings/S3 端拒绝
+  6. 权限在 URL 生成后被撤销
+- 建立两条下载链路的审计完整性对比（§5.6.5），明确 S3 模式下无通用唯一键可自动关联
+- 提出闭合完整审计链路的建议操作（§5.6.6），要求结合 Panel 日志 + Wings HTTP 日志 + S3 Access Logs 三方交叉验证
+
+### 修正八：用户身份不涉及 S3 的架构原因（初始只说"不传"未解释"为什么"）
+
+**最初不足**：仅说明 $user 参数未被 S3 分支使用，未从架构层面解释根本原因。
+
+**补充内容**（§4.4）：
+- **信任模型分野**：Wings 属于 Pterodactyl 内部生态（共享密钥体系），S3 是外部第三方（独立 IAM 体系）
+- **签名协议差异**：Wings 使用自定义 JWT（可自由扩展 Claim），S3 遵循 AWS SigV4 标准（Query 参数集合严格固定为 6 个标准字段）
+- **AWS SigV4 协议限制详解**：列出 `X-Amz-Algorithm / Credential / Date / Expires / SignedHeaders / Signature` 六个固定参数，说明 SDK 不提供注入自定义 Panel 用户身份的接口
+- **不可行方案分析**：Object Key 拼接、response-content-disposition、Metadata/Tags 三种替代方案均存在严重副作用（破坏固定结构、不被 S3 用作身份、预签名 GetObject 不附带 Metadata 身份）
+- **结论**：S3 分支不传 $user **不是代码遗漏，而是协议和架构约束下的合理设计决策**
