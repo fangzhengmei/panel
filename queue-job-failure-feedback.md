@@ -654,6 +654,154 @@ SWR 缓存（第 1 页）立即更新 → 触发 BackupRow 重渲染
 | 用户手动 F5 刷新页面 | 显式操作 | 重新加载所有数据 |
 | 用户离开备份页再进入 | 路由切换触发组件卸载重挂载 | 重新请求第 1 页数据 |
 
+### 7.11 新建备份的即时可见性与分页位置分析
+
+#### 7.11.1 服务端备份列表的默认排序
+
+**关键发现：`BackupController::index()` 没有显式 `orderBy()`，依赖数据库默认排序。**
+
+代码位于 [BackupController.php:44-58](file:///d:/fz/0508-3/solo-dogfeeding/code/206-panel/app/Http/Controllers/Api/Client/Servers/BackupController.php#L44-L58)，第 52 行：
+
+```php
+return $this->fractal->collection($server->backups()->paginate($limit))
+    ->transformWith($this->getTransformer(BackupTransformer::class))
+    ->addMeta([
+        'backup_count' => $this->repository->getNonFailedBackups($server)->count(),
+    ])
+    ->toArray();
+```
+
+`$server->backups()` 是 [Server.php:358-361](file:///d:/fz/0508-3/solo-dogfeeding/code/206-panel/app/Models/Server.php#L358-L361) 定义的简单 `hasMany` 关系，**没有附加任何排序条件**：
+
+```php
+public function backups(): HasMany
+{
+    return $this->hasMany(Backup::class);
+}
+```
+
+**MySQL 默认排序规则**：
+- `backups` 表的主键是 `id`（BIGINT 自增），见 [2020_04_03_230614_create_backups_table.php:31](file:///d:/fz/0508-3/solo-dogfeeding/code/206-panel/database/migrations/2020_04_03_230614_create_backups_table.php#L31)
+- 在 InnoDB 引擎中，当查询不带 `ORDER BY` 时，结果按**聚簇索引（主键 id）**顺序返回
+- 因此实际排序是 **`ORDER BY id ASC`**（旧备份在前，新备份在后）
+
+**每页 20 条时的分页分布**：
+```
+第 1 页（page=1）：id=1 ~ 20   → 最旧的 20 条备份
+第 2 页（page=2）：id=21 ~ 40  → ...
+...
+第 N 页（page=N）：id=...      → 最新的几条备份（在最后一页）
+```
+
+> **重要歧义澄清**：新建备份的 `id` 最大，因此默认排在**最后一页**，而不是第 1 页！
+> 这与用户直觉（"最新的应该在最前面"）完全相反。
+
+#### 7.11.2 前端本地插入逻辑与服务端排序的脱节
+
+**CreateBackupButton 的乐观更新**代码位于 [CreateBackupButton.tsx:84-87](file:///d:/fz/0508-3/solo-dogfeeding/code/206-panel/resources/scripts/components/server/backups/CreateBackupButton.tsx#L84-L87)：
+
+```typescript
+mutate(
+    (data) => ({
+        ...data,
+        items: data.items.concat(backup),     // ← 关键：追加到数组末尾
+        backupCount: data.backupCount + 1
+    }),
+    false  // 不重新请求后端
+);
+```
+
+**两种排序方向的对比**：
+
+| 维度 | 前端本地插入 | 服务端默认排序 | 是否一致 |
+|------|-------------|---------------|---------|
+| 排序方向 | `concat()` 追加到**数组末尾** | 按 `id ASC` 新备份在**最后一页末尾** | ✅ 逻辑上一致 |
+| 页码映射 | 仅更新**当前页**缓存 | 新备份属于**最后一页** | ❌ 不一致 |
+| 用户感知 | 当前页立即看到新备份 | 必须翻到最后一页才能看到 | ❌ 不一致 |
+
+#### 7.11.3 新建备份落点判断的复杂性
+
+不能简单说"新建备份在第 1 页"或"在最后一页"，因为**取决于当前所在页码和前端本地状态**：
+
+```
+场景 1：用户当前在第 1 页（备份数 < 20，只有 1 页）
+  前端行为：items.concat(backup) → 新备份追加到第 1 页末尾 → 用户立即看到 ✅
+  服务端真实位置：第 1 页末尾（因为只有 1 页）→ 一致 ✅
+
+场景 2：用户当前在第 1 页（备份数 ≥ 20，有多页）
+  前端行为：items.concat(backup) → 新备份追加到第 1 页缓存末尾 → 用户"以为"在第 1 页 ⚠️
+  服务端真实位置：最后一页末尾 → 不一致 ❌
+  后果：SWR 下次刷新时（如切标签页），第 1 页重新拉取数据 → 新备份"消失"，必须翻到最后一页才看到
+
+场景 3：用户当前在第 2 页（备份数 ≥ 40）
+  前端行为：items.concat(backup) → 新备份追加到第 2 页缓存末尾 → 用户在第 2 页看到 ⚠️
+  服务端真实位置：最后一页（如第 5 页）→ 完全不一致 ❌
+  后果：SWR 刷新后第 2 页的新备份消失，用户困惑"我刚创建的备份去哪了"
+
+场景 4：用户当前在最后一页
+  前端行为：items.concat(backup) → 追加到最后一页末尾 → 用户立即看到 ✅
+  服务端真实位置：最后一页末尾 → 一致 ✅
+```
+
+**结论**：新建备份在前端列表中的**表现位置**取决于用户创建时所在的页码，而**服务端真实位置**永远在最后一页。两者仅在"当前在最后一页"或"只有 1 页"时一致。
+
+#### 7.11.4 并发创建时的本地状态错乱
+
+**问题**：短时间内连续创建多个备份时，前端本地状态与服务端状态会严重偏离。
+
+```
+T0：第 1 页有 20 条备份（id=1~20），服务端共 100 条（5 页）
+T1：用户创建备份 A → POST 成功，返回 id=101
+   → mutate 本地插入：第 1 页变为 [1..20, 101]，共 21 条
+T2：1 秒后再创建备份 B → POST 成功，返回 id=102
+   → mutate 本地插入：第 1 页变为 [1..20, 101, 102]，共 22 条
+T3：用户切标签页触发 revalidateOnFocus
+   → SWR 重新请求第 1 页数据 → 服务端返回 [1..20]
+   → 前端第 1 页的 101、102 突然"消失"
+   → 用户必须翻到第 6 页才能看到 101、102
+```
+
+**根本原因**：前端 `concat()` 追加新备份到当前页的假设（"新备份属于当前页"）与服务端真实分布（"新备份属于最后一页"）不匹配。
+
+#### 7.11.5 对失败告警显示时机的影响
+
+排序与分页位置的不一致进一步加剧了"失败告警延迟显示"问题：
+
+```
+用户在第 1 页创建备份（假设已有 50 条，共 3 页）
+  ↓
+前端本地插入到第 1 页末尾 → 用户看到 Spinner
+  ↓
+BackupRow 挂载 → 注册 `backup completed:{uuid}` 监听器 ✅
+  ↓
+Wings 执行备份失败（耗时 30 秒）
+  ↓
+T0+30s：Wings 回调 Panel + 广播 WS 事件
+  ↓
+第 1 页的监听器触发 → mutate 更新（但 Bug 导致 isSuccessful=true，不显示 Failed）
+  ↓
+T0+60s：用户切回标签页 → revalidateOnFocus 刷新第 1 页
+  ↓
+SWR 重新请求第 1 页 → 服务端返回 [1..20]（原第 1 页备份）
+  ↓
+新备份从第 1 页消失（它真实在第 3 页）
+  ↓
+用户困惑"备份不见了" → 翻到第 3 页
+  ↓
+第 3 页 BackupRow 批量挂载 → 重新拉取第 3 页数据
+  ↓
+此时才看到新备份 + 红色 Failed 标签
+```
+
+从备份失败到用户看到告警，额外增加了**"用户翻页发现备份消失 → 翻到最后一页"**的时间成本。
+
+#### 7.11.6 建议修复方向
+
+1. **服务端显式排序**：在 `$server->backups()` 关系或查询中添加 `orderByDesc('id')`，使最新备份在第 1 页
+2. **前端本地插入位置修正**：创建备份后 `unshift()` 插入到数组开头而非 `concat()` 到末尾
+3. **乐观更新后立即拉取正确页码**：创建成功后根据 `backupCount` 计算所在页码并切换
+4. **跨页码 mutate**：创建备份时更新最后一页的 SWR 缓存，而非当前页
+
 ---
 
 ## 八、用户通知回写机制
