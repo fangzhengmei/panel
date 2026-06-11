@@ -300,6 +300,166 @@ S3 预签名 URL 的行为由 AWS SDK 与 S3 服务端协议保证：
 
 ---
 
+## 5.6 Activity 审计边界深度分析：签发链接 ≠ 实际下载
+
+### 5.6.1 日志记录时机与代码位置
+
+`server:backup.download` 活动日志的记录位置在 [BackupController.php:179](file:///d:/fz/0508-3/solo-dogfeeding/code/209-panel/app/Http/Controllers/Api/Client/Servers/BackupController.php#L179)：
+
+```php
+// 1. 生成签名 URL（可能是 Wings JWT 或 S3 预签名）
+$url = $this->downloadLinkService->handle($backup, $request->user());
+
+// 2. 记录 Activity 日志（此处已写入数据库）
+Activity::event('server:backup.download')->subject($backup)->property('name', $backup->name)->log();
+
+// 3. 返回 JSON 响应给客户端
+return new JsonResponse(['object' => 'signed_url', 'attributes' => ['url' => $url]]);
+```
+
+**关键事实**：日志记录发生在 **URL 生成后、返回 JSON 响应给客户端前**。此时文件还未开始传输，下载行为完全没有发生。浏览器（或客户端）是否实际访问 URL、是否完整下载文件，Panel 端完全不可知。
+
+### 5.6.2 Activity 日志字段级详解（`server:backup.download` 场景）
+
+基于 [ActivityLog.php](file:///d:/fz/0508-3/solo-dogfeeding/code/209-panel/app/Models/ActivityLog.php) 模型、[create_activity_logs_table.php](file:///d:/fz/0508-3/solo-dogfeeding/code/209-panel/database/migrations/2022_05_28_135717_create_activity_logs_table.php) 迁移文件和 [ActivityLogService.php](file:///d:/fz/0508-3/solo-dogfeeding/code/209-panel/app/Services/Activity/ActivityLogService.php) 服务实现：
+
+| 数据库字段 | 取值来源 | `server:backup.download` 时的实际值 | 含义 |
+|-----------|---------|------------------------------------|------|
+| `id` | 自增主键 | 任意数字 | 内部主键 |
+| `batch` | [ActivityLogService.php:204](file:///d:/fz/0508-3/solo-dogfeeding/code/209-panel/app/Services/Activity/ActivityLogService.php#L204) `ActivityLogBatchService::uuid()` | UUID v4 | 关联同一请求/事务中的多个日志（本次场景中只有 1 条，独立 UUID） |
+| `event` | [BackupController.php:179](file:///d:/fz/0508-3/solo-dogfeeding/code/209-panel/app/Http/Controllers/Api/Client/Servers/BackupController.php#L179) `Activity::event()` | 固定值：`server:backup.download` | 事件类型标识 |
+| `ip` | [ActivityLogService.php:203](file:///d:/fz/0508-3/solo-dogfeeding/code/209-panel/app/Services/Activity/ActivityLogService.php#L203) `Request::ip()` | 客户端请求来源 IP | **签发 URL 请求**的来源 IP，不是实际下载请求的来源 IP |
+| `description` | 未设置（`log()` 未传参数） | `null` | 描述字段，备份下载未使用 |
+| `actor_type` / `actor_id` | [ActivityLogService.php:213-217](file:///d:/fz/0508-3/solo-dogfeeding/code/209-panel/app/Services/Activity/ActivityLogService.php#L213-L217) 当前登录用户 | `actor_type = Pterodactyl\Models\User`<br>`actor_id = 生成 URL 的用户 ID` | **生成下载链接**的用户，不是实际下载者（两者可能不同） |
+| `api_key_id` | [ActivityLogService.php:206](file:///d:/fz/0508-3/solo-dogfeeding/code/209-panel/app/Services/Activity/ActivityLogService.php#L206) | 若用 Client API Key 则为 Key ID，否则 `null` | 生成 URL 时是否使用了 API Key |
+| `properties` (JSON) | `property('name', $backup->name)` 注入 | `{"name": "备份名称字符串"}` | 备份名称（非 UUID），用于事件描述渲染 |
+| `timestamp` | 数据库默认 `CURRENT_TIMESTAMP` | URL 生成写入数据库的时间 | **签发链接**的时间，不是下载开始或完成的时间 |
+
+**关联表补充**：`activity_log_subjects` 表（[ActivityLogSubject.php](file:///d:/fz/0508-3/solo-dogfeeding/code/209-panel/app/Models/ActivityLogSubject.php)）
+- `activity_log_id`：关联 `activity_logs.id`
+- `subject_type` = `Pterodactyl\Models\Backup`
+- `subject_id` = `$backup->id`（备份数字 ID）
+- 通过 ActivityLog → subjects → subject 可反查关联的备份对象
+
+### 5.6.3 日志翻译的前端误导
+
+[activity.php:53](file:///d:/fz/0508-3/solo-dogfeeding/code/209-panel/resources/lang/en/activity.php#L53) 中的翻译字符串：
+```php
+'server' => [
+    'backup' => [
+        'download' => 'Downloaded the :name backup',  // "已下载 :name 备份"
+```
+
+**审计风险**：前端界面将此事件翻译为"已下载 XX 备份"（过去完成时），给人一种"文件已成功下载"的错觉。但实际只是"已签发下载链接"，文件可能从未被传输。
+
+### 5.6.4 签发了链接但未实际完成下载的完整异常场景
+
+以下所有场景中，Panel 数据库中**均存在** `server:backup.download` 日志，但实际并未发生完整的文件下载：
+
+#### 场景 1：用户取消下载（浏览器交互层）
+
+触发条件：用户点击下载后，在浏览器的"另存为"对话框中点击取消，或下载进度条中点击暂停/取消。
+- **Panel 侧**：有 1 条 `server:backup.download` 日志，actor 为当前用户
+- **Wings/S3 侧**：
+  - Wings 模式：可能收到 HTTP 请求但连接被中断，或根本未收到请求（用户在跳转前取消）
+  - S3 模式：S3 可能收到 GetObject 请求但 Content-Length 不匹配（中断传输）
+- **实际结果**：文件未被完整保存到用户磁盘
+- **审计错觉**：面板显示"用户下载了备份"，但文件并未被获取
+
+#### 场景 2：URL 生成后从未被访问（网络层以上）
+
+触发条件：API 请求成功返回了 URL，但用户或程序未实际发起 HTTP GET 到 Wings/S3。
+- 常见子场景：
+  - 前端 JS 代码获取 URL 后出错，未执行 `window.location`
+  - 用户 API 脚本只调用 `/download` 接口获取 URL 但未访问
+  - 浏览器在跳转前被关闭
+  - 防火墙/代理拦截了对 Wings/S3 的请求（但放行 Panel 请求）
+- **Panel 侧**：有完整日志
+- **Wings/S3 侧**：**无任何访问记录**
+- **审计错觉**：最严重的误报场景——"有日志 = 有下载"的假设完全不成立
+
+#### 场景 3：链接泄露后第三方匿名下载（身份错位）
+
+触发条件：签名 URL 通过以下途径泄露：
+- 浏览器历史记录
+- 代理服务器 / CDN 日志
+- Referer 头传递（跳转到 Wings 时携带 Panel 页面 URL，含 server UUID 等信息）
+- 网络抓包（若 HTTPS 配置不当或中间人攻击）
+- 用户主动分享（粘贴到聊天、日志、代码库）
+- Panel Activity 日志本身对其他管理员可见，包含的 backup subject 信息
+- **Panel 侧**：日志 actor 为**原 URL 申请者**（用户 A）
+- **实际下载者**：第三方匿名用户（可能是用户 B、脚本、爬虫……）
+- **Wings 侧日志**（若存在）：记录 JWT 中的 `user_uuid` = 用户 A，但实际请求 IP 可能完全不同
+- **S3 侧日志**：无任何用户身份，只有请求者 IP 和 IAM 身份
+- **审计错觉**：追查下载事件时指向"用户 A 下载了备份"，但实际下载者可能完全不同
+
+#### 场景 4：同一 URL 被多次重复下载（数量不匹配）
+
+触发条件：在有效期内（Wings 15 分钟、S3 5 分钟），同一个 URL 被多次请求。
+- 可能原因：
+  - 用户多次点击"重新下载"按钮（实际上浏览器使用了缓存的同一个 URL）
+  - 泄露的 URL 被多个攻击者/第三方重复使用
+  - 下载管理器分块下载、断点续传（多次 Range 请求）
+- **Panel 侧**：只有 **1 条**日志（URL 生成时的那一次）
+- **Wings/S3 侧**：有 **N 条**访问记录
+- **数量不匹配**：无法从 Panel 日志条数推导实际下载次数
+
+#### 场景 5：下载被 Wings/S3 端拒绝（状态校验失败）
+
+触发条件（基于之前的推断）：
+- Wings 模式：备份仍在写入中、备份文件损坏、备份已被本地删除、JWT 解码失败等
+- S3 模式：对象 Key 不存在（备份上传失败）、IAM 权限被撤销等
+- **Panel 侧**：有日志（URL 生成时通过了所有校验）
+- **Wings/S3 侧**：返回 4xx/5xx HTTP 错误
+- **实际结果**：用户看到错误页面，未获得文件
+- **审计错觉**：面板日志暗示下载成功，但 Wings/S3 返回了错误
+
+#### 场景 6：服务器/用户权限在 URL 生成后被撤销
+
+触发条件：
+- 用户 A 生成了 URL，随后管理员移除了 A 的子用户身份，或将 A 的 IP 从白名单中移除
+- 服务器被暂停（suspended）或进入维护模式
+- **Panel 侧**：日志已生成
+- **Wings/S3 侧**：JWT / 预签名 URL 仍然有效（Wings 无权限校验能力、S3 无 Panel 用户概念）
+- **实际结果**：虽然用户 A 已无权限，但持有的 URL 在过期前仍可被任何人使用
+- **审计错觉**：日志记录的是"有权限的用户 A 生成了链接"，但实际下载发生在 A 被撤销权限之后
+
+### 5.6.5 两条下载链路的审计完整性对比
+
+| 审计要素 | Wings JWT 模式 | S3 预签名模式 |
+|---------|---------------|---------------|
+| Panel Activity 日志（谁申请的链接） | ✅ 有，`activity_logs` 表，含 actor、IP、时间戳 | ✅ 有，完全相同（与磁盘适配器无关） |
+| Panel 日志中的备份标识 | ✅ `activity_log_subjects` 关联 Backup ID | ✅ 相同 |
+| Wings/S3 侧访问日志 | ⚠️ Wings 节点日志（Go 代码不在本仓库，推断存在） | ✅ S3 Access Logs / CloudTrail（需在 AWS 侧配置开启） |
+| 下载日志中含 Panel 用户身份 | ✅ JWT Payload 中有 `user_uuid`（Wings 若记录则可关联） | ❌ 完全没有。S3 侧只能看到 IAM 用户身份、请求 IP、User-Agent |
+| 下载日志中含请求来源 IP | ✅ Wings 有（若记录 HTTP request remote addr） | ✅ S3 有（`requester` / `sourceip` 字段） |
+| 下载日志中含请求结果 | ✅ Wings 有（HTTP 状态码、传输字节数） | ✅ S3 有（`httpstatus`、`bytessent`） |
+| Panel 日志与下载日志能否自动关联 | ⚠️ 需匹配：Panel 时间戳 + `backup_uuid` + Wings 侧 `user_uuid` | ❌ 无通用唯一键，只能通过 **时间窗口 + backup Key** 人工模糊匹配 |
+| 是否有"下载成功/失败"回源 Panel | ❌ Panel 无 `/api/remote/backup/downloaded` 端点 | ❌ S3 无回调机制 |
+| 完整审计链路的闭合方式 | Panel `activity_logs` + **Wings HTTP 访问日志**（需独立采集） | Panel `activity_logs` + **S3 Access Logs**（需在 AWS 侧配置并独立采集） |
+
+### 5.6.6 审计边界声明与准确语义
+
+**准确结论**：
+
+> Panel 的 `server:backup.download` Activity 日志**唯一可证明的事实**是：
+> **"某个用户（actor_id）在某个时间（timestamp）、从某个 IP（ip）申请了某个备份（subject_id）的下载链接。"**
+
+以下结论**均无法仅通过 Panel Activity 日志得出**，必须结合 Wings/S3 侧日志交叉验证：
+- ❌ 备份文件已被实际下载（可能只是生成了链接但未使用）
+- ❌ 日志中的 actor 就是实际下载文件的人（可能第三方下载）
+- ❌ 文件下载了多少次（可能 0 次、1 次或 N 次）
+- ❌ 文件下载是否成功完成（可能中途取消或报错）
+- ❌ 下载发生时用户是否仍有权限（可能权限已被撤销）
+
+**闭合完整审计链路的建议操作**：
+1. **Panel 侧**：`activity_logs` + `activity_log_subjects` 表 → 谁、何时、申请了哪个备份的链接
+2. **Wings 节点侧**：采集 HTTP 访问日志（特别是 `/download/backup` 端点）→ 请求时间、IP、HTTP 状态码、传输字节数、JWT 解码后的 `user_uuid` / `unique_id`
+3. **S3 侧**：开启并采集 S3 Access Logs 或 CloudTrail Data Events → 请求时间、源 IP、对象 Key、HTTP 状态码、传输字节数
+4. **关联逻辑**：以时间窗口（±1 分钟）+ `backup_uuid` / S3 Object Key 为模糊键，将 Panel 日志与下载日志匹配
+
+---
+
 ## 6. Panel 端访问控制（URL 生成前）
 
 ### 6.1 路由与中间件链
@@ -686,7 +846,7 @@ if ($server->node_id !== $node->id) {
 | **节点边界** | JWT `aud` + 节点独立密钥 | 仅目标 Wings 节点可验证。跨节点 Token 无法通过 HS256 签名校验 |
 | **服务器边界** | JWT Claims 绑定 `backup_uuid` + `server_uuid` | 不可跨服务器使用（Wings 端校验） + Panel 端 `ResourceBelongsToServer` 双重保障 |
 | **次数边界** | 无限制 | 有效期内可重复使用。无一次性 Token / 使用计数 / 撤销机制 |
-| **用户身份边界** | 仅在生成时校验 | URL 生成后不承载用户级访问控制。`user_uuid` 仅用于审计日志，泄露后任何第三方均可使用 |
+| **用户身份边界** | 仅在生成时校验 | URL 生成后不承载用户级访问控制。Wings 模式 JWT 中 `user_uuid` 仅用于审计日志，不参与访问控制；S3 模式预签名 URL **完全不含** Panel 用户身份信息。泄露后任何第三方均可使用 |
 
 ---
 
