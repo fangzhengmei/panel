@@ -17,17 +17,46 @@
 - **重试超时**：`retry_after = 90` 秒（任务执行超过 90 秒视为超时，重新入队）
 - **失败存储**：数据库表 `failed_jobs`，使用 UUID 驱动（`database-uuids`）
 
-### 1.2 失败任务表结构
+### 1.2 失败任务表结构（完整字段演进）
 
-`failed_jobs` 表由 [2016_01_23_200421_create_failed_jobs_table.php](file:///d:/fz/0508-3/solo-dogfeeding/code/206-panel/database/migrations/2016_01_23_200421_create_failed_jobs_table.php) 定义，包含字段：
+`failed_jobs` 表经历了 **3 次迁移**，完整字段如下：
 
-| 字段 | 说明 |
-|------|------|
-| `id` | 自增主键 |
-| `connection` | 队列连接名（如 redis） |
-| `queue` | 队列名称（如 standard） |
-| `payload` | 任务序列化数据（JSON longText） |
-| `failed_at` | 失败时间戳 |
+| 迁移文件 | 新增字段 | 说明 |
+|----------|----------|------|
+| [2016_01_23_200421_create_failed_jobs_table.php](file:///d:/fz/0508-3/solo-dogfeeding/code/206-panel/database/migrations/2016_01_23_200421_create_failed_jobs_table.php) | `id`, `connection`, `queue`, `payload`, `failed_at` | 初始建表 |
+| [2016_09_04_172028_update_failed_jobs_table.php](file:///d:/fz/0508-3/solo-dogfeeding/code/206-panel/database/migrations/2016_09_04_172028_update_failed_jobs_table.php) | `exception` | 存储异常堆栈字符串（text 类型） |
+| [2023_01_24_210051_add_uuid_column_to_failed_jobs_table.php](file:///d:/fz/0508-3/solo-dogfeeding/code/206-panel/database/migrations/2023_01_24_210051_add_uuid_column_to_failed_jobs_table.php) | `uuid` | 唯一标识符（nullable + unique），用于 `queue:retry` 按 UUID 重试，迁移会为历史记录自动生成 UUID |
+
+**最终完整字段表**：
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `id` | int auto_increment | 自增主键 |
+| `uuid` | varchar nullable unique | UUID 唯一标识（Laravel 8+ `database-uuids` 驱动要求） |
+| `connection` | text | 队列连接名（如 `redis`） |
+| `queue` | text | 队列名称（如 `standard`） |
+| `payload` | longText | 任务序列化 JSON（包含 `job` 类名、`data` 属性、关联模型 IDs 等） |
+| `exception` | text | 完整异常堆栈（Laravel Queue Worker 在任务最终失败时写入） |
+| `failed_at` | timestamp | 任务标记为最终失败的时间戳 |
+
+`payload` 字段 JSON 结构示意：
+```json
+{
+  "uuid": "550e8400-e29b-41d4-a716-446655440000",
+  "job": "Illuminate\\Queue\\CallQueuedHandler@call",
+  "displayName": "Pterodactyl\\Jobs\\Schedule\\RunTaskJob",
+  "maxTries": 1,
+  "maxExceptions": null,
+  "failOnTimeout": false,
+  "backoff": null,
+  "timeout": null,
+  "retryUntil": null,
+  "data": {
+    "commandName": "Pterodactyl\\Jobs\\Schedule\\RunTaskJob",
+    "command": "O:42:\"Pterodactyl\\Jobs\\Schedule\\RunTaskJob\":..."
+  }
+}
+```
 
 ---
 
@@ -170,7 +199,7 @@ Laravel Queue Worker 对任务的处理顺序：
       │   ├─ 是 → release() 延迟后重新入队
       │   └─ 否 → 标记为最终失败
       │       ├─ 调用 Job::failed() 方法
-      │       ├─ 写入 failed_jobs 表
+      │       ├─ 写入 failed_jobs 表（payload + exception 堆栈）
       │       └─ 触发 Queue::failing() 事件
 ```
 
@@ -206,7 +235,19 @@ Laravel Queue Worker 对任务的处理顺序：
 
 ### 6.1 标准失败任务表
 
-所有最终失败的队列任务由 Laravel 自动写入 `failed_jobs` 表，包含完整 `payload`（任务类、属性、关联模型 IDs 等），运维可通过 `php artisan queue:failed` 查看并重试。
+所有最终失败的队列任务由 Laravel Queue Worker 自动写入 `failed_jobs` 表：
+
+```
+任务最终失败（超过 $tries 或 $maxExceptions）
+  ↓
+Laravel Queue Worker 执行 FailedJobProvider::log()
+  ├─ 写入 connection、queue、payload（完整任务序列化数据）
+  ├─ 写入 exception（$e->__toString() 包含完整堆栈追踪）
+  ├─ 生成并写入 uuid（database-uuids 驱动）
+  └─ 写入 failed_at = 当前时间
+```
+
+运维可通过 `php artisan queue:failed` 查看，通过 `php artisan queue:retry {uuid|id}` 重试。
 
 ### 6.2 备份失败的特殊记录路径
 
@@ -251,60 +292,157 @@ Wings 安装完成回调
 
 ---
 
-## 七、前端状态板展示链路
+## 七、前端状态板展示链路（深度解析）
 
-### 7.1 数据获取：SWR 轮询 + WebSocket 推送
+### 7.1 WebSocket 连接全链路
+
+前端**直接连接 Wings Daemon** 的 WebSocket，不经 Panel 中转：
+
+```
+用户进入服务器页面（ServerRouter.tsx）
+  ↓
+ServerRouter [ServerRouter.tsx:103-105] 挂载三个核心监听器：
+  ├─ <InstallListener />    — 安装/恢复事件
+  ├─ <TransferListener />   — 服务器迁移事件
+  └─ <WebsocketHandler />   — WebSocket 连接管理
+      ↓
+WebsocketHandler.tsx:32-88 调用 connect(uuid)
+  ├─ GET /api/client/servers/{uuid}/websocket
+  │   → WebsocketController.php:33-72 返回 { token, socket }
+  │     ├─ token: JWT（10分钟过期，携带用户权限）
+  │     └─ socket: ws(s)://{node_address}/api/servers/{server_uuid}/ws
+  ├─ new Websocket()（基于 Sockette 库）
+  │   ├─ 连接 Wings 节点 WebSocket 端点
+  │   ├─ send('auth', token) 鉴权
+  │   └─ 注册事件监听器
+  ├─ ServerContext.socket.instance = socket
+  └─ ServerContext.socket.connected = true
+```
+
+关键点：[WebsocketController.php](file:///d:/fz/0508-3/solo-dogfeeding/code/206-panel/app/Http/Controllers/Api/Client/Servers/WebsocketController.php) 的第 64 行明确将节点连接地址从 http(s) 替换为 ws(s)，前端直接与 Wings 建立 WebSocket 长连接。
+
+### 7.2 SWR 数据获取与刷新机制
+
+**项目版本**：[package.json](file:///d:/fz/0508-3/solo-dogfeeding/code/206-panel/package.json) 使用 `swr@^0.2.3`（非常早期的版本）。
+
+**前端未配置全局 `SWRConfig`**，所有 SWR Hook 使用库的默认行为：
+
+| 配置项 | SWR 0.2.x 默认值 | getServerBackups 是否覆盖 | 实际行为 |
+|--------|-------------------|--------------------------|----------|
+| `refreshInterval` | `0`（不主动轮询） | 否 | **不自动定时刷新** |
+| `revalidateOnFocus` | `true` | 否 | **窗口/标签页获得焦点时重新验证** |
+| `revalidateOnReconnect` | `true` | 否 | **浏览器网络重连时重新验证** |
+| `revalidateOnMount` | `true` | 否 | 组件挂载时重新验证 |
+| `dedupingInterval` | `2000`（2秒） | 否 | 2秒内相同 key 的请求去重 |
+| `errorRetryInterval` | `5000`（5秒） | 否 | 出错后 5 秒重试 |
 
 **前端备份列表 Hook**：[getServerBackups.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/206-panel/resources/scripts/api/swr/getServerBackups.ts)
 
-使用 Vercel SWR（stale-while-revalidate）策略：
-- 首次加载 → 请求 `/api/client/servers/{uuid}/backups`
-- 后台持续轮询（SWR 默认配置）
-- WebSocket 事件到达时 → `mutate()` 局部更新缓存，无需全量刷新
-
-### 7.2 WebSocket 事件机制
-
-**事件定义**：[events.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/206-panel/resources/scripts/components/server/events.ts)
-
-| 事件 | 触发时机 |
-|------|----------|
-| `BACKUP_COMPLETED` | 备份完成（成功/失败） |
-| `BACKUP_RESTORE_COMPLETED` | 备份恢复完成 |
-| `STATUS` | 服务器状态变更 |
-| `INSTALL_COMPLETED` | 服务器安装完成 |
-
-**WebSocket 客户端**：[Websocket.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/206-panel/resources/scripts/plugins/Websocket.ts)
-- 基于 Sockette 库
-- 最大重连 20 次
-- Token 15 分钟过期，通过 `token expiring` / `token expired` 事件自动续期
-- Wings 返回 4400/4409 状态码时停止重连（服务器被暂停）
-
-### 7.3 备份行实时更新
-
-**组件**：[BackupRow.tsx:24-48](file:///d:/fz/0508-3/solo-dogfeeding/code/206-panel/resources/scripts/components/server/backups/BackupRow.tsx#L24-L48)
-
-```tsx
-useWebsocketEvent(`backup completed:${backup.uuid}`, (data) => {
-    const parsed = JSON.parse(data);
-    mutate(
-        (data) => ({
-            ...data,
-            items: data.items.map((b) =>
-                b.uuid !== backup.uuid ? b : {
-                    ...b,
-                    isSuccessful: parsed.is_successful || true,
-                    checksum: (parsed.checksum_type || '') + ':' + (parsed.checksum || ''),
-                    bytes: parsed.file_size || 0,
-                    completedAt: new Date(),
-                }
-            ),
-        }),
-        false  // false = 不重新请求 API，直接使用本地更新
-    );
+```typescript
+// 只传 key 和 fetcher，不传 options → 完全依赖 SWR 默认配置
+return useSWR<BackupResponse>(['server:backups', uuid, page], async () => {
+    const { data } = await http.get(`/api/client/servers/${uuid}/backups`, { params: { page } });
+    return {
+        items: (data.data || []).map(rawDataToServerBackup),
+        pagination: getPaginationSet(data.meta.pagination),
+        backupCount: data.meta.backup_count,
+    };
 });
 ```
 
-### 7.4 失败状态的视觉呈现
+**结论：SWR 实际触发刷新的时机只有 3 种**：
+1. **组件首次挂载**（进入备份页面）
+2. **浏览器窗口重新获得焦点**（用户从其他标签页切回来）
+3. **浏览器网络断开后重连**（例如 WiFi 重连）
+4. 代码中手动调用 `mutate()`（由 WebSocket 事件触发，见下文）
+
+**没有后台自动轮询**！如果用户停留在备份页面且不切换标签页、网络稳定——SWR 永远不会主动刷新。
+
+### 7.3 前端备份完成事件写入状态列表的完整链路
+
+从 Wings 发出事件到前端 UI 渲染 "Failed" 标签的完整流程：
+
+```
+【Wings 端】备份执行完成（成功/失败）
+  │
+  ├─ 步骤1：Wings 回调 Panel REST API
+  │   POST https://panel.example.com/api/remote/backups/{backup_uuid}
+  │   Body: { successful: false, ... }
+  │   → BackupStatusController.php 更新数据库
+  │     backups.is_successful = false
+  │     backups.completed_at = NOW()
+  │
+  └─ 步骤2：Wings 向已连接的 WebSocket 客户端广播
+      emit('backup completed', JSON.stringify({
+          uuid: backup_uuid,
+          is_successful: false,
+          checksum_type: null,
+          checksum: null,
+          file_size: 0
+      }))
+          ↓
+【前端】WebSocket 消息接收
+  Websocket.ts:25-31 Sockette onmessage
+  ├─ JSON.parse(e.data) → { event: 'backup completed:abc-uuid', args: [...] }
+  └─ this.emit('backup completed:abc-uuid', ...args)
+      ↓
+【前端】事件监听器触发
+  useWebsocketEvent.ts:13-21（BackupRow 组件注册）
+  ├─ instance.addListener('backup completed:abc-uuid', callback)
+  └─ callback(data) 执行 → BackupRow.tsx:24-48
+      ↓
+【前端】SWR 缓存本地更新（Optimistic Update）
+  mutate(updater, false)
+  ├─ false = 不重新请求后端 API（避免网络请求）
+  ├─ updater 函数在内存中遍历 items 数组
+  │   └─ 匹配 uuid → 更新字段
+  │       ├─ isSuccessful = parsed.is_successful || true  ⚠️ BUG：失败时也会变成 true！（见下）
+  │       ├─ checksum = checksum_type + ':' + checksum
+  │       ├─ bytes = file_size
+  │       └─ completedAt = new Date()  ← 关键：前端本地设置当前时间
+  └─ SWR 缓存变更 → 触发所有使用该 key 的组件重渲染
+      ↓
+【前端】React 组件重渲染
+  BackupRow.tsx:50-101
+  ├─ 重新计算判断条件
+  │   backup.completedAt !== null && !backup.isSuccessful
+  └─ 条件满足 → 渲染红色 "Failed" 标签
+```
+
+### 7.4 WebSocket 事件监听注册机制
+
+每个备份行独立注册监听器（按 uuid 精确匹配），代码在 [BackupRow.tsx:24-48](file:///d:/fz/0508-3/solo-dogfeeding/code/206-panel/resources/scripts/components/server/backups/BackupRow.tsx#L24-L48)：
+
+```typescript
+// 每个 BackupRow 组件挂载时注册，卸载时自动移除
+useWebsocketEvent(
+    `backup completed:${backup.uuid}` as SocketEvent,  // 精确到具体备份 UUID
+    (data) => { /* mutate 更新缓存 */ }
+);
+```
+
+`useWebsocketEvent` Hook 实现见 [useWebsocketEvent.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/206-panel/resources/scripts/plugins/useWebsocketEvent.ts)：
+- 依赖 `ServerContext.socket.connected` 和 `instance`
+- 连接断开时自动移除监听，重连后重新注册
+
+### 7.5 前端代码中的潜在 Bug
+
+[BackupRow.tsx:36](file:///d:/fz/0508-3/solo-dogfeeding/code/206-panel/resources/scripts/components/server/backups/BackupRow.tsx#L36)：
+
+```typescript
+isSuccessful: parsed.is_successful || true,
+```
+
+这段代码存在逻辑错误：当 `parsed.is_successful = false`（备份失败）时，`false || true` 的结果是 `true`。
+
+**但实际 UI 仍能显示 "Failed"**，原因是：
+- `completedAt` 在失败时也被设置为 `new Date()`（非 null）
+- 然而 `isSuccessful` 被错误设置为 `true`，按理应该显示成功状态
+- 这说明**实际失败展示依赖的是 SWR 兜底重新拉取 API 数据**，而非 WebSocket 的乐观更新
+
+当 WebSocket 的乐观更新数据错误后，用户切换标签页触发 `revalidateOnFocus`，SWR 重新请求 `/api/client/servers/{uuid}/backups`，后端返回真实的 `is_successful=false`，此时 UI 才正确显示 "Failed"。
+
+### 7.6 失败状态的视觉呈现
 
 [BackupRow.tsx:66-72](file:///d:/fz/0508-3/solo-dogfeeding/code/206-panel/resources/scripts/components/server/backups/BackupRow.tsx#L66-L72)
 
@@ -321,13 +459,24 @@ useWebsocketEvent(`backup completed:${backup.uuid}`, (data) => {
 - `completedAt !== null && isSuccessful = true` → 正常归档图标 + 文件大小
 - `completedAt !== null && isSuccessful = false` → 红色 "Failed" 标签
 
-### 7.5 "为什么备份失败半天才显示"的原因
+### 7.7 "为什么备份失败半天才显示"的完整原因
 
-1. **备份本身非队列任务**：Panel 发起 Wings API 调用后即返回，备份在 Wings 后台执行，耗时取决于文件大小
-2. **没有进度回调**：Wings 执行期间 Panel 不知道进度，UI 一直显示 Spinner
-3. **依赖 Wings 回调**：只有当 Wings 完成（成功/失败）后调用 `/api/remote/backups/{uuid}` 回调，Panel 才更新 `completed_at` 和 `is_successful`
-4. **WebSocket 延迟**：Wings 触发回调后，还需要通过 WebSocket 将 `backup completed` 事件推送到前端浏览器
-5. **SWR 兜底**：如果 WebSocket 未送达，前端只能等下一次 SWR 轮询（默认间隔较长）才会刷新到失败状态
+结合代码分析，延迟显示是多层因素叠加的结果：
+
+| 阶段 | 耗时来源 | 说明 |
+|------|----------|------|
+| **Wings 执行备份** | 几秒到几小时 | 取决于备份文件大小、磁盘 IO、网络上传速度。此阶段 Panel 完全不知道进度，前端一直显示 Spinner |
+| **Wings → Panel 回调** | 毫秒级 | Wings 完成后立即调用 Panel REST API 更新数据库 |
+| **Wings → 前端 WebSocket 广播** | 毫秒级 | Wings 同时向已连接的 WS 客户端推送事件 |
+| **前端乐观更新 Bug** | — | WebSocket 到达后 `isSuccessful` 被错误设为 `true`，UI 不会显示 Failed |
+| **等待 SWR 触发刷新** | 几秒到几分钟 | 必须等待以下事件之一：<br>1. 用户切换标签页再切回（`revalidateOnFocus`）<br>2. 用户浏览器网络重连（`revalidateOnReconnect`）<br>3. 用户手动刷新页面<br>4. 用户离开备份页面再进入（组件重新挂载） |
+| **SWR 拉取真实数据** | 几百毫秒 | 重新请求 API，后端返回 `is_successful=false` |
+| **React 重渲染** | 毫秒级 | 状态变更后渲染红色 "Failed" 标签 |
+
+**核心结论**：备份失败不会"立即"显示的根本原因是：
+1. 备份任务本身在 Wings 端异步执行，Panel 无进度感知能力
+2. **WebSocket 乐观更新代码存在 Bug**，导致即使事件到达也无法正确显示失败
+3. SWR 默认无自动轮询，必须依赖用户交互触发重新验证才能获取真实失败状态
 
 ---
 
@@ -440,46 +589,72 @@ RunTaskJob 执行前检查：`server.status !== null` → 直接调用 `failed()
 ### 10.1 备份失败排查步骤
 
 ```
-1. 检查 failed_jobs 表（但备份通常不走队列）
-2. 检查 backups 表：
-   SELECT uuid, name, is_successful, completed_at, created_at 
+1. 检查 backups 表（备份不走队列，因此 failed_jobs 通常为空）：
+   SELECT uuid, name, is_successful, is_locked, completed_at, created_at, bytes
    FROM backups WHERE server_id = ? ORDER BY created_at DESC LIMIT 10;
-3. 检查 activity_logs 表：
-   SELECT * FROM activity_logs WHERE event LIKE 'server:backup%' ORDER BY created_at DESC LIMIT 20;
-4. 检查 Laravel 日志 storage/logs/laravel-YYYY-MM-DD.log
-5. 检查 Wings 节点日志（根据 X-Request-Id 关联）
-6. 验证 Wings → Panel 网络连通性（回调地址）
+   → completed_at=null 表示 Wings 尚未回调（可能在执行或回调失败）
+   → is_successful=false + completed_at!=null 表示明确失败
+
+2. 检查 activity_logs 表：
+   SELECT event, created_at, properties FROM activity_logs 
+   WHERE event LIKE 'server:backup%' ORDER BY created_at DESC LIMIT 20;
+   → 对比 start 和 complete/fail 事件的时间差
+
+3. 检查 Laravel 日志 storage/logs/laravel-YYYY-MM-DD.log
+   搜索 backup、BackupStatusController、DaemonConnectionException
+
+4. 检查 Wings 节点日志（根据备份回调的 X-Request-Id 关联）
+   Wings 日志位置通常在 /var/log/pterodactyl/wings.log
+
+5. 验证 Wings → Panel 网络连通性：
+   在 Wings 节点上 curl -X POST https://panel.example.com/api/remote/backups/test
+   检查是否能到达 Panel 的 /api/remote/* 路由
+
+6. 检查前端是否收到 WebSocket 事件：
+   浏览器 F12 → Network → WS → 选中 Wings 的 WebSocket 连接 → Messages 标签
+   查看是否收到 backup completed 事件
 ```
 
 ### 10.2 队列任务失败排查步骤
 
 ```bash
-# 查看失败任务列表
+# 查看失败任务列表（显示 uuid、连接、队列、失败时间、类名）
 php artisan queue:failed
 
-# 重试指定任务
-php artisan queue:retry {job-id}
+# 查看某个失败任务的完整 exception 堆栈
+# （直接查数据库，artisan 命令默认不显示完整堆栈）
+mysql -e "SELECT id, uuid, exception FROM failed_jobs ORDER BY failed_at DESC LIMIT 1\G"
+
+# 重试指定任务（支持 uuid 或 id）
+php artisan queue:retry {uuid}
+php artisan queue:retry 5
 
 # 重试所有失败任务
 php artisan queue:retry all
 
-# 忽略失败任务
-php artisan queue:forget {job-id}
+# 忽略/删除单个失败任务
+php artisan queue:forget {uuid}
 
 # 清空所有失败任务
 php artisan queue:flush
+
+# 检查 Worker 进程是否存活
+ps aux | grep "queue:work"
+supervisorctl status
 ```
 
 ### 10.3 关键配置项
 
 | 配置文件 | 配置项 | 说明 | 默认值 |
 |----------|--------|------|--------|
-| `queue.php` | `connections.redis.retry_after` | 任务超时秒数 | 90 |
-| `queue.php` | `failed.driver` | 失败任务存储 | `database-uuids` |
+| `queue.php` | `connections.redis.retry_after` | 任务超时秒数（超过则判定为僵死任务，重新入队） | 90 |
+| `queue.php` | `failed.driver` | 失败任务存储驱动 | `database-uuids` |
 | `backups.php` | `throttles.limit` | 时间窗口内最大备份数 | - |
 | `backups.php` | `throttles.period` | 节流时间窗口（秒） | - |
 | `pterodactyl.php` | `guzzle.timeout` | Wings API 请求超时 | - |
+| `pterodactyl.php` | `guzzle.connect_timeout` | Wings API 连接超时 | - |
 | `pterodactyl.php` | `email.send_install_notification` | 安装邮件通知开关 | true |
+| `pterodactyl.php` | `email.send_reinstall_notification` | 重装邮件通知开关 | true |
 
 ---
 
@@ -488,19 +663,31 @@ php artisan queue:flush
 | 文件路径 | 职责 |
 |----------|------|
 | [config/queue.php](file:///d:/fz/0508-3/solo-dogfeeding/code/206-panel/config/queue.php) | 队列连接与失败存储配置 |
+| [database/migrations/2016_01_23_200421_create_failed_jobs_table.php](file:///d:/fz/0508-3/solo-dogfeeding/code/206-panel/database/migrations/2016_01_23_200421_create_failed_jobs_table.php) | failed_jobs 初始建表 |
+| [database/migrations/2016_09_04_172028_update_failed_jobs_table.php](file:///d:/fz/0508-3/solo-dogfeeding/code/206-panel/database/migrations/2016_09_04_172028_update_failed_jobs_table.php) | failed_jobs 新增 exception 字段 |
+| [database/migrations/2023_01_24_210051_add_uuid_column_to_failed_jobs_table.php](file:///d:/fz/0508-3/solo-dogfeeding/code/206-panel/database/migrations/2023_01_24_210051_add_uuid_column_to_failed_jobs_table.php) | failed_jobs 新增 uuid 字段 |
 | [app/Jobs/Schedule/RunTaskJob.php](file:///d:/fz/0508-3/solo-dogfeeding/code/206-panel/app/Jobs/Schedule/RunTaskJob.php) | 定时任务执行与失败处理 |
 | [app/Jobs/RevokeSftpAccessJob.php](file:///d:/fz/0508-3/solo-dogfeeding/code/206-panel/app/Jobs/RevokeSftpAccessJob.php) | SFTP 撤销任务与重试退避 |
 | [app/Services/Backups/InitiateBackupService.php](file:///d:/fz/0508-3/solo-dogfeeding/code/206-panel/app/Services/Backups/InitiateBackupService.php) | 备份发起服务（同步非队列） |
 | [app/Http/Controllers/Api/Remote/Backups/BackupStatusController.php](file:///d:/fz/0508-3/solo-dogfeeding/code/206-panel/app/Http/Controllers/Api/Remote/Backups/BackupStatusController.php) | Wings 备份状态回调处理 |
 | [app/Http/Controllers/Api/Remote/Servers/ServerInstallController.php](file:///d:/fz/0508-3/solo-dogfeeding/code/206-panel/app/Http/Controllers/Api/Remote/Servers/ServerInstallController.php) | Wings 安装状态回调处理 |
+| [app/Http/Controllers/Api/Client/Servers/WebsocketController.php](file:///d:/fz/0508-3/solo-dogfeeding/code/206-panel/app/Http/Controllers/Api/Client/Servers/WebsocketController.php) | WebSocket JWT 签发与节点地址返回 |
 | [app/Exceptions/DisplayException.php](file:///d:/fz/0508-3/solo-dogfeeding/code/206-panel/app/Exceptions/DisplayException.php) | 可展示异常基类 |
 | [app/Exceptions/Http/Connection/DaemonConnectionException.php](file:///d:/fz/0508-3/solo-dogfeeding/code/206-panel/app/Exceptions/Http/Connection/DaemonConnectionException.php) | Wings 连接异常（可恢复） |
 | [app/Exceptions/Handler.php](file:///d:/fz/0508-3/solo-dogfeeding/code/206-panel/app/Exceptions/Handler.php) | 全局异常处理器 |
 | [app/Models/Backup.php](file:///d:/fz/0508-3/solo-dogfeeding/code/206-panel/app/Models/Backup.php) | 备份模型与状态字段 |
 | [app/Models/Server.php](file:///d:/fz/0508-3/solo-dogfeeding/code/206-panel/app/Models/Server.php) | 服务器模型与状态常量 |
 | [app/Notifications/ServerInstalled.php](file:///d:/fz/0508-3/solo-dogfeeding/code/206-panel/app/Notifications/ServerInstalled.php) | 安装完成邮件通知 |
+| [resources/scripts/routers/ServerRouter.tsx](file:///d:/fz/0508-3/solo-dogfeeding/code/206-panel/resources/scripts/routers/ServerRouter.tsx) | 服务器路由与监听器挂载点 |
 | [resources/scripts/api/swr/getServerBackups.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/206-panel/resources/scripts/api/swr/getServerBackups.ts) | 前端备份列表 SWR Hook |
-| [resources/scripts/components/server/backups/BackupRow.tsx](file:///d:/fz/0508-3/solo-dogfeeding/code/206-panel/resources/scripts/components/server/backups/BackupRow.tsx) | 备份行组件（失败状态展示） |
+| [resources/scripts/components/server/backups/BackupRow.tsx](file:///d:/fz/0508-3/solo-dogfeeding/code/206-panel/resources/scripts/components/server/backups/BackupRow.tsx) | 备份行组件（失败状态展示 + WebSocket 事件处理） |
+| [resources/scripts/components/server/backups/CreateBackupButton.tsx](file:///d:/fz/0508-3/solo-dogfeeding/code/206-panel/resources/scripts/components/server/backups/CreateBackupButton.tsx) | 创建备份按钮（新备份本地插入） |
 | [resources/scripts/components/server/WebsocketHandler.tsx](file:///d:/fz/0508-3/solo-dogfeeding/code/206-panel/resources/scripts/components/server/WebsocketHandler.tsx) | WebSocket 连接管理 |
-| [resources/scripts/plugins/Websocket.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/206-panel/resources/scripts/plugins/Websocket.ts) | WebSocket 客户端实现 |
+| [resources/scripts/components/server/InstallListener.tsx](file:///d:/fz/0508-3/solo-dogfeeding/code/206-panel/resources/scripts/components/server/InstallListener.tsx) | 安装/恢复事件监听 |
+| [resources/scripts/plugins/Websocket.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/206-panel/resources/scripts/plugins/Websocket.ts) | WebSocket 客户端实现（Sockette 封装） |
+| [resources/scripts/plugins/useWebsocketEvent.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/206-panel/resources/scripts/plugins/useWebsocketEvent.ts) | WebSocket 事件监听 Hook |
 | [resources/scripts/components/server/events.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/206-panel/resources/scripts/components/server/events.ts) | WebSocket 事件枚举 |
+| [resources/scripts/api/server/getWebsocketToken.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/206-panel/resources/scripts/api/server/getWebsocketToken.ts) | 前端获取 WebSocket Token |
+| [resources/scripts/state/server/index.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/206-panel/resources/scripts/state/server/index.ts) | 服务器全局状态（easy-peasy Store） |
+| [resources/scripts/state/server/socket.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/206-panel/resources/scripts/state/server/socket.ts) | WebSocket 实例状态存储 |
+| [package.json](file:///d:/fz/0508-3/solo-dogfeeding/code/206-panel/package.json) | 前端依赖（SWR 版本：0.2.3） |
