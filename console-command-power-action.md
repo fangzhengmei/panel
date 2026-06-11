@@ -1,4 +1,4 @@
-﻿# Pterodactyl Panel 控制台命令与电源动作 — 代码走向全链路分析
+# Pterodactyl Panel 控制台命令与电源动作 — 代码走向全链路分析
 
 > **关于本仓库的范围声明**：此代码库仅包含 Panel（PHP Laravel + React 前端），不含 Wings 守护进程（Go）源码。凡是涉及 Wings 内部实现的描述，均在标题或段落开头明确标注【推断】，以示与 Panel 侧可确认代码的区别。
 
@@ -498,9 +498,9 @@ public function handle(Request $request, \Closure $next): mixed
         }
     }
 
-    // 2. 状态冲突校验：Server::v`validateCurrentState()`
+    // 2. 状态冲突校验：Server::validateCurrentState()
     try {
-        $server->v`validateCurrentState()`;
+        $server->validateCurrentState();
     } catch (ServerStateConflictException $exception) {
         // 例外 1：view endpoint (GET /server) 允许查看状态
         if (!$request->routeIs('api:client:server.view')) {
@@ -519,10 +519,10 @@ public function handle(Request $request, \Closure $next): mixed
 }
 ```
 
-**`v`validateCurrentState()`` 判定逻辑**（[Server.php#L390-L401](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Models/Server.php#L390-L401)，代码可确认）：
+**`validateCurrentState()` 判定逻辑**（[Server.php#L390-L401](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Models/Server.php#L390-L401)，代码可确认）：
 
 ```php
-public function v`validateCurrentState()`
+public function validateCurrentState()
 {
     if (
         $this->isSuspended()              // status = 'suspended'
@@ -1047,7 +1047,7 @@ try {
 |------|------|
 | [Permission.php](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Models/Permission.php) | 权限常量（`control.*` / `websocket.connect` 等）+ 权限描述 |
 | [Policies/ServerPolicy.php](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Policies/ServerPolicy.php) | Gate 判定：root_admin/owner 放行，子用户查 permissions 数组 |
-| [Models/Server.php](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Models/Server.php) | `v`validateCurrentState()``（suspended/维护/安装/还原/迁移 → 409）|
+| [Models/Server.php](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Models/Server.php) | `validateCurrentState()`（suspended/维护/安装/还原/迁移 → 409）|
 | [Services/Nodes/NodeJWTService.php](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Services/Nodes/NodeJWTService.php) | HS256 JWT 签发，嵌入 server_uuid + permissions + user_uuid |
 
 #### 调度系统
@@ -1087,7 +1087,7 @@ A: **完全不一样！**
 A: Panel 代码可确认二者发出的值不同（`"kill"` vs `"stop"`，见 [PowerButtons.tsx#L29](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/resources/scripts/components/server/console/PowerButtons.tsx#L29) 和 [DaemonPowerRepository.php#L29](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Repositories/Wings/DaemonPowerRepository.php#L29)）。【推断】Stop = 优雅关闭流程（通常会给游戏服机会完成自身清理）；Kill = 强制终止（不等候游戏服自身处理）。Kill 建议只在 Stop 无响应时使用。用完 Kill 后建议检查最新存档完整性再开服。
 
 **Q5: 服务器被暂停（suspended）了，能发命令吗？**
-A: Panel 代码可确认：[AuthenticateServerAccess.php#L50-L59](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Http/Middleware/Api/Client/Server/AuthenticateServerAccess.php#L50-L59) 中的 `validateCurrentState()` 会拒绝 `/power` 和 `/command` 请求（HTTP 409 Conflict）。管理员即使能连上 WebSocket 也只能看日志，无法执行操作。先联系主机商解除暂停。
+A: Panel 代码可确认：[AuthenticateServerAccess.php#L50-L59](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Http/Middleware/Api/Client/Server/AuthenticateServerAccess.php#L50-L59) 中的 `validateCurrentState()` 会拒绝 `/power` 和 `/command` 请求（HTTP 409 Conflict）。管理员即使能连上 WebSocket 也只能看日志，无法执行操作。先联系主机商解除暂停。
 
 **Q6: 命令输入框没了？**
 A: 检查当前账号有没有 `control.console` 权限。代码可确认：[Console.tsx#L66](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/resources/scripts/components/server/console/Console.tsx#L66) `canSendCommands` 由 `usePermissions(['control.console'])` 返回，子用户由所有者在 **Users** 标签页分配。没有此权限的账号不会渲染命令输入框；【推断】即使手动构造 WebSocket `send command` 事件，Wings 侧也会因为 JWT claims 不含 control.console 而被拦截。
