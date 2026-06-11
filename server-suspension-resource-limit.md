@@ -263,43 +263,130 @@ if (!is_null($server->status)) {  // 包含 suspended 在内的任何异常状�
 | 数据源 | 字段 | 精度 | 是否推荐 | 说明 |
 |-------|------|------|---------|------|
 | Panel 数据库 / 服务器基本信息 API | `status` | 精确 | ✅ **推荐** | 状态权威来源，Panel 所有逻辑基于此字段 |
-| 资源使用 API | `is_suspended` | 不可靠 | ❌ **不推荐** | 来自 Wings，有缓存和默认值问题 |
+| 资源使用 API | `is_suspended` | 不可靠 | ❌ **不推荐** | 来自 Wings，存在连接报错与默认值两种风险 |
 
 **服务器基本信息 API**（`api:client:server.view`）✅ 代码事实：
 - 返回 `status` 字段，挂起时为 `'suspended'`
 - 数据来自 Panel 数据库，实时准确
 - 挂起时可访问（白名单内）
 
-**资源使用 API**（`api:client:server.resources`）⚠️ 注意事项：
-- 返回 `is_suspended` 字段，数据**来自 Wings**，不是 Panel 数据库
-- 有 **20 秒缓存**（[ResourceUtilizationController.php 第 33 行](file:///d:/fz/0508-3/solo-dogfeeding/code/207-panel/app/Http/Controllers/Api/Client/Servers/ResourceUtilizationController.php#L33)）
-- **默认值为 `false`**（[StatsTransformer.php 第 22 行](file:///d:/fz/0508-3/solo-dogfeeding/code/207-panel/app/Transformers/Api/Client/StatsTransformer.php#L22)）
-- 如果 Wings 连接异常或数据格式不同，可能返回默认值 `false`，造成"未挂起"的假象
-
 > **客服操作建议**：判断服务器是否挂起，**务必使用服务器基本信息接口的 `status` 字段**，不要使用资源接口的 `is_suspended` 字段。
 
-### 5.2 资源接口返回内容细节 ✅ 代码事实
+---
 
-资源接口数据结构（[StatsTransformer.php](file:///d:/fz/0508-3/solo-dogfeeding/code/207-panel/app/Transformers/Api/Client/StatsTransformer.php)）：
+### 5.2 资源接口的完整调用链与两种错误场景 ✅ 代码事实
 
-```json
+#### 调用链概览
+
+```
+① ResourceUtilizationController::__invoke()
+   ↓ （无缓存时）
+② DaemonServerRepository::getDetails()
+   → 向 Wings 发送 GET /api/servers/{uuid}
+   ↓
+③ 两种情况：
+   ├─ 情况 A：连接失败 → 抛 DaemonConnectionException → 504/502 报错给用户
+   └─ 情况 B：连接成功 → json_decode 响应体 → StatsTransformer 转换
+                 ↓
+                 ├─ 字段完整 → 使用 Wings 返回的原始值
+                 └─ 字段缺失 → 使用 PHP 默认值（Arr::get 的第三个参数）
+```
+
+**入口代码**（[ResourceUtilizationController.php 第 30-40 行](file:///d:/fz/0508-3/solo-dogfeeding/code/207-panel/app/Http/Controllers/Api/Client/Servers/ResourceUtilizationController.php#L30-L40)）：
+```php
+public function __invoke(GetServerRequest $request, Server $server): array
 {
-  "current_state": "stopped",     // 电源状态，默认 "stopped"
-  "is_suspended": false,          // 是否挂起，默认 false（来自 Wings）
-  "resources": {
-    "memory_bytes": 0,            // 默认 0
-    "cpu_absolute": 0,            // 默认 0
-    "disk_bytes": 0,              // 默认 0
-    "network_rx_bytes": 0,        // 默认 0
-    "network_tx_bytes": 0,        // 默认 0
-    "uptime": 0                   // 默认 0
-  }
+    $key = "resources:$server->uuid";
+    // 缓存 20 秒
+    $stats = $this->cache->remember($key, Carbon::now()->addSeconds(20), function () use ($server) {
+        return $this->repository->setServer($server)->getDetails();
+    });
+    return $this->fractal->item($stats)
+        ->transformWith($this->getTransformer(StatsTransformer::class))
+        ->toArray();
 }
 ```
 
-所有字段都有默认值（0 或 false），当 Wings 未返回对应字段时使用默认值。
+**注意** ✅ 代码事实：缓存只对成功响应生效。如果 `getDetails()` 抛出异常（连接失败），不会写入缓存，下次请求仍会再次尝试连接 Wings。
 
-> **重要** ⚠️ 推断：挂起状态下 Wings 是否还会返回资源使用数据、返回什么数据，Panel 代码无法验证。客服不能假设挂起时资源数据一定是 0。
+---
+
+#### 情况 A：Wings 连接失败 → 直接报错 ✅ 代码事实
+
+**触发条件**（[DaemonServerRepository.php 第 26-32 行](file:///d:/fz/0508-3/solo-dogfeeding/code/207-panel/app/Repositories/Wings/DaemonServerRepository.php#L26-L32)）：
+- 网络超时、DNS 解析失败、Wings 进程未启动等任何 HTTP 连接错误
+- Wings 返回 4xx/5xx 错误码
+- 任何 `TransferException`（Guzzle 的网络异常基类）
+
+**代码**：
+```php
+try {
+    $response = $this->getHttpClient()->get(
+        sprintf('/api/servers/%s', $this->server->uuid)
+    );
+} catch (TransferException $exception) {
+    // 注意：$useStatusCode = false
+    throw new DaemonConnectionException($exception, false);
+}
+```
+
+**错误呈现给用户** ✅ 代码事实：
+- HTTP 状态码：**504 Gateway Timeout**（`DaemonConnectionException` 第 15 行默认值，`$useStatusCode=false` 时不使用 Wings 的状态码）
+- 消息分两种：
+  - **完全连不上**（无响应体）：`"Could not establish a connection to the machine running this server. Please try again."`
+  - **Wings 返回错误码**（有响应体）：`"There was an error while communicating with the machine running this server. ..."`
+- 同时写入 Panel 日志（warning 级别 或 error 级别，根据状态码区分）
+
+**客服含义**：当用户调用资源接口看到 **504 报错**时，**不能**据此判断服务器是挂起或未挂起，504 只代表 Panel 与 Wings 的通信出现了问题，可能是节点离线、网络故障等任何原因。
+
+---
+
+#### 情况 B：Wings 连接成功但字段缺失 → 使用默认值 ✅ 代码事实
+
+**触发条件**：
+- HTTP 请求返回 2xx 成功
+- 响应体是合法 JSON（`json_decode` 正常解析）
+- 但 JSON 中缺少某个字段，或层级结构与预期不同
+
+**默认值生效位置**（[StatsTransformer.php 第 18-32 行](file:///d:/fz/0508-3/solo-dogfeeding/code/207-panel/app/Transformers/Api/Client/StatsTransformer.php#L18-L32)）：
+```php
+return [
+    'current_state'  => Arr::get($data, 'state', 'stopped'),       // 默认 'stopped'
+    'is_suspended'   => Arr::get($data, 'is_suspended', false),    // 默认 false
+    'resources' => [
+        'memory_bytes'     => Arr::get($data, 'utilization.memory_bytes', 0),   // 默认 0
+        'cpu_absolute'     => Arr::get($data, 'utilization.cpu_absolute', 0),   // 默认 0
+        'disk_bytes'       => Arr::get($data, 'utilization.disk_bytes', 0),     // 默认 0
+        'network_rx_bytes' => Arr::get($data, 'utilization.network.rx_bytes', 0), // 默认 0
+        'network_tx_bytes' => Arr::get($data, 'utilization.network.tx_bytes', 0), // 默认 0
+        'uptime'           => Arr::get($data, 'utilization.uptime', 0),         // 默认 0
+    ],
+];
+```
+
+**测试验证**（[ResourceUtilizationControllerTest.php 第 21-41 行](file:///d:/fz/0508-3/solo-dogfeeding/code/207-panel/tests/Integration/Api/Client/Server/ResourceUtilizationControllerTest.php#L21-L41)）：
+- Mock `getDetails()` 返回**空数组** `[]`
+- 断言结果：所有字段取默认值
+  - `current_state = 'stopped'`
+  - `is_suspended = false` ← **关键：字段缺失时返回 false**
+  - 所有 `resources.* = 0`
+
+> **客服含义** ✅ 代码事实：只有当 Panel **成功连接到 Wings 并拿到合法 JSON**，但 JSON 中缺少 `is_suspended` 字段时，才会返回默认值 `false`。如果连接失败，用户会看到 504 报错，**不会**拿到 `is_suspended=false`。
+
+> **客服含义** ⚠️ 注意：由于默认值是 `false`（未挂起），如果出现"连接成功但字段缺失"这种罕见情况，`is_suspended` 会误报"未挂起"。这也是不推荐用此字段判断状态的原因之一。
+
+---
+
+### 5.3 资源接口返回内容速查表 ✅ 代码事实
+
+| 字段 | 默认值 | 数据来源 | 场景 | 客服判断挂起？ |
+|-----|-------|---------|------|--------------|
+| `is_suspended` | `false` | Wings | 连接成功且字段完整 | 不推荐（Wings 说了算）|
+| `is_suspended` | `false` | PHP 默认值 | 连接成功但字段缺失 | ❌ 可能误报 |
+| HTTP 504 | - | Panel | Wings 连接失败 | ❌ 完全不知道 |
+| 20 秒内重复请求 | 上一次结果 | 缓存 | 任意场景 | ❌ 数据可能过时 |
+
+> **再次强调**：判断挂起状态请用服务器基本信息接口的 `status` 字段，100% 准确。
 
 ---
 
