@@ -1,4 +1,4 @@
-# Pterodactyl Panel 控制台命令与电源动作 — 代码走向全链路分析
+﻿# Pterodactyl Panel 控制台命令与电源动作 — 代码走向全链路分析
 
 > **关于本仓库的范围声明**：此代码库仅包含 Panel（PHP Laravel + React 前端），不含 Wings 守护进程（Go）源码。凡是涉及 Wings 内部实现的描述，均在标题或段落开头明确标注【推断】，以示与 Panel 侧可确认代码的区别。
 
@@ -110,11 +110,11 @@
  └──────────────────────────────────────────────────────────────────────┘
 ```
 
-**代码可确认的设计原则**：
+**代码可确认的设计原则**（仅 Panel 侧，不含 Wings）：
 1. **双轨下发**：电源/命令既可以走 REST（同步确认，供外部/调度），也可以走 WebSocket（实时双向，前端默认使用）。
-2. **JWT 短时令牌**：WebSocket 通信使用 10 分钟过期的 JWT，由 Panel 签发并嵌入权限列表，Wings 可本地校验而无需回查 Panel。
-3. **白名单优先**：`signal` 字段使用 `in:start,stop,restart,kill` 枚举验证，拒绝未知值。
-4. **乐观状态模型**：Panel 数据库不维护 `running/offline` 电源状态，完全依赖 Wings 推送的 WebSocket `status` 事件；失败时无"数据库回滚"。
+2. **JWT 短时令牌**：WebSocket 通信使用 10 分钟过期的 JWT，由 Panel 签发并嵌入权限列表（代码可确认）。【推断】Wings 可本地校验 JWT 签名与权限列表而无需回查 Panel。
+3. **白名单优先**：`signal` 字段使用 `in:start,stop,restart,kill` 枚举验证，拒绝未知值（代码可确认）。
+4. **乐观状态模型**：Panel 数据库不维护 `running/offline` 电源状态字段（代码可确认），完全依赖 Wings 推送的 WebSocket `status` 事件；失败时无"数据库回滚"。
 
 ---
 
@@ -395,7 +395,7 @@ class SendCommandRequest extends ClientApiRequest
 **关键区别（代码可确认）**：
 - Panel 对命令**不做白名单过滤**。原因：游戏服控制台命令集千差万别（Minecraft `/op`、Source `sm_kick`、Rust `server.save` 等），Panel 无法穷举。
 - **权限门槛**：只需拥有 `control.console` 权限即可发送任意命令。
-- **命令过滤职责（【推断】）**：推测由 Wings 或 Egg 配置的 `config.yml` disallow 列表负责，Panel 侧无对应实现。
+- **命令过滤职责（【推断】）**：【推断】由 Wings 或 Egg 配置的 `config.yml` disallow 列表负责，Panel 侧无对应实现。
 
 ### 4.3 调度任务白名单
 
@@ -498,9 +498,9 @@ public function handle(Request $request, \Closure $next): mixed
         }
     }
 
-    // 2. 状态冲突校验：Server::validateCurrentState()
+    // 2. 状态冲突校验：Server::v`validateCurrentState()`
     try {
-        $server->validateCurrentState();
+        $server->v`validateCurrentState()`;
     } catch (ServerStateConflictException $exception) {
         // 例外 1：view endpoint (GET /server) 允许查看状态
         if (!$request->routeIs('api:client:server.view')) {
@@ -519,10 +519,10 @@ public function handle(Request $request, \Closure $next): mixed
 }
 ```
 
-**`validateCurrentState()` 判定逻辑**（[Server.php#L390-L401](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Models/Server.php#L390-L401)，代码可确认）：
+**`v`validateCurrentState()`` 判定逻辑**（[Server.php#L390-L401](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Models/Server.php#L390-L401)，代码可确认）：
 
 ```php
-public function validateCurrentState()
+public function v`validateCurrentState()`
 {
     if (
         $this->isSuspended()              // status = 'suspended'
@@ -671,14 +671,14 @@ Payload (Claims):
   user_uuid: 用户 UUID
   user_id: 用户自增 ID (兼容字段)
   server_uuid: 服务器 UUID
-  permissions: [ "websocket.connect", "control.start", ... ]  // ★ Wings 据此独立鉴权
+  permissions: [ "websocket.connect", "control.start", ... ]  // ★ Panel 写入 JWT，【推断】Wings 据此独立鉴权
   unique_id: Str::random() // 防重放
   jti: md5(user_id + server_uuid)
 ```
 
 **代码可确认的 Websocket 权限门槛**：
 - 在签发 JWT 前，[WebsocketController.php#L36-L38](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Http/Controllers/Api/Client/Servers/WebsocketController.php#L36-L38) 首先检查 `Permission::ACTION_WEBSOCKET_CONNECT`，无权限直接抛 403。
-- JWT 中的 `permissions` 列表是 Wings 侧独立鉴权的依据（如 `send command` 需 `control.console`、`set state` 需对应 `control.*`），无需回查 Panel。
+- Panel 将用户在该服务器上的全部权限列表通过 `permissions` claim 写入 JWT（代码可确认，见 [WebsocketController.php#L58-L60](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Http/Controllers/Api/Client/Servers/WebsocketController.php#L58-L60)）。【推断】Wings 收到 WebSocket 事件（如 `send command`、`set state`）时，会基于 JWT 中的 `permissions` 列表做独立鉴权，无需回查 Panel。
 
 ### 7.2 前端 WebSocket 封装（Websocket.ts + Sockette）
 
@@ -737,11 +737,11 @@ export enum SocketEvent {     // Wings → 前端（接收）
 
 基于 Panel 发出的 HTTP 调用结构推断：
 
-| Method | Path | Body | 推测 Wings 行为 |
+| Method | Path | Body | 【推断】Wings 行为 |
 |--------|------|------|--------------|
-| POST | `/api/servers/{uuid}/power` | `{"action":"start\|stop\|restart\|kill"}` | 推测立即返回 204 No Content；内部异步改变进程状态 |
-| POST | `/api/servers/{uuid}/commands` | `{"commands":["cmd1","cmd2"]}` | 推测要求服务器处于 running 状态，否则返回 502 Bad Gateway；否则立即 204 |
-| GET | `/api/servers/{uuid}` | — | 推测返回 `{"state": "running\|offline\|...", ...}`（Panel 调度 `only_when_online` 检查依赖此接口） |
+| POST | `/api/servers/{uuid}/power` | `{"action":"start\|stop\|restart\|kill"}` | 【推断】立即返回 204 No Content；内部异步改变进程状态 |
+| POST | `/api/servers/{uuid}/commands` | `{"commands":["cmd1","cmd2"]}` | 【推断】要求服务器处于 running 状态，否则返回 502 Bad Gateway；否则立即 204 |
+| GET | `/api/servers/{uuid}` | — | 【推断】返回 `{"state": "running\|offline\|...", ...}`（Panel 调度 `only_when_online` 检查依赖此接口） |
 | GET | `/api/servers/{uuid}/ws` | Upgrade | WebSocket 握手 |
 
 ### 8.2 【推断】WebSocket Event 约定
@@ -760,7 +760,7 @@ export enum SocketEvent {     // Wings → 前端（接收）
 
 **Wings → Client（前端监听）**：
 
-| Event | Args | 触发时机（推测） |
+| Event | Args | 【推断】触发时机 |
 |-------|------|----------------|
 | `auth success` | — | JWT 校验通过 |
 | `token expiring` | — | JWT 距过期 < 3 分钟时 |
@@ -768,14 +768,14 @@ export enum SocketEvent {     // Wings → 前端（接收）
 | `jwt error` | `[msg]` | JWT 校验失败 |
 | `status` | `["starting"]` | 电源状态迁移时 |
 | `console output` | `["[12:34] ..."]` | 游戏服 stdout 有新行时 |
-| `stats` | `[{"cpu":10.5,"memory_bytes":...}]` | 统计心跳（推测 1~2 秒一次） |
+| `stats` | `[{"cpu":10.5,"memory_bytes":...}]` | 【推断】统计心跳（间隔由 Wings 决定） |
 
 ### 8.3 【推断】并发安全与节流
 
 基于 Panel 的设计模式推断 Wings 侧可能采取的机制：
-- 电源动作串行化：推测用互斥锁避免 Start 与 Kill 同时到达导致进程孤儿
-- 控制台命令限频：推测使用令牌桶限频，防止通过 WebSocket `send command` 刷屏
-- 命令黑名单：推测读取 Egg 的 `config.yml` 中的 disallow 列表，拦截危险命令
+- 电源动作串行化：【推断】用互斥锁避免 Start 与 Kill 同时到达导致进程孤儿
+- 控制台命令限频：【推断】使用令牌桶限频，防止通过 WebSocket `send command` 刷屏
+- 命令黑名单：【推断】读取 Egg 的 `config.yml` 中的 disallow 列表，拦截危险命令
 
 这些机制的具体实现（结构体、变量名、调用顺序）**无法从 Panel 代码确认**。
 
@@ -971,16 +971,16 @@ try {
 
 > 针对客服把按钮当命令行的场景，整理"按钮按下 → Panel 代码行为 →（【推断】Wings 行为）→ 玩家体感"：
 
-| 按钮 | 实际发送值（Panel 代码可确认） | 【推断】Wings 行为 | 玩家体感 | 风险（客服应知） |
+| 按钮 | 实际发送值（Panel 代码可确认） | 【推断】Wings 行为 | 【推断】玩家体感 | 风险（客服应知） |
 |------|-----------------------------|-----------------|---------|----------------|
-| **Start** | `"start"`（WebSocket `set state` 或 REST `signal`） | 【推断】启动容器并执行启动命令 | 服务器开始启动，数秒到数分钟后可进 | 正常操作，几乎无风险 |
-| **Stop** | `"stop"` | 【推断】先执行 Egg 配置的 `stop_command`（如 Minecraft `/stop`）→ 等待 `stop_timeout`（默认 30s）→ 未退出则 SIGTERM → SIGKILL | 玩家收到服务器关闭中提示，地图正常存档 | **优雅关闭，应默认使用** |
-| **Restart** | `"restart"` | 【推断】先 stop 完整流程，容器退出后自动 start | 玩家被踢出 → 等待重连 | 会导致玩家被踢 |
-| **Kill** | `"kill"` | 【推断】直接 SIGKILL 容器进程组，不走 stop_command | 瞬间掉线，**无存档提示** | ⚠️ 可能损坏地图/世界；仅在 Stop 卡死无响应时使用 |
+| **Start** | `"start"`（WebSocket `set state` 或 REST `signal`） | 【推断】启动容器并执行启动命令 | 【推断】服务器开始启动，可进入游戏的时间取决于游戏服类型 | 正常操作，几乎无风险 |
+| **Stop** | `"stop"` | 【推断】执行优雅关闭流程，具体行为由 Wings 决定 | 【推断】玩家会收到服务器关闭相关提示，地图通常会正常存档 | **优雅关闭，应默认使用** |
+| **Restart** | `"restart"` | 【推断】先执行关闭流程，容器退出后自动启动 | 【推断】玩家会被断开连接，需等待重启完成后重连 | 会导致玩家连接中断 |
+| **Kill** | `"kill"` | 【推断】执行强制终止流程，不给游戏服预留处理时间 | 【推断】玩家会瞬间失去连接，可能存在未存档数据 | ⚠️ 建议仅在 Stop 无响应时使用；用完后建议检查存档完整性再开服 |
 
 **客服应传达的操作原则**：
 1. 日常维护一律用 **Stop**，不用 Kill
-2. 只有当 Stop 超过 2 分钟控制台仍无任何响应时，才升级到 Kill
+2. 当 Stop 后控制台长时间无任何输出时，可升级到 Kill（具体等待时长建议参考所运行游戏服的常规关闭耗时，本仓库代码未定义阈值）
 3. Kill 之后建议检查游戏服最新存档完整性，再执行 Start
 4. **按钮 = 电源动作，不是命令输入框**。要执行游戏内命令（`/op`, `whitelist add` 等），使用 Console 下方命令输入框
 
@@ -1045,4 +1045,49 @@ try {
 
 | 文件 | 职责 |
 |------|------|
-| [Permission.php
+| [Permission.php](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Models/Permission.php) | 权限常量（`control.*` / `websocket.connect` 等）+ 权限描述 |
+| [Policies/ServerPolicy.php](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Policies/ServerPolicy.php) | Gate 判定：root_admin/owner 放行，子用户查 permissions 数组 |
+| [Models/Server.php](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Models/Server.php) | `v`validateCurrentState()``（suspended/维护/安装/还原/迁移 → 409）|
+| [Services/Nodes/NodeJWTService.php](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Services/Nodes/NodeJWTService.php) | HS256 JWT 签发，嵌入 server_uuid + permissions + user_uuid |
+
+#### 调度系统
+
+| 文件 | 职责 |
+|------|------|
+| [Services/Schedules/ProcessScheduleService.php](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Services/Schedules/ProcessScheduleService.php) | DB 事务入队 + `only_when_online` 检查（调 Wings GET /api/servers/{uuid}）+ 延迟分发 |
+| [Jobs/Schedule/RunTaskJob.php](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Jobs/Schedule/RunTaskJob.php) | 按 sequence_id 顺序执行 + `continue_on_failure` 降级 + `failed()` 释放锁 |
+| [Models/Task.php](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Models/Task.php) | Task::ACTION_POWER/COMMAND/BACKUP 常量 |
+| [.../Schedules/StoreTaskRequest.php](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Http/Requests/Api/Client/Servers/Schedules/StoreTaskRequest.php) | action 白名单 + payload/time_offset 校验 |
+
+#### 异常处理 & 配置
+
+| 文件 | 职责 |
+|------|------|
+| [DaemonConnectionException.php](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Exceptions/Http/Connection/DaemonConnectionException.php) | Wings 通讯异常封装（含 X-Request-Id、状态码重映射、自动报告日志） |
+| [config/http.php](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/config/http.php) | API 限流阈值（client 256/min, application 256/min） |
+| [config/pterodactyl.php](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/config/pterodactyl.php) | Guzzle 超时配置（`timeout=15s`, `connect_timeout=5s`） |
+
+---
+
+## 附：客服 FAQ 速查
+
+**Q1: 点 Stop 按钮等了好久都没反应怎么办？**
+A: Stop 是"优雅关闭"——【推断】Wings 会向游戏服发送停止指令，让其完成存档+踢玩家后再关容器。若控制台长时间无任何输出，说明游戏服进程可能无响应，可以升级到 **Kill** 按钮（会弹出二次确认），但存在未存档丢失风险。具体等待时长建议参考游戏服的常规停止耗时，本仓库代码未定义阈值。
+
+**Q2: Start 按钮灰的，点不了？**
+A: 代码可确认：[PowerButtons.tsx#L54](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/resources/scripts/components/server/console/PowerButtons.tsx#L54) `disabled={status !== 'offline'}`。只有当服务器状态是 **offline** 时 Start 才可用。检查 Console 页面左上角的状态标签，如果是 `starting`/
+`running`/`stopping`，Start 会被前端禁用，避免并发启动。
+
+**Q3: 用命令输入框输了 "stop" 回车和点 Stop 按钮一样吗？**
+A: **完全不一样！**
+- 命令输入框（[Console.tsx#L176](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/resources/scripts/components/server/console/Console.tsx#L176)）走的是 WebSocket `send command` 事件，内容作为游戏服**控制台命令**直接写入 stdin。大多数游戏里 `"stop"` 并不是合法指令（Minecraft 需要 `/stop` 带斜杠）。
+- Stop **按钮**走的是 `set state` → `DaemonPowerRepository` → Wings `POST /power`，【推断】由 Wings 负责执行优雅关闭流程。**推荐用按钮**。
+
+**Q4: Kill 和 Stop 到底有啥区别？**
+A: Panel 代码可确认二者发出的值不同（`"kill"` vs `"stop"`，见 [PowerButtons.tsx#L29](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/resources/scripts/components/server/console/PowerButtons.tsx#L29) 和 [DaemonPowerRepository.php#L29](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Repositories/Wings/DaemonPowerRepository.php#L29)）。【推断】Stop = 优雅关闭流程（通常会给游戏服机会完成自身清理）；Kill = 强制终止（不等候游戏服自身处理）。Kill 建议只在 Stop 无响应时使用。用完 Kill 后建议检查最新存档完整性再开服。
+
+**Q5: 服务器被暂停（suspended）了，能发命令吗？**
+A: Panel 代码可确认：[AuthenticateServerAccess.php#L50-L59](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/app/Http/Middleware/Api/Client/Server/AuthenticateServerAccess.php#L50-L59) 中的 `validateCurrentState()` 会拒绝 `/power` 和 `/command` 请求（HTTP 409 Conflict）。管理员即使能连上 WebSocket 也只能看日志，无法执行操作。先联系主机商解除暂停。
+
+**Q6: 命令输入框没了？**
+A: 检查当前账号有没有 `control.console` 权限。代码可确认：[Console.tsx#L66](file:///d:/fz/0508-3/solo-dogfeeding/code/208-panel/resources/scripts/components/server/console/Console.tsx#L66) `canSendCommands` 由 `usePermissions(['control.console'])` 返回，子用户由所有者在 **Users** 标签页分配。没有此权限的账号不会渲染命令输入框；【推断】即使手动构造 WebSocket `send command` 事件，Wings 侧也会因为 JWT claims 不含 control.console 而被拦截。
