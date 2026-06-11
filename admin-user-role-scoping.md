@@ -951,15 +951,22 @@ class AdminAcl
 
 ---
 
-## 八、WebSocket 完整生命周期 — 签发、校验、续期、吊销与重授权
+## 八、WebSocket 完整生命周期 — 签发、续期、吊销与重授权
 
-### 8.1 JWT 令牌签发 — 完整数据流
+> **事实与推断边界说明**：
+> - ✅ **仓内事实**：Panel 仓库代码可直接定位、逐行核对的行为
+> - ❓ **Wings 推断**：需依赖 Wings 内部实现才能确认，仓内无直接代码证据（即使 Panel 注释中有提及）
+
+---
+
+### 8.1 JWT 令牌签发 — 完整数据流（全部 ✅ 仓内事实）
 
 文件：[WebsocketController.php](file:///d:/fz/0508-3/solo-dogfeeding/code/205-panel/app/Http/Controllers/Api/Client/Servers/WebsocketController.php#L33-L72) 和 [NodeJWTService.php](file:///d:/fz/0508-3/solo-dogfeeding/code/205-panel/app/Services/Nodes/NodeJWTService.php#L60-L102)
 
 ```
 前端 getWebsocketToken(uuid)
     │  GET /api/client/servers/{uuid}/websocket
+    │  [getWebsocketToken.ts#L8-L18](file:///d:/fz/0508-3/solo-dogfeeding/code/205-panel/resources/scripts/api/server/getWebsocketToken.ts#L8-L18)
     │
     ▼
 AuthenticateServerAccess 中间件
@@ -970,243 +977,275 @@ AuthenticateServerAccess 中间件
     │
     ▼
 WebsocketController.__invoke()
-    ├─ Gate::check(websocket.connect, server)
+    ├─ ✅ Gate::check(websocket.connect, server)
     │   ├─ 管理员 → true
     │   ├─ 所有者 → true
     │   └─ 子用户 → in_array('websocket.connect', permissions)
     │
-    ├─ GetUserPermissionsService.handle(server, user)
+    ├─ ✅ GetUserPermissionsService.handle(server, user)
     │   ├─ 管理员 → ['*', 'admin.websocket.errors', 'admin.websocket.install', 'admin.websocket.transfer']
     │   ├─ 所有者 → ['*']
     │   └─ 子用户 → ['websocket.connect', 'control.start', ...]
     │
-    ├─ 迁移检查
+    ├─ ✅ 迁移检查
     │   ├─ server.transfer 为 null → 跳过
     │   └─ server.transfer 非 null
-    │       ├─ in_array('admin.websocket.transfer', permissions) → false → ❌ 403
-    │       └─ true → 继续
-    │           └─ transfer.archived → 重定向到 newNode
+    │       ├─ !in_array('admin.websocket.transfer', permissions) → ❌ 403
+    │       └─ transfer.archived → node 重定向为 newNode
     │
-    └─ NodeJWTService 签发 JWT
-        ├─ 签名密钥：节点的 getDecryptedKey()
-        ├─ jti: md5(user_id + server_uuid)   ← 吊销时按此标识
-        ├─ exp: 当前时间 + 10 分钟
-        ├─ nbf: 当前时间 - 5 分钟（容忍时钟偏差）
-        ├─ claims:
-        │   ├─ server_uuid: 服务器 UUID
-        │   ├─ permissions: 权限数组（快照！）
-        │   └─ user_uuid: 用户 UUID
-        └─ unique_id: Str::random()（每次签发唯一）
+    └─ ✅ NodeJWTService 签发 JWT
+        ├─ 签名算法：HMAC-SHA256，密钥 = 节点的 getDecryptedKey()
+        ├─ jti (JWT ID)：md5(user_id + server_uuid)
+        │   ← 同一用户对同一服务器的所有 JWT 共享同一 jti
+        ├─ exp：当前时间 + 10 分钟
+        ├─ nbf：当前时间 - 5 分钟（容忍时钟偏差）
+        ├─ iss：config('app.url')
+        ├─ aud：节点连接地址
+        ├─ claims：
+        │   ├─ server_uuid：服务器 UUID
+        │   ├─ permissions：权限数组（签发时的快照）
+        │   ├─ user_uuid：用户 UUID
+        │   └─ user_id：用户 ID（注释标注为 deprecated，1.11 移除）
+        └─ unique_id：Str::random()（每次签发唯一值）
     │
     ▼
-返回 { token: JWT字符串, socket: wss://node:port/api/servers/uuid/ws }
+✅ 返回 { token: JWT字符串, socket: wss://node:port/api/servers/uuid/ws }
 ```
 
-### 8.2 WebSocket 连接建立 — 从前端到 Wings
+---
+
+### 8.2 WebSocket 连接建立 — 前端到 Wings（混合 ✅ 与 ❓）
 
 文件：[Websocket.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/205-panel/resources/scripts/plugins/Websocket.ts) 和 [WebsocketHandler.tsx](file:///d:/fz/0508-3/solo-dogfeeding/code/205-panel/resources/scripts/components/server/WebsocketHandler.tsx)
 
 ```
-前端 WebsocketHandler 组件挂载
+前端 WebsocketHandler 组件挂载 → connect(uuid)
     │
-    ▼
-connect(uuid)
+    ├─ ✅ new Websocket() — 创建 Sockette 包装实例
+    │   └─ ✅ 注册以下事件监听器（WebsocketHandler.tsx#L35-L77）：
+    │       ├─ 'auth success' → setConnectionState(true)
+    │       ├─ 'SOCKET_CLOSE' → setConnectionState(false)
+    │       ├─ 'SOCKET_CONNECT_ERROR' → 显示"多次尝试后连接失败"
+    │       ├─ 'SOCKET_ERROR' → 显示"连接中..."
+    │       ├─ 'status' → 更新服务器状态
+    │       ├─ 'daemon error' → console.warn
+    │       ├─ 'token expiring' → updateToken()
+    │       ├─ 'token expired' → updateToken()
+    │       ├─ 'jwt error' → 判断是否重连
+    │       └─ 'transfer status' → 迁移阶段处理
     │
-    ├─ new Websocket()
-    │   └─ 注册事件处理器（auth success / token expiring / jwt error / ...）
-    │
-    ├─ getWebsocketToken(uuid)  ← 第一次请求 /websocket
+    ├─ ✅ getWebsocketToken(uuid)  ← 第一次请求 /websocket
     │   └─ 返回 { token, socket }
     │
-    └─ socket.setToken(token).connect(socketUrl)
+    └─ ✅ socket.setToken(token).connect(socketUrl)
         │
         ▼
-    WebSocket 连接到 wss://node:port/api/servers/uuid/ws
+    ✅ WebSocket 连接到 wss://node:port/api/servers/uuid/ws
         │
         ▼
-    onopen 触发 → authenticate()
-        │  发送 { event: "auth", args: [JWT_TOKEN] }
+    ✅ onopen 触发 → authenticate()
+        │  发送：{ event: "auth", args: [JWT_TOKEN] }
+        │  [Websocket.ts#L72-L76](file:///d:/fz/0508-3/solo-dogfeeding/code/205-panel/resources/scripts/plugins/Websocket.ts#L72-L76)
         │
         ▼
-    Wings 验证 JWT
-        ├─ 检查签名（使用节点密钥）
-        ├─ 检查 exp（未过期）
-        ├─ 检查 jti（不在 denylist 中）
-        ├─ 检查 nbf ≤ 当前时间
-        └─ 读取 permissions 建立会话权限上下文
+    ❓ Wings 验证 JWT（仓内无代码，以下为合理推断）
+        ├─ ❓ 检查签名（使用节点密钥，与签发对称）
+        ├─ ❓ 检查 exp（未过期）
+        ├─ ❓ 检查 nbf ≤ 当前时间
+        └─ ❓ 读取 permissions 建立会话权限上下文
         │
         ▼
-    Wings 返回 { event: "auth success", args: [...] }
-        │
-        ▼
-    前端 setConnectionState(true) → 连接成功
+    ✅ Wings 返回事件（从前端监听器反推，Wings 必然会发送）
+        ├─ ✅ 验证成功 → 'auth success'
+        └─ ✅ 验证失败 → 'jwt error'，附带具体错误消息
 ```
 
-### 8.3 JWT 自动续期 — 不中断的令牌轮换
+---
+
+### 8.3 JWT 自动续期 — 不中断的令牌轮换（✅ 仓内事实为主）
 
 文件：[WebsocketHandler.tsx#L20-L30](file:///d:/fz/0508-3/solo-dogfeeding/code/205-panel/resources/scripts/components/server/WebsocketHandler.tsx#L20-L30) 和 [Websocket.ts#L62-L76](file:///d:/fz/0508-3/solo-dogfeeding/code/205-panel/resources/scripts/plugins/Websocket.ts#L62-L76)
 
 ```
-JWT 生命周期（10 分钟有效期）
+JWT 有效期（✅ 签发时写死 10 分钟，WebsocketController.php#L56）
     │
-    ├─ T+0min  签发
-    ├─ T+7min  Wings 推送 'token expiring' 事件（提前 3 分钟警告）
+    ├─ T+0min  ✅ 签发
+    ├─ T+7min  ❓ Wings 推送 'token expiring'（提前 3 分钟警告）
+    │           ← 前端 WebsocketHandler.tsx#L50 有监听，但仓内无法确认 Wings 的推送时机
     ├─ T+10min JWT 过期
     │
     ▼
-续期触发条件（任一满足即触发 updateToken）：
+✅ 续期触发条件（WebsocketHandler.tsx#L10 + L50-L62）：
 
-1. 'token expiring'  → Wings 主动提醒
-2. 'token expired'   → JWT 已过期
-3. 'jwt error' 且错误消息包含以下之一：
-   ├─ 'jwt: exp claim is invalid'         ← 过期
-   └─ 'jwt: created too far in past (denylist)'  ← 被吊销
-
-续期流程：
+1. ✅ 收到 'token expiring' 事件
+2. ✅ 收到 'token expired' 事件
+3. ✅ 收到 'jwt error' 事件且错误消息匹配 reconnectErrors 任一字符串：
+   ├─ 'jwt: exp claim is invalid'
+   └─ 'jwt: created too far in past (denylist)'
+    │  reconnectErrors 定义：[WebsocketHandler.tsx#L10](file:///d:/fz/0508-3/solo-dogfeeding/code/205-panel/resources/scripts/components/server/WebsocketHandler.tsx#L10)
     │
     ▼
-updateToken(uuid, socket)
-    │  if (updatingToken) return;   ← 防止并发续期
+✅ updateToken(uuid, socket) — [WebsocketHandler.tsx#L20-L30](file:///d:/fz/0508-3/solo-dogfeeding/code/205-panel/resources/scripts/components/server/WebsocketHandler.tsx#L20-L30)
+    │  if (updatingToken) return;   ← 防并发标志
     │  updatingToken = true;
     │
-    ├─ getWebsocketToken(uuid)      ← 重新请求 /api/client/servers/{uuid}/websocket
+    ├─ ✅ getWebsocketToken(uuid) → GET /api/client/servers/{uuid}/websocket
     │   │
-    │   ├─ Panel 重新鉴权（中间件 + Gate + 权限服务）
-    │   │   ├─ 权限已被撤销 → ❌ 403 → .catch(error)
+    │   ├─ ✅ Panel 重新走完整鉴权链（中间件 + Gate + 权限服务）
+    │   │   ├─ 权限已撤销 → ❌ 403 → .catch(error) → updatingToken = false
     │   │   └─ 权限仍在 → ✅ 返回新 JWT（含最新权限快照）
     │   │
-    │   └─ 新 JWT 的 jti 与旧 JWT 相同（md5(user_id+server_uuid)）
-    │       ← 这意味着旧 JWT 被吊销后，新 JWT 的 jti 也会
-    │         被加入 denylist，导致"吊销-重签-又被吊销"死循环
+    │   └─ ✅ 新 JWT 的 jti 与旧 JWT 相同（jti = md5(user_id + server_uuid)）
     │
-    └─ socket.setToken(newToken, isUpdate=true)
+    └─ ✅ socket.setToken(newToken, isUpdate = true)
         │  this.token = newToken;
-        └─ this.authenticate()
-           发送 { event: "auth", args: [NEW_JWT] }
-           │
-           ▼
-        Wings 验证新 JWT → 'auth success' 或 'jwt error'
+        └─ isUpdate=true → this.authenticate()
+           → 发送 { event: "auth", args: [NEW_JWT] }
 ```
 
-> **关于 jti 的关键细节**：JWT 的 jti 由 `md5(user_id + server_uuid)` 计算得出，**同一用户对同一服务器的所有 JWT 共享同一 jti**。这意味着当 Wings 收到 `/api/deauthorize-user` 请求后，会将该 jti 加入 denylist，**后续用同一 jti 签发的新 JWT 也会被拒绝**。实际上 Wings 的吊销机制是按 user_uuid 而非 jti 运作的——收到 deauthorize 请求后，Wings 会清除该用户的全部会话和 jti 记录，因此重签的新 JWT（即使 jti 相同）可以重新通过验证。
+> **jti 说明（事实与推断分开）**：
+> - ✅ **仓内事实**：jti = `md5(user_id + server_uuid)`，同一用户对同一服务器的所有 JWT 共享同一 jti（[NodeJWTService.php#L63-L65](file:///d:/fz/0508-3/solo-dogfeeding/code/205-panel/app/Services/Nodes/NodeJWTService.php#L63-L65)）
+> - ❓ **Wings 推断**：收到 `/api/deauthorize-user` 后 denylist 粒度未知。若按 jti 拦截会导致"吊销 → 重签 → 又被拦截"死循环，但系统实际能正常工作，合理推断 denylist 不是按 jti 粒度维护的。
 
-### 8.4 JWT 被吊销后的重连与重授权路径
+---
 
-当 Panel 调用 `RevokeSftpAccessJob` 后，以下链路触发：
+### 8.4 deauthorize 请求发出链路（全部 ✅ 仓内事实）
+
+Panel 端触发吊销请求的完整链路，所有代码均在仓内可证：
 
 ```
-Panel 端
+✅ 触发入口（4 处）：
     │
-    ├─ SubuserController.update() → RevokeSftpAccessJob::dispatch(user_uuid, server)
-    ├─ SubuserController.delete() → RevokeSftpAccessJob::dispatch(user_uuid, server)
-    └─ RevocationListener.revoke() → RevokeSftpAccessJob::dispatch(user_uuid, node)
+    ├─ ✅ [SubuserController.update()](file:///d:/fz/0508-3/solo-dogfeeding/code/205-panel/app/Http/Controllers/Api/Client/Servers/SubuserController.php#L110-L117)
+    │      权限变更（$permissions !== $current）→ dispatch($user_uuid, $server)
+    │
+    ├─ ✅ [SubuserController.delete()](file:///d:/fz/0508-3/solo-dogfeeding/code/205-panel/app/Http/Controllers/Api/Client/Servers/SubuserController.php#L140-L144)
+    │      协作者删除 → dispatch($user_uuid, $server)
+    │
+    └─ ✅ [RevocationListener.revoke()](file:///d:/fz/0508-3/solo-dogfeeding/code/205-panel/app/Listeners/RevocationListener.php#L15-L26)
+           监听事件：
+           ├─ User\Deleting（用户被删除）
+           └─ User\PasswordChanged（密码变更）
+           → 遍历用户关联的所有节点 → dispatch($user_uuid, $node)
     │
     ▼
-RevokeSftpAccessJob（队列异步执行，最多重试 3 次）
+✅ [RevokeSftpAccessJob](file:///d:/fz/0508-3/solo-dogfeeding/code/205-panel/app/Jobs/RevokeSftpAccessJob.php#L18-L57)（队列异步执行）
+    │  implements ShouldQueue, ShouldBeUnique
+    │  tries = 3，maxExceptions = 1
+    │  uniqueId = "revoke-sftp:{user}:{server:uuid|node:uuid}" ← 防重复调度
+    │
+    ├─ handle() 中：
+    │   ├─ $node = target 是 Node 时直接用，否则取 $server->node
+    │   └─ $servers = target 是 Server 时传 [server_uuid]，是 Node 时传 []（空数组=全节点）
+    │
+    └─ 失败处理（DaemonConnectionException）：
+        $this->release($this->attempts() * 10);  ← 退避重试：10s、20s、30s
     │
     ▼
-DaemonRevocationRepository.deauthorize(user_uuid, servers)
-    │  POST /api/deauthorize-user
-    │  Body: { "user": "user_uuid", "servers": ["server_uuid"] 或 [] }
+✅ [DaemonRevocationRepository.deauthorize()](file:///d:/fz/0508-3/solo-dogfeeding/code/205-panel/app/Repositories/Wings/DaemonRevocationRepository.php#L17-L26)
+    │
+    ├─ ✅ HTTP 请求：POST /api/deauthorize-user
+    ├─ ✅ Body：{ "user": "user_uuid", "servers": ["server_uuid"] 或 [] }
+    │
+    └─ ⚠️ 类注释写着 "Deauthorizes a user (disconnects websockets and SFTP)"
+           ← 这是 Panel 开发者的注释说明，不是仓内代码执行的结果
+           ← Wings 实际做了什么，仓内无直接证据
+```
+
+---
+
+### 8.5 deauthorize 发出后：前端重连与重授权路径（✅ 仓内事实 + ❓ Wings 推断严格分开）
+
+```
+✅ Panel 发出 POST /api/deauthorize-user 之后……
     │
     ▼
-Wings 端收到 deauthorize-user 请求
+❓ Wings 端收到请求（仓内无 Wings 代码，以下均为推断，附推断依据）
     │
-    ├─ 立即断开该用户在此节点上的所有 SFTP 会话
-    ├─ 将该用户的所有 JWT 加入 denylist（按 user_uuid 匹配）
-    └─ 对活跃的 WebSocket 连接推送 'jwt error' 事件
-        │  消息：'jwt: created too far in past (denylist)'
+    ├─ ❓ 处理 SFTP 会话
+    │      推断依据：DaemonRevocationRepository 类注释 "disconnects websockets and SFTP"
+    │
+    ├─ ❓ 处理 WebSocket 会话与 JWT 拒绝列表
+    │      推断依据：前端 reconnectErrors 含 'jwt: created too far in past (denylist)'
+    │                → 说明 Wings 存在某种 denylist 机制并会据此拒绝 JWT
+    │
+    └─ ❓ 对已建立的 WebSocket 连接推送事件
+           推断依据：前端 WebsocketHandler 监听 'jwt error'
+                     → 说明 Wings 会向活跃连接推送该事件
+           ❓ 具体事件内容：'jwt error'，消息含 'jwt: created too far in past (denylist)'
+           推断依据：前端 reconnectErrors 中明确写了该字符串
+    │
+    ▼
+✅ 前端 WebsocketHandler 收到事件（以下全部仓内可证）
+    │
+    ├─ ✅ 若收到 'jwt error' 事件：[WebsocketHandler.tsx#L52-L63](file:///d:/fz/0508-3/solo-dogfeeding/code/205-panel/resources/scripts/components/server/WebsocketHandler.tsx#L52-L63)
+    │   │  setConnectionState(false)
+    │   │
+    │   ├─ ✅ error.toLowerCase() 匹配 reconnectErrors 任一：
+    │   │   ├─ 'jwt: exp claim is invalid'
+    │   │   └─ 'jwt: created too far in past (denylist)'
+    │   │   │
+    │   │   ▼
+    │   │   ✅ updateToken(uuid, socket)：
+    │   │       │
+    │   │       ├─ ✅ getWebsocketToken(uuid) → GET /api/client/servers/{uuid}/websocket
+    │   │       │   │
+    │   │       │   ├─ ✅ 场景 A：子用户权限被修改但 websocket.connect 仍在
+    │   │       │   │   → 中间件放行 → WebsocketController 签发新 JWT
+    │   │       │   │   → 新 JWT 含最新权限快照
+    │   │       │   │   → socket.setToken(newToken, true) → authenticate()
+    │   │       │   │   → ❓ Wings 接受新 JWT → 连接恢复（Wings 行为推断）
+    │   │       │   │
+    │   │       │   ├─ ✅ 场景 B：子用户被删除 / websocket.connect 被撤销
+    │   │       │   │   → Gate::check 返回 false → ❌ 403
+    │   │       │   │   → .catch(error) → console.error
+    │   │       │   │   → updatingToken = false → 不再自动尝试
+    │   │       │   │   → WebSocket 保持断开
+    │   │       │   │
+    │   │       │   └─ ✅ 场景 C：服务器被暂停
+    │   │       │       → AuthenticateServerAccess 第一个 if 拦截
+    │   │       │         （isSuspended=true && !routeIs('resources')=true）
+    │   │       │       → ❌ ServerStateConflictException
+    │   │       │       → 同上，保持断开
+    │   │       │
+    │   │       └─ ✅ 总结（仅仓内可证部分）：
+    │   │           ├─ Panel 能签发新 JWT → 前端会主动重新 authenticate
+    │   │           └─ Panel 返回 403/异常 → 前端放弃自动重连
+    │   │
+    │   └─ ✅ 若错误不匹配 reconnectErrors：
+    │       → setError('There was an error validating the credentials...')
+    │       → 提示用户手动刷新页面
+    │
+    └─ ✅ 若 WebSocket 被 Wings 主动关闭：
+        │  [Websocket.ts#L37-L50](file:///d:/fz/0508-3/solo-dogfeeding/code/205-panel/resources/scripts/plugins/Websocket.ts#L37-L50)
         │
-        ▼
-    前端收到 'jwt error' 事件
+        ├─ ✅ 关闭码 4409 或 4400 → this.close(1000) ← 不再自动重连
+        │   ← 注释："We return code 4409 from Wings when a server is suspended"
+        │   ← 这是 Panel 开发者写的注释，关闭码含义来自约定
         │
-        ▼
-    WebsocketHandler 判断错误类型
-        │
-        ├─ 错误包含 'denylist' → 匹配 reconnectErrors
-        │   │
-        │   ▼
-        │   updateToken(uuid, socket)
-        │       │
-        │       ├─ GET /api/client/servers/{uuid}/websocket
-        │       │   │
-        │       │   ├─ 场景 A：子用户权限被修改（未删除）
-        │       │   │   → 中间件放行 → WebsocketController 签发新 JWT
-        │       │   │   → 新 JWT 含最新权限 → Wings 接受 → ✅ 重连成功
-        │       │   │
-        │       │   ├─ 场景 B：子用户被删除 / websocket.connect 被撤销
-        │       │   │   → Gate::check 返回 false → ❌ 403
-        │       │   │   → getWebsocketToken catch(error) → console.error
-        │       │   │   → 更新 updatingToken = false → 不会再尝试
-        │       │   │   → WebSocket 保持断开状态
-        │       │   │
-        │       │   └─ 场景 C：服务器被暂停
-        │       │       → AuthenticateServerAccess 拦截 → ❌ ServerStateConflictException
-        │       │       → getWebsocketToken catch(error) → 同上
-        │       │
-        │       └─ 结果：
-        │           ├─ 权限仍在 → ✅ 无缝重连（新 JWT 含最新权限）
-        │           └─ 权限已撤销 → ❌ 永久断开（前端不再尝试）
-        │
-        └─ 错误不包含 denylist
-            → setError('凭证验证错误，请刷新页面') → 用户需手动操作
+        └─ ✅ 其他关闭码 → Sockette 自动重连（maxAttempts=20）
+            → emit 'SOCKET_RECONNECT'
 ```
 
-### 8.5 服务器暂停后的 WebSocket 行为
+**本章事实 vs 推断速查表**：
 
-服务器被暂停（[SuspensionService](file:///d:/fz/0508-3/solo-dogfeeding/code/205-panel/app/Services/Servers/SuspensionService.php#L28-L60)）后，WebSocket 的完整行为链路：
-
-```
-管理员在管理后台暂停服务器
-    │
-    ├─ Panel DB: server.status = 'suspended'
-    └─ Wings: daemonServerRepository.sync() → Wings 冻结服务器进程
-    │
-    ▼
-Wings 主动关闭该服务器的所有 WebSocket 连接
-    │  关闭码: 4409（Suspended）
-    │
-    ▼
-前端 Websocket.ts onreconnect 处理
-    │  evt.code === 4409 → this.close(1000)  ← 不再自动重连
-    │
-    ▼
-前端显示红色提示条：'连接中断...'
-
-此时如果用户尝试刷新页面：
-    │
-    ▼
-前端 getWebsocketToken(uuid)
-    │  GET /api/client/servers/{uuid}/websocket
-    │
-    ▼
-AuthenticateServerAccess 中间件
-    ├─ validateCurrentState() → isSuspended() = true → 抛异常
-    └─ 捕获后检查路由
-        ├─ 路由 = api:client:server.ws（在 $except 中）
-        ├─ 但 isSuspended() = true → 进入分支 B
-        │   └─ 路由不是 resources → ❌ 拦截
-        └─ 结果：所有角色（包括管理员）都被拦截
-```
-
-> **暂停 vs 安装/迁移的关键区别**：暂停时管理员也不能获取 WebSocket 令牌，因为 Wings 端服务器进程已冻结，WebSocket 服务不可用。而安装/迁移时 Wings 仍运行着 WebSocket 服务，只是频道内容不同。
-
-### 8.6 迁移过程中的 WebSocket 重连
-
-文件：[WebsocketHandler.tsx#L65-L77](file:///d:/fz/0508-3/solo-dogfeeding/code/205-panel/resources/scripts/components/server/WebsocketHandler.tsx#L65-L77)
-
-迁移是一个多阶段过程，WebSocket 需要跨节点重连：
-
-```
-管理员发起迁移（管理后台 ServerTransferController）
-    │
-    ├─ 创建 server_transfers 记录
-    ├─ 通知源节点开始传输
-    └─ 源节点向目标节点推送数据
-    │
-    ▼
-前端收到 'transfer status' 事件
-    │
+| 行为 | 仓内事实 ✅ | Wings 推断 ❓ | 依据 |
+|-----|-----------|-------------|-----|
+| JWT 结构（jti、exp、claims 等） | ✅ | — | NodeJWTService.php#L63-L101 |
+| JWT 有效期 10 分钟 | ✅ | — | WebsocketController.php#L56 |
+| 前端监听的 9 种事件名 | ✅ | — | WebsocketHandler.tsx#L35-L77 |
+| reconnectErrors 两个字符串 | ✅ | — | WebsocketHandler.tsx#L10 |
+| updateToken 重签流程 | ✅ | — | WebsocketHandler.tsx#L20-L30 |
+| 重签请求经完整鉴权链 | ✅ | — | WebsocketController.php + 中间件 |
+| deauthorize 4 个触发入口 | ✅ | — | SubuserController + RevocationListener |
+| POST /api/deauthorize-user 格式 | ✅ | — | DaemonRevocationRepository.php#L17-L26 |
+| Job 重试策略（3 次、退避） | ✅ | — | RevokeSftpAccessJob.php#L23-L55 |
+| 关闭码 4409/4400 不再重连 | ✅ | — | Websocket.ts#L37-L50 |
+| Wings 断开 SFTP 会话 | — | ❓ | 类注释提及 |
+| Wings 维护 JWT denylist | — | ❓ | 前端错误消息含 denylist |
+| Wings 推送 'jwt error' 事件 | — | ❓ | 前端有监听 |
+| Wings 验证新 JWT 并接受 | — | ❓ | 系统能正常工作反推 |
+| denylist 的具体粒度（jti / user_uuid） | — | ❓ | 无直接证据 |
     ├─ status = 'starting' → 忽略（迁移刚开始）
     ├─ status = 'success' → 忽略（迁移完成）
     └─ status = 'archived' 或其他 → 触发重连
