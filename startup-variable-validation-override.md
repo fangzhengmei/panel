@@ -17,7 +17,7 @@
 | `name` | 变量显示名 |
 | `description` | 变量描述 |
 | `env_variable` | 环境变量名（正则校验 `^[\w]{1,191}$`） |
-| `default_value` | 默认值，当服务器未设置该变量时的兜底值 |
+| `default_value` | 默认值，仅当 `server_variables` 表中完全不存在该变量记录时才会兜底（空串记录不算"未设置"） |
 | `user_viewable` | 用户是否可见（布尔） |
 | `user_editable` | 用户是否可编辑（布尔） |
 | `rules` | Laravel Validation 规则字符串（如 `required\|string\|max:20`） |
@@ -635,7 +635,7 @@ Egg 继承机制见 [Egg.php](file:///d:/fz/0508-3/solo-dogfeeding/code/202-pane
 |----------|----------|---------------------|------------------|
 | 修改服务器构建参数（内存/CPU/端口） | BuildModificationService | ✅ 是（[L68](file:///d:/fz/0508-3/solo-dogfeeding/code/202-panel/app/Services/Servers/BuildModificationService.php#L68)） | 部分可热更（如 cgroup 限制），部分需重启 |
 | 修改启动变量 / 启动命令 / Docker 镜像 | StartupModificationService | ❌ 否 | ✅ 必须重启服务器 |
-| 修改 Egg 模板 default_value | VariableUpdateService | ❌ 否 | ✅ 必须重启，且服务器未显式覆盖该变量才生效 |
+| 修改 Egg 模板 default_value | VariableUpdateService | ❌ 否 | ✅ 仅对状态③（server_variables 完全无该变量记录，即 Egg 在该服创建后新增的变量）生效，且需重启；对状态①/②（有记录，哪怕是空串）的老服完全无效 |
 | 修改 Egg 模板 rules/env_variable 名 | VariableUpdateService | ❌ 否 | ⚠️ 需视情况；若改了 env_variable 名，旧 server_variables 行的 variable_id 仍指向新定义，可能不会匹配新占位符 |
 | 服务器（重新）安装 | ReinstallServerService | ❌ 由 install 流程本身处理 | ✅ 安装完后首次启动即生效 |
 | 节点 / Wings 重启 | — | ✅ Wings 启动时批量拉所有服 | — |
@@ -699,7 +699,7 @@ WHERE s.id = <YOUR_SERVER_ID>
 ORDER BY ev.env_variable;
 ```
 
-SQL 关键理解：`runtime_actual_value` 是下发给 Wings 时真正会使用的值；`egg_var_created_at > server_created_at` 的行**极大概率**是 状态（无记录）（Egg 在服务器创建之后新增的变量）。
+SQL 关键理解：`runtime_actual_value` 是下发给 Wings 时真正会使用的值；`egg_var_created_at > server_created_at` 的行**极大概率**是 状态③（无记录）（Egg 在服务器创建之后新增的变量）。
 
 ### 9.2 典型症状 → 根因 → 处理对照表
 
