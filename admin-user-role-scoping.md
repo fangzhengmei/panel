@@ -410,6 +410,60 @@ protected function validatePermissionsCanBeAssigned(array $permissions)
 }
 ```
 
+### 4.4 权限保存时的自动补充与裁剪
+
+文件：[SubuserController.php](file:///d:/fz/0508-3/solo-dogfeeding/code/205-panel/app/Http/Controllers/Api/Client/Servers/SubuserController.php#L154-L168)
+
+子用户权限在保存前会经过 `getDefaultPermissions()` 方法的三道处理，确保权限列表既合法又完整：
+
+```php
+protected function getDefaultPermissions(Request $request): array
+{
+    // 步骤一：展开权限字典，得到所有合法权限的扁平化数组
+    $allowed = Permission::permissions()
+        ->map(function ($value, $prefix) {
+            return array_map(function ($value) use ($prefix) {
+                return "$prefix.$value";
+            }, array_keys($value['keys']));
+        })
+        ->flatten()
+        ->all();
+
+    // 步骤二：裁剪 — 仅保留在白名单中存在的权限（丢弃非法/拼写错误的权限）
+    $cleaned = array_intersect($request->input('permissions') ?? [], $allowed);
+
+    // 步骤三：自动补充 — 强制追加 websocket.connect（即使前端没传也会加上）
+    return array_unique(array_merge($cleaned, [Permission::ACTION_WEBSOCKET_CONNECT]));
+}
+```
+
+**处理流程详解**：
+
+| 步骤 | 操作 | 作用 | 示例 |
+|-----|------|------|------|
+| 1. 展开 | 从 `Permission::permissions()` 生成全量合法权限列表 | 建立白名单基准 | `['websocket.connect', 'control.start', ...]` |
+| 2. 裁剪 | `array_intersect` 取交集 | 过滤掉不存在的权限（防止注入非法权限字符串） | 传入 `['fake.perm', 'file.read']` → 只剩 `['file.read']` |
+| 3. 补充 | `array_merge` 追加 `websocket.connect` | 确保子用户至少能连接控制台（即使未显式授予） | 传入 `[]` → 得到 `['websocket.connect']` |
+| 4. 去重 | `array_unique` | 避免重复项 | — |
+
+> **设计意图**：`websocket.connect` 是控制台交互的基础权限，如果没有它子用户进入服务器页面会连不上控制台，体验极差。因此系统强制保证该权限始终存在，属于一种防御性编程。
+
+**更新时的优化**（[SubuserController.php#L93-L118](file:///d:/fz/0508-3/solo-dogfeeding/code/205-panel/app/Http/Controllers/Api/Client/Servers/SubuserController.php#L93-L118)）：
+
+```php
+// 排序后比对，只有权限真正变更时才写库 + 吊销会话
+if ($permissions !== $current) {
+    $log->transaction(function () use ($request, $subuser, $server) {
+        $this->repository->update($subuser->id, [
+            'permissions' => $this->getDefaultPermissions($request),
+        ]);
+
+        // 权限变更 → 触发 SFTP/WebSocket 吊销
+        RevokeSftpAccessJob::dispatch($subuser->user->uuid, $server);
+    });
+}
+```
+
 ---
 
 ## 五、权限的下发（后端 → 前端）
