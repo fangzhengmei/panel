@@ -255,9 +255,15 @@ $this->serverVariableRepository->insert($records);
 
 **这是整篇文档最重要的表**：状态②和状态③在"没设置值"这个语义上很像，但 PHP `??` 的行为完全不同，直接决定 Egg 默认值的改动是否会影响运行时。
 
-### 5.3 变量修改（StartupModificationService）时的写入
+### 5.3 变量修改：两条完全不同的保存路径
 
-[StartupModificationService.php#L39-L47](file:///d:/fz/0508-3/solo-dogfeeding/code/202-panel/app/Services/Servers/StartupModificationService.php#L39-L47)
+变量保存有**两条完全不同的代码路径**，混在一起讲是运维踩坑的主要来源。
+
+##### 路径 A：后台启动页——整表提交，批量写库
+
+入口：[ServersController@saveStartup](file:///d:/fz/0508-3/solo-dogfeeding/code/202-panel/app/Http/Controllers/Admin/ServersController.php#L178-L197) → [StartupModificationService](file:///d:/fz/0508-3/solo-dogfeeding/code/202-panel/app/Services/Servers/StartupModificationService.php#L29-L63)
+
+后台启动页只有一个"保存"按钮，点击后表单中**所有变量的当前值**一起提交。后端拿到完整 `environment` 字典后，由 VariableValidatorService 校验全部变量，再循环 updateOrCreate：
 
 ```php
 foreach ($results as $result) {
@@ -268,9 +274,49 @@ foreach ($results as $result) {
 }
 ```
 
-用 `updateOrCreate`，意味着：
-- 处于状态②的变量（原本是空串）：有匹配行 → 更新为表单当前值。如果用户什么也没改，表单提交的就是之前回填的值，见下一节。
-- 处于状态③的变量（Egg 新增、还没记录）：无匹配行 → **新插入一行**，值为表单中该 input 的值。保存之后这台服务器对该变量就**从③退不回 Egg 默认了**。
+特点：
+- **一次请求写入所有变量**，哪怕管理员只改了一个值，其他变量的当前显示值也会重新落库
+- 对状态③的变量来说，后台 Input 显示的是 EnvironmentService 回退到的 Egg default → 提交的也是这个 default → 固化后与运行时一致
+- 管理员"什么都不改、只点保存"也会把全部变量固化——这是**整表提交**的副作用
+
+##### 路径 B：客户端控制台——单变量即时保存
+
+入口：[VariableBox.tsx#L30-L52](file:///d:/fz/0508-3/solo-dogfeeding/code/202-panel/resources/scripts/components/server/startup/VariableBox.tsx#L30-L52) → [updateStartupVariable.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/202-panel/resources/scripts/api/server/updateStartupVariable.ts) → `PUT /api/client/servers/{uuid}/startup/variable`
+
+客户端**没有保存按钮**。每种控件的用户操作都直接触发 `setVariableValue`（经 500ms 防抖），立即向 API 发送单个变量的更新请求：
+
+| 控件 | 触发事件 | 发送值 |
+|------|---------|--------|
+| Input | `onKeyUp`（每次键盘抬起） | `e.currentTarget.value`（输入框当前内容） |
+| Select | `onChange`（选中项变化） | `e.target.value`（新选中项的值） |
+| Switch | `onChange`（开关切换） | 翻转后的值（如 `'1'` ↔ `'0'` 或 `'true'` ↔ `'false'`） |
+
+API 端 [StartupController@update](file:///d:/fz/0508-3/solo-dogfeeding/code/202-panel/app/Http/Controllers/Api/Client/Servers/StartupController.php#L53-L98) 只操作**请求中指定的那一个变量**：
+
+```php
+$this->repository->updateOrCreate([
+    'server_id' => $server->id,
+    'variable_id' => $variable->id,
+], [
+    'variable_value' => $request->input('value') ?? '',
+]);
+```
+
+特点：
+- **一次请求只写一个变量**，其他变量完全不受影响
+- 不存在"整表保存"——用户改哪个变量就固化哪个，没有被动连坐
+- 但对于**没有主动操作过的变量**（比如状态③的 Switch 显示关），因为用户没有触发 onChange，所以**不会被写入**，保持状态③不变
+- Input 控件的 `onKeyUp` + 500ms 防抖意味着：用户只要在输入框里敲了任何字符，500ms 无后续输入后就会自动保存。**不需要按回车，也没有回车触发的逻辑**
+
+##### 两条路径对状态③的关键差异
+
+| 维度 | 后台整表保存（路径 A） | 客户端单变量即时保存（路径 B） |
+|------|----------------------|------------------------------|
+| 触发方式 | 点"保存"按钮 | Input 键盘抬起 / Select 选择 / Switch 切换 |
+| 写入范围 | 全部变量一起写 | 只写被操作的那一个变量 |
+| 状态③未操作变量的命运 | **全部被固化**（显示值落库） | **保持状态③不变**（未触发就不会写） |
+| 状态③ Switch（关/开） | 点保存 → Egg default 被固化 → ✅ 一致 | 点开关 → 发送翻转值（如 '0'）→ ❌ 值变为假 |
+| 状态③ Switch 什么都没点 | 点保存 → Egg default 被固化 → ✅ | **不触发、不写入** → 仍然保持动态跟随 |
 
 ### 5.4 界面显示逻辑全景：后台 vs 客户端、三种控件的差异
 
@@ -300,7 +346,7 @@ $('#egg_variable_' + item.env_variable).val(setValue);
 | ② 有记录、值 = `''` | `'' ?? default` → **仍是 `''`**（空串不是 null，`??` 不触发） | 空框 | ✅ 一致（运行时也用空串） |
 | ③ 无记录（Egg 新增） | `null ?? default` → **`default_value`** | Egg 当前 default 值 | ✅ 一致 |
 
-**保存行为**：后台提交表单时，input 的 `value` 属性就是 `setValue` 的值。对状态③来说，显示的值是 Egg default → 提交的值也是 Egg default → 保存后 `updateOrCreate` 把这个值写进 `server_variables` → 从状态③**固化为状态①**，值为保存那一刻的 Egg default。从此以后 Egg 再改 default 也不会影响这台服了。
+**保存行为（路径 A，整表提交）**：后台点"保存"时，所有变量的当前显示值一起提交（见 5.3 节路径 A）。对状态③来说，后台 Input 显示的值是 EnvironmentService 回退到的 Egg default → 提交的也是这个 default → `updateOrCreate` 把这个值写进 `server_variables` → 从状态③**固化为状态①**，值为保存那一刻的 Egg default。从此以后 Egg 再改 default 也不会影响这台服了。**注意：这是后台整表提交的效果，客户端走的是路径 B（单变量即时保存），不会因为"打开页面"就固化。**
 
 ---
 
@@ -403,32 +449,38 @@ Switch 是**三种控件里最极端的**：完全没有 fallback 到 default_va
 
 ---
 
-#### 5.4.5 保存后的固化行为
+#### 5.4.5 保存后的固化行为（分两条路径讲）
 
-无论哪一种界面、哪一种控件，保存操作最终都落到 `StartupModificationService` 的 `updateOrCreate`：
+5.3 节已经讲过客户端和后台走的是完全不同的代码路径，这里按两条路径分别分析固化后果。
 
-```php
-['variable_value' => $result->value ?? '']
-```
+##### 路径 A：后台整表保存的固化
 
-保存动作的后果是**单向**的：
+后台点"保存"会把**所有变量**的当前显示值一起写入 server_variables。
 
-- 状态① → 保存 → 还是状态①（值可能变）
-- 状态② → 保存 → 还是状态②或①（取决于提交的值）
-- 状态③ → 保存 → **必然变成状态①或②**，从此失去"动态跟随 Egg default"的特性
+| 状态 | 后台 Input 显示的值 | 保存后写入 DB 的值 | 固化效果 |
+|------|---------------------|-------------------|---------|
+| ① 非空 | 原值 | 原值 | 值不变 |
+| ② 空串 | 空框 | `''` | 值不变（还是空串） |
+| ③ 无记录 | Egg default（EnvironmentService 回退后的值） | Egg default | **从③变为①，动态跟随能力丧失** |
 
-对状态③来说，"什么都不改、只点保存"也会产生副作用：把**当前界面显示的值**固化写入 server_variables。而界面显示的值在不同入口、不同控件下可能不一样：
+后台整表保存对状态③来说是一个**全量固化**：所有未操作过的 Egg 后加变量也会被显示值（Egg default）固化进 DB。
 
-| 保存入口 | 状态③时界面显示的值 | 保存后写入 DB 的值 | 与 Egg default 是否一致 |
-|----------|---------------------|-------------------|----------------------|
-| 后台启动页 | EnvironmentService 回退到的 Egg default | Egg default | ✅ 一致 |
-| 客户端普通 Input | 空（`null ?? ''`） | 空串 `''` | ❌ 不一致！保存后从"跟随 default"变成"值为空串" |
-| 客户端 Select | Egg default（`null ?? default`） | Egg default | ✅ 一致 |
-| 客户端 Switch | 关（`defaultChecked = false`） | **值为 `'0'` 或 `'false'`（取决于 toggle 后的发送值）** | ❌ 若 Egg default 为真，保存后变成了假，值被永久改了 |
+##### 路径 B：客户端单变量即时保存的固化
 
-⚠️ **这是一个非常隐蔽的坑**：对 Egg 新增的 boolean 变量（状态③），用户在客户端看到开关是"关"的，但实际运行时是开（Egg default=真）。如果用户顺手把开关点一下再点回来（或者什么都不动但触发表单提交），值就从"动态跟随 default=真"变成"固化为假"，行为永久改变。
+客户端**只固化被用户主动操作过的那一个变量**。没有被操作的变量保持原状态不变。
 
----
+| 控件 | 用户操作 | 状态③时发送的值 | 写入 DB 的值 | 固化效果 |
+|------|---------|----------------|-------------|---------|
+| Input | 在输入框内敲字（`onKeyUp` + 500ms 防抖） | 输入框当前内容 | 输入内容 | **从③变为①或②** |
+| Input | 输入框空白时无操作 | — | — | **不触发，保持状态③** |
+| Select | 选择某个选项（`onChange`） | 选中项值 | 选中项值 | **从③变为①** |
+| Switch | 点击开关（`onChange`） | 翻转值（如 `'1'` 或 `'false'`） | 翻转值 | **从③变为①，且值被翻转** |
+
+⚠️ **Switch 控件的特殊坑**：状态③时 Switch 显示"关"（因为 `defaultChecked` 只跟 serverValue 比，null 被视为关），但运行时是 Egg default（可能是"开"）。用户点击开关时，客户端发送的是**翻转后的值**（如 `'1'`），所以：
+- 点一下 → 从"关"变成"开" → 发送 `'1'` → 固化为"开" → ✅ 与 Egg default 一致（前提是 Egg default 就是"开"）
+- 再点一下 → 从"开"变成"关" → 发送 `'0'` → 固化为"关" → ❌ 值被永久改为假
+
+**与后台整表保存的关键区别**：客户端的 Switch 不会因为"打开页面看了但没点"而被固化——只有用户真正点击了开关才会触发保存。而后台是"打开页面点保存，不管有没有改，全部变量都固化"。
 
 #### 5.4.6 哪些判断只适用于"Egg 后加变量"（状态③）
 
@@ -437,8 +489,8 @@ Switch 是**三种控件里最极端的**：完全没有 fallback 到 default_va
 1. "Egg 改 default_value 会影响这台服的运行时值" — 只有状态③才会动态跟随
 2. "保存一次就固化了，Egg 再改也不生效" — 只有状态③→①/② 这个转变才有"固化"效应，状态①/②保存本来就是更新自己的值
 3. "后台启动页显示的值与运行时一致" — 其实对三种状态都一致，但状态③下后台显示的是 Egg default 而不是空，这个特性在③的时候最容易被误认为"后台怎么和我客户端看到的不一样"
-4. "客户端 Switch 控件显示与实际相反" — 只有状态③且 Egg default 为真时才会显示关但运行开
-5. "什么都没改点了保存，值就变了" — 只有状态③（特别是 Switch 控件）会因为保存而从动态跟随变成一个固定值
+4. "客户端 Switch 控件显示与实际相反" — 只有状态③且 Egg default 为真时才会显示关但运行开。但用户点击开关时客户端会发送翻转值（即时保存），不会像后台那样"整表连坐"
+5. "什么都没改点了保存，值就变了" — 只有后台整表保存（路径 A）才会这样：未操作的 Egg 后加变量也会被固化。客户端（路径 B）没有"整表保存"按钮，未操作的变量不会被写入
 6. "服务器创建时间晚于 egg_variables.created_at" — 这个判断方法仅用于识别状态③
 
 ### 5.5 真正的优先级总表（含状态分支）
@@ -710,9 +762,9 @@ SQL 关键理解：`runtime_actual_value` 是下发给 Wings 时真正会使用�
 | 1 | 创建时没填某变量，之后一直是空白，Egg 改了 default 也完全没反应 | ② 空串 | 后台 Input / 客户端 Input | 服务器创建流程 `storeEggVariables` 已为所有 Egg 变量插入空行 `''`；空串不是 null，`??` 不会走 Egg 的 default | 正常行为。**注意：这不是"被重置"，是一直就是空串**。如果希望让这台服跟随 Egg default：`DELETE FROM server_variables WHERE server_id=? AND variable_id=?`（慎用，更推荐手动在后台/客户端填值显式声明） |
 | 2 | Egg 管理员新增了某变量 X，老服重启后"值变了"（没人改过） | ③ 无记录 | 所有 | server_variables 表无该 variable_id 行 → 走 `null ?? default_value` → 动态读取 Egg 当前 default。Egg 维护者改了 default 就会自动跟随 | **这是唯一会出现"无人修改但值变动"的场景，且仅适用于 Egg 后加变量**。若希望稳定不跟随：打开该服务器后台启动页，点一次保存（哪怕不改值），StartupModificationService 会把当前 default 固化入 server_variables 表 |
 | 3 | 点了一次保存后，Egg 再改 default 就不生效了 | ③ → ① 或 ② | 所有 | 保存操作的 `updateOrCreate` 把当时显示的值写进了 DB。对状态③来说是从"动态跟随"变成"有记录"，永不回退 | 正常预期（仅对状态③是"固化"，状态①②保存本来就是更新值）。需要更新时手动改该服务器的值 |
-| 4 | 用户控制台某变量 Input 框是空白，但灰色提示字显示着 "latest"，实际启动日志中用的是空串 | ② 空串 | 客户端 Input | [VariableBox.tsx#L122-L123](file:///d:/fz/0508-3/solo-dogfeeding/code/202-panel/resources/scripts/components/server/startup/VariableBox.tsx#L122-L123) `defaultValue={variable.serverValue ?? ''}` 绑的是空串，而 `placeholder={variable.defaultValue}` 只是视觉提示，**placeholder 不会作为真实值**。运行时走 `''` | 典型界面误导。告诉用户灰色字只是建议，必须真正在输入框内敲字并回车才会改值；或者在后台保存一次（会填入当前运行时值） |
+| 4 | 用户控制台某变量 Input 框是空白，但灰色提示字显示着 "latest"，实际启动日志中用的是空串 | ② 空串 | 客户端 Input | [VariableBox.tsx#L122-L123](file:///d:/fz/0508-3/solo-dogfeeding/code/202-panel/resources/scripts/components/server/startup/VariableBox.tsx#L122-L123) `defaultValue={variable.serverValue ?? ''}` 绑的是空串，而 `placeholder={variable.defaultValue}` 只是视觉提示，**placeholder 不会作为真实值**。运行时走 `''` | 典型界面误导。客户端 Input 的保存触发方式是 `onKeyUp` + 500ms 防抖（见 [VariableBox.tsx#L115-L118](file:///d:/fz/0508-3/solo-dogfeeding/code/202-panel/resources/scripts/components/server/startup/VariableBox.tsx#L115-L118)），用户只要在输入框内敲了字符，500ms 后就会自动保存——**不需要按回车**。但输入框空白时不触发任何保存，所以状态②和状态③的空白 Input 只能通过手动填值来纠正 |
 | 5 | 用户控制台某 Select 下拉框一片空白，看不到选中项 | ② 空串 | 客户端 Select | Select 的 `defaultValue` 是 `serverValue ?? defaultValue`，状态②空串时 `'' ?? default` 还是 `''`；但 Egg 的 `in:` 选项里通常没有空串，导致没有 option 被选中，显示空白 | 体验问题而非逻辑问题。让用户选一个值保存即可。或者检查 Egg 规则是否允许空值，必要时在 `in:` 里加上默认选项 |
-| 6 | 用户控制台某开关显示"关"，但实际服务器运行时是启用的 | ③ 无记录（Egg 新增）且 Egg default=真 | 客户端 Switch | Switch 的 `defaultChecked` 只跟 `serverValue` 比，**完全不回退 default**。状态③时 `serverValue=null` → 显示关；但运行时 `null ?? default` → 用 Egg default=真 → 实际是开的 | **表里不一，必须修**。方法一：用户点一下开关再切回来（副作用是固化值）；方法二：管理员在后台启动页保存一次（会正确填入 Egg default） |
+| 6 | 用户控制台某开关显示"关"，但实际服务器运行时是启用的 | ③ 无记录（Egg 新增）且 Egg default=真 | 客户端 Switch | Switch 的 `defaultChecked` 只跟 `serverValue` 比，**完全不回退 default**。状态③时 `serverValue=null` → 显示关；但运行时 `null ?? default` → 用 Egg default=真 → 实际是开的 | **表里不一，必须修**。方法一：用户点一下开关（发送翻转值如 `'1'`，固化为开 → 与 Egg default=真一致）；方法二：管理员在后台启动页保存一次（整表保存，会把 Egg default 正确固化）。⚠️ 注意：方法一不能"点一下再切回来"，因为第二次切换会发送 `'0'`，值反而变成关了。客户端是单变量即时保存，每次操作立即落库 |
 | 7 | 后台启动页某变量显示 "v1.20"，Egg 的 default 明明已经改成 "v1.21" 了 | ① 或 ② | 后台 Input | 服务器有自己的实例值，永不回退。后台显示的是 EnvironmentService 计算后的真实运行值，显示完全正确 | 正常。想同步到 Egg 新 default，直接在后台把值改成 "v1.21" 并保存（清空保存会变空串，**不会**自动回退到 Egg 新 default） |
 | 8 | 后台显示的值和客户端显示的值**不一样** | 视情况 | 对比：后台 Input vs 客户端对应控件 | 后台用 EnvironmentService 的输出（即运行时最终值）；客户端按控件类型各自有不同的 fallback 策略。状态②和状态③在很多控件上显示得都跟后台不一样 | 以**后台**为准，后台显示的就是实际运行时值。客户端显示差异请对照 5.4.3 的对照表判断是哪一类偏差 |
 | 9 | 一批老服务器某变量同时"变值"，没人动过它们各自的启动页 | ③ 无记录（多台服同时） | 所有 | Egg 管理员最近在模板上新增了一个变量，且这批老服都没保存过 → 全部动态跟随 Egg 的 default。Egg 维护者改了 default_value 导致集体变化 | 对这批服批量锁定：<br>批量 `INSERT INTO server_variables (server_id, variable_id, variable_value) SELECT s.id, ev.id, ev.default_value FROM servers s JOIN egg_variables ev ON ev.egg_id = s.egg_id AND ev.env_variable = 'X' WHERE s.node_id = ? AND NOT EXISTS (SELECT 1 FROM server_variables sv WHERE sv.server_id = s.id AND sv.variable_id = ev.id)` |
@@ -754,6 +806,8 @@ SQL 关键理解：`runtime_actual_value` 是下发给 Wings 时真正会使用�
 | 客户端普通 Input 控件（defaultValue vs placeholder） | [VariableBox.tsx#L114-L123](file:///d:/fz/0508-3/solo-dogfeeding/code/202-panel/resources/scripts/components/server/startup/VariableBox.tsx#L114-L123) |
 | 客户端 Select 下拉控件（`serverValue ?? defaultValue`） | [VariableBox.tsx#L96-L110](file:///d:/fz/0508-3/solo-dogfeeding/code/202-panel/resources/scripts/components/server/startup/VariableBox.tsx#L96-L110) |
 | 客户端 Switch 开关控件（完全不回退 default） | [VariableBox.tsx#L75-L90](file:///d:/fz/0508-3/solo-dogfeeding/code/202-panel/resources/scripts/components/server/startup/VariableBox.tsx#L75-L90) |
+| 客户端防抖保存函数（500ms debounce，setVariableValue） | [VariableBox.tsx#L30-L52](file:///d:/fz/0508-3/solo-dogfeeding/code/202-panel/resources/scripts/components/server/startup/VariableBox.tsx#L30-L52) |
+| 客户端 API 请求模块（PUT 单变量更新） | [updateStartupVariable.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/202-panel/resources/scripts/api/server/updateStartupVariable.ts) |
 | 客户端 API 数据 Transformer（原始 server_value/default_value 分离） | [EggVariableTransformer.php#L23-L31](file:///d:/fz/0508-3/solo-dogfeeding/code/202-panel/app/Transformers/Api/Client/EggVariableTransformer.php#L23-L31) |
 | Wings 配置结构组装 | [ServerConfigurationStructureService.php](file:///d:/fz/0508-3/solo-dogfeeding/code/202-panel/app/Services/Servers/ServerConfigurationStructureService.php) |
 | Wings 拉取接口（被动触发配置同步） | [ServerDetailsController.php](file:///d:/fz/0508-3/solo-dogfeeding/code/202-panel/app/Http/Controllers/Api/Remote/Servers/ServerDetailsController.php) |
