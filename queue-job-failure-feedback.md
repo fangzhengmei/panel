@@ -478,6 +478,182 @@ isSuccessful: parsed.is_successful || true,
 2. **WebSocket 乐观更新代码存在 Bug**，导致即使事件到达也无法正确显示失败
 3. SWR 默认无自动轮询，必须依赖用户交互触发重新验证才能获取真实失败状态
 
+### 7.8 SWR 分页缓存隔离机制
+
+**SWR Key 包含页码，每页缓存完全独立**：
+
+[getServerBackups.ts:17-29](file:///d:/fz/0508-3/solo-dogfeeding/code/206-panel/resources/scripts/api/swr/getServerBackups.ts#L17-L29) 的第 21 行：
+
+```typescript
+return useSWR<BackupResponse>(['server:backups', uuid, page], async () => { /* ... */ });
+```
+
+SWR Key 结构为 `['server:backups', serverUuid, pageNumber]`，意味着：
+
+| 页码 | SWR Key | 缓存是否独立 |
+|------|---------|--------------|
+| 第 1 页 | `['server:backups', 'abc-uuid', 1]` | ✅ 独立缓存 |
+| 第 2 页 | `['server:backups', 'abc-uuid', 2]` | ✅ 独立缓存 |
+| 第 3 页 | `['server:backups', 'abc-uuid', 3]` | ✅ 独立缓存 |
+
+**这直接导致以下行为**：
+
+1. **某一页调用 `mutate()` 不会影响其他页的缓存**：第 1 页的 BackupRow 触发 mutate 只更新第 1 页缓存，第 2、3 页数据完全不变
+2. **翻页触发全新 API 请求**：从第 1 页切到第 2 页时，SWR 发现 Key 变化（`page` 从 1 变 2），立即发起新的 HTTP 请求拉取第 2 页数据
+3. **每页数据互不感知**：第 1 页新创建的备份，在第 2 页翻回来时 SWR 会重新验证（因为组件卸载后重新挂载触发 `revalidateOnMount`）
+
+分页切换流程：
+```
+用户点击第 2 页按钮
+  → BackupContainer.tsx:15 setPage(2)
+    → ServerBackupContext.page 更新为 2
+      → getServerBackups() 的 useSWR Key 变化
+        → SWR 触发新请求 GET /api/client/servers/{uuid}/backups?page=2
+          → 返回第 2 页数据，存入独立缓存
+            → BackupRow 组件批量卸载（第 1 页）+ 批量挂载（第 2 页）
+```
+
+### 7.9 哪些备份行能接收 "backup completed" 事件
+
+**核心结论：只有当前渲染在 DOM 中的 BackupRow 组件才注册了 WebSocket 事件监听器，才能接收到事件。**
+
+#### 7.9.1 事件监听器注册的前提条件
+
+每个 BackupRow 通过 [useWebsocketEvent.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/206-panel/resources/scripts/plugins/useWebsocketEvent.ts) 注册监听器，第 13-22 行：
+
+```typescript
+return useEffect(() => {
+    const eventListener = (event: SocketEvent) => savedCallback.current(event);
+    if (connected && instance) {          // ← 条件1：WebSocket 已连接
+        instance.addListener(event, eventListener);  // ← 条件2：instance 不为 null
+    }
+    return () => {
+        instance && instance.removeListener(event, eventListener);
+    };
+}, [event, connected, instance]);  // ← 依赖项变化会重新注册
+```
+
+**监听器注册必须同时满足**：
+- ✅ `ServerContext.socket.connected === true`（WebSocket 鉴权成功）
+- ✅ `ServerContext.socket.instance !== null`（Websocket 对象已创建）
+- ✅ BackupRow 组件已挂载且未被卸载
+
+#### 7.9.2 各场景下能否接收事件
+
+| 场景 | 备份行是否在 DOM 中 | WebSocket 是否连接 | 能否接收事件 | 说明 |
+|------|---------------------|-------------------|-------------|------|
+| **当前页显示的备份** | ✅ 是 | ✅ 是 | ✅ 能 | 每个可见行都注册了独立监听器 |
+| **其他页的备份** | ❌ 否（组件已卸载） | ✅ 是 | ❌ 不能 | 翻页时旧 BackupRow 卸载，监听器被 removeListener 移除 |
+| **WebSocket 正在连接时** | ✅ 是 | ❌ 否（connecting） | ❌ 暂不能 | 等连接成功后 useEffect 依赖项变化会自动重新注册 |
+| **用户未打开备份页面** | ❌ 否（整个路由未渲染） | ✅ 是 | ❌ 不能 | BackupContainer 未挂载，无任何 BackupRow 存在 |
+| **用户在服务器控制台页面** | ❌ 否 | ✅ 是 | ❌ 不能 | 备份路由未激活，组件不存在 |
+| **新创建的备份（刚插入列表）** | ✅ 是（mutate 插入后立即挂载） | ✅ 是 | ✅ 能 | 新 BackupRow 挂载时立即注册监听器 |
+| **浏览器标签页非活动** | ✅ 是（DOM 仍存在） | ✅ 是（连接未断） | ✅ 能 | 组件未卸载，监听器仍在，但重渲染可能被浏览器节流 |
+
+#### 7.9.3 监听器注册的时序问题
+
+**WebSocket 连接与 BackupRow 挂载存在竞态条件**：
+
+```
+时序 A（先连 WS 后进入备份页）：常见场景
+  1. WebsocketHandler 连接成功 → connected=true, instance=socket
+  2. 用户切换到 Backups 标签 → BackupContainer 挂载
+  3. 每个 BackupRow 挂载 → useWebsocketEvent 检测 connected=true → 注册监听器 ✅
+
+时序 B（先进入备份页后连 WS）：首次进入服务器页面时可能发生
+  1. 用户直接访问 Backups 页面 → BackupContainer 挂载
+  2. BackupRow 挂载 → useWebsocketEvent 检测 connected=false → 不注册 ❌
+  3. WebsocketHandler 异步连接成功 → connected 变为 true
+  4. useWebsocketEvent 的 useEffect 依赖 [connected] 变化 → 重新执行 → 注册监听器 ✅
+
+时序 C（备份完成时 WS 恰好断开重连）：
+  1. 事件到达时 instance=null → 监听器不存在 → 事件被丢弃
+  2. 重连成功后监听器重新注册 → 但事件已发送过，Wings 不会重发
+  3. 最终只能靠 SWR 焦点刷新获取状态 ⚠️
+```
+
+### 7.10 本地客户端 vs 其他客户端：刷新路径差异
+
+#### 7.10.1 创建备份时的不同刷新路径
+
+**场景**：用户 A 在浏览器标签 A 创建备份，用户 B 在另一设备/标签页同时查看同一服务器的备份列表。
+
+**客户端 A（发起创建的标签页）刷新路径**：
+
+```
+用户点击 "Create backup" → 表单提交
+  ↓
+CreateBackupButton.tsx:82-87
+  ├─ POST /api/client/servers/{uuid}/backups → 后端返回新建备份对象
+  └─ mutate(updater, false)  ← 关键：本地乐观更新，不请求 API
+      ├─ updater: data => ({
+      │     ...data,
+      │     items: data.items.concat(backup),  ← 直接拼接到 items 数组末尾
+      │     backupCount: data.backupCount + 1
+      │  })
+      └─ false = 不重新请求后端
+          ↓
+SWR 缓存（第 1 页）立即更新 → 触发 BackupRow 重渲染
+  ↓
+新的 BackupRow 挂载 → useWebsocketEvent 注册 `backup completed:{new_uuid}` 监听器 ✅
+  ↓
+备份完成时 Wings 广播事件 → 监听器触发 → 再次 mutate 更新状态
+```
+
+**客户端 B（其他设备/标签页）刷新路径**：
+
+```
+客户端 A 发起创建备份
+  ↓
+客户端 B 的 SWR 无任何感知（SWR 缓存是浏览器内内存级，不跨标签/设备）
+  ↓
+备份完成时 Wings 广播 `backup completed:{uuid}` 事件
+  ↓
+客户端 B 的情况：
+  ├─ 情况 1：B 当前在备份页第 1 页，新备份在第 1 页可见
+  │   └─ BackupRow 已挂载 → 监听器存在 → 收到事件 → mutate 更新 ✅
+  │
+  ├─ 情况 2：B 在备份页第 1 页，但新备份因分页不在第 1 页（如已有 20+ 条）
+  │   └─ 无对应 BackupRow → 无监听器 → 事件丢弃 ❌
+  │      （需要 B 翻到最后一页或刷新页面才能看到）
+  │
+  ├─ 情况 3：B 不在备份页（在控制台/设置等其他路由）
+  │   └─ 整个 BackupContainer 未挂载 → 无任何 BackupRow → 所有事件丢弃 ❌
+  │
+  └─ 情况 4：B 的浏览器标签页非活动状态
+      └─ 即使监听器存在，React 重渲染可能被浏览器挂起
+         等用户切回标签页时才会重渲染，同时触发 revalidateOnFocus
+```
+
+#### 7.10.2 同一条备份在不同场景显示失败告警的时间点对比
+
+假设同一条备份在 Wings 端执行失败，T0 时刻 Wings 同时触发：
+1. REST API 回调 Panel（写入数据库 `is_successful=false`）
+2. WebSocket 广播 `backup completed:{uuid}` 事件
+
+不同用户看到 "Failed" 标签的时间点：
+
+| 用户场景 | T0+100ms | T0+5s | T0+30s（用户切回标签页） | T0+2min（用户翻页） | 最终是否看到 |
+|----------|----------|-------|------------------------|---------------------|-------------|
+| **创建者在第 1 页，备份可见** | ⚠️ Bug 导致不显示（isSuccessful=true） | ⚠️ 仍不显示 | ✅ 显示（revalidateOnFocus） | ✅ 显示 | T0+用户交互时间 |
+| **创建者在第 2 页，备份在第 1 页** | ❌ 不显示（监听器不存在） | ❌ 不显示 | ❌ 仍不显示（只刷新第 2 页） | ✅ 显示（翻回第 1 页触发 revalidateOnMount） | T0+用户翻页时间 |
+| **其他用户在第 1 页，备份可见 + 无 Bug** | ✅ 立即显示（事件到达 + mutate） | ✅ 已显示 | ✅ 已显示 | ✅ 已显示 | T0+100ms（理想） |
+| **其他用户在第 1 页，备份可见 + 有 Bug** | ⚠️ 不显示 | ⚠️ 不显示 | ✅ 显示 | ✅ 显示 | T0+用户交互时间 |
+| **其他用户不在备份页** | ❌ 不显示 | ❌ 不显示 | ❌ 不显示 | ❌ 不显示（直到进入备份页） | T0+用户打开备份页面 |
+| **其他用户在备份页但备份在其他页** | ❌ 不显示 | ❌ 不显示 | ❌ 不显示（只刷新当前页） | ✅ 显示（翻到对应页） | T0+用户翻页时间 |
+
+#### 7.10.3 事件被"丢弃"后的兜底机制
+
+当 WebSocket 事件因上述任一原因未被有效处理时，备份失败状态只能通过以下途径最终同步到前端：
+
+| 兜底触发方式 | 触发条件 | 刷新范围 |
+|-------------|----------|----------|
+| `revalidateOnFocus` | 用户从其他标签切回当前标签 | 仅刷新**当前页**的 SWR 缓存 |
+| `revalidateOnReconnect` | 浏览器网络断开后重连（WiFi 切换等） | 所有失效的 SWR 缓存 |
+| `revalidateOnMount` | 组件首次挂载（用户进入备份页/翻页） | 仅当前页码的缓存 |
+| 用户手动 F5 刷新页面 | 显式操作 | 重新加载所有数据 |
+| 用户离开备份页再进入 | 路由切换触发组件卸载重挂载 | 重新请求第 1 页数据 |
+
 ---
 
 ## 八、用户通知回写机制
@@ -679,9 +855,13 @@ supervisorctl status
 | [app/Models/Server.php](file:///d:/fz/0508-3/solo-dogfeeding/code/206-panel/app/Models/Server.php) | 服务器模型与状态常量 |
 | [app/Notifications/ServerInstalled.php](file:///d:/fz/0508-3/solo-dogfeeding/code/206-panel/app/Notifications/ServerInstalled.php) | 安装完成邮件通知 |
 | [resources/scripts/routers/ServerRouter.tsx](file:///d:/fz/0508-3/solo-dogfeeding/code/206-panel/resources/scripts/routers/ServerRouter.tsx) | 服务器路由与监听器挂载点 |
+| [resources/scripts/components/server/backups/BackupContainer.tsx](file:///d:/fz/0508-3/solo-dogfeeding/code/206-panel/resources/scripts/components/server/backups/BackupContainer.tsx) | 备份列表容器（分页 + BackupRow 渲染） |
+| [resources/scripts/components/elements/Pagination.tsx](file:///d:/fz/0508-3/solo-dogfeeding/code/206-panel/resources/scripts/components/elements/Pagination.tsx) | 通用分页组件 |
 | [resources/scripts/api/swr/getServerBackups.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/206-panel/resources/scripts/api/swr/getServerBackups.ts) | 前端备份列表 SWR Hook |
+| [resources/scripts/api/server/backups/createServerBackup.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/206-panel/resources/scripts/api/server/backups/createServerBackup.ts) | 创建备份 API 封装 |
 | [resources/scripts/components/server/backups/BackupRow.tsx](file:///d:/fz/0508-3/solo-dogfeeding/code/206-panel/resources/scripts/components/server/backups/BackupRow.tsx) | 备份行组件（失败状态展示 + WebSocket 事件处理） |
 | [resources/scripts/components/server/backups/CreateBackupButton.tsx](file:///d:/fz/0508-3/solo-dogfeeding/code/206-panel/resources/scripts/components/server/backups/CreateBackupButton.tsx) | 创建备份按钮（新备份本地插入） |
+| [app/Http/Controllers/Api/Client/Servers/BackupController.php](file:///d:/fz/0508-3/solo-dogfeeding/code/206-panel/app/Http/Controllers/Api/Client/Servers/BackupController.php) | 客户端备份 API 控制器（分页列表、创建、删除等） |
 | [resources/scripts/components/server/WebsocketHandler.tsx](file:///d:/fz/0508-3/solo-dogfeeding/code/206-panel/resources/scripts/components/server/WebsocketHandler.tsx) | WebSocket 连接管理 |
 | [resources/scripts/components/server/InstallListener.tsx](file:///d:/fz/0508-3/solo-dogfeeding/code/206-panel/resources/scripts/components/server/InstallListener.tsx) | 安装/恢复事件监听 |
 | [resources/scripts/plugins/Websocket.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/206-panel/resources/scripts/plugins/Websocket.ts) | WebSocket 客户端实现（Sockette 封装） |
