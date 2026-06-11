@@ -656,22 +656,21 @@ SWR 缓存（第 1 页）立即更新 → 触发 BackupRow 重渲染
 
 ### 7.11 新建备份的即时可见性与分页位置分析
 
-#### 7.11.1 服务端备份列表的默认排序
+本节严格按代码事实分三层展开：**已明确的行为**（代码直接写死）、**代码未定义的部分**（依赖外部环境）、**条件推演**（在特定前提下的推断）。
 
-**关键发现：`BackupController::index()` 没有显式 `orderBy()`，依赖数据库默认排序。**
+#### 7.11.1 已明确的行为（代码事实）
 
-代码位于 [BackupController.php:44-58](file:///d:/fz/0508-3/solo-dogfeeding/code/206-panel/app/Http/Controllers/Api/Client/Servers/BackupController.php#L44-L58)，第 52 行：
+以下是从代码中可以**直接确认**的内容：
+
+**1. 服务端分页查询没有显式排序**
+
+[BackupController.php:52](file:///d:/fz/0508-3/solo-dogfeeding/code/206-panel/app/Http/Controllers/Api/Client/Servers/BackupController.php#L52)：
 
 ```php
 return $this->fractal->collection($server->backups()->paginate($limit))
-    ->transformWith($this->getTransformer(BackupTransformer::class))
-    ->addMeta([
-        'backup_count' => $this->repository->getNonFailedBackups($server)->count(),
-    ])
-    ->toArray();
 ```
 
-`$server->backups()` 是 [Server.php:358-361](file:///d:/fz/0508-3/solo-dogfeeding/code/206-panel/app/Models/Server.php#L358-L361) 定义的简单 `hasMany` 关系，**没有附加任何排序条件**：
+`$server->backups()` 定义在 [Server.php:358-361](file:///d:/fz/0508-3/solo-dogfeeding/code/206-panel/app/Models/Server.php#L358-L361)，是纯 `hasMany` 关系，**无任何 `orderBy()` 调用**：
 
 ```php
 public function backups(): HasMany
@@ -680,127 +679,162 @@ public function backups(): HasMany
 }
 ```
 
-**MySQL 默认排序规则**：
-- `backups` 表的主键是 `id`（BIGINT 自增），见 [2020_04_03_230614_create_backups_table.php:31](file:///d:/fz/0508-3/solo-dogfeeding/code/206-panel/database/migrations/2020_04_03_230614_create_backups_table.php#L31)
-- 在 InnoDB 引擎中，当查询不带 `ORDER BY` 时，结果按**聚簇索引（主键 id）**顺序返回
-- 因此实际排序是 **`ORDER BY id ASC`**（旧备份在前，新备份在后）
+> ✅ 事实：列表查询不带 `ORDER BY`，排序行为由数据库决定，代码层面未定义。
 
-**每页 20 条时的分页分布**：
-```
-第 1 页（page=1）：id=1 ~ 20   → 最旧的 20 条备份
-第 2 页（page=2）：id=21 ~ 40  → ...
-...
-第 N 页（page=N）：id=...      → 最新的几条备份（在最后一页）
+**2. 每页条数上限**
+
+[BackupController.php:50](file:///d:/fz/0508-3/solo-dogfeeding/code/206-panel/app/Http/Controllers/Api/Client/Servers/BackupController.php#L50)：
+
+```php
+$limit = min($request->query('per_page') ?? 20, 50);
 ```
 
-> **重要歧义澄清**：新建备份的 `id` 最大，因此默认排在**最后一页**，而不是第 1 页！
-> 这与用户直觉（"最新的应该在最前面"）完全相反。
+> ✅ 事实：默认每页 20 条，上限 50 条。前端未传 `per_page` 参数，始终按 20 条分页。
 
-#### 7.11.2 前端本地插入逻辑与服务端排序的脱节
+**3. 前端本地插入追加到当前页末尾**
 
-**CreateBackupButton 的乐观更新**代码位于 [CreateBackupButton.tsx:84-87](file:///d:/fz/0508-3/solo-dogfeeding/code/206-panel/resources/scripts/components/server/backups/CreateBackupButton.tsx#L84-L87)：
+[CreateBackupButton.tsx:84-87](file:///d:/fz/0508-3/solo-dogfeeding/code/206-panel/resources/scripts/components/server/backups/CreateBackupButton.tsx#L84-L87)：
 
 ```typescript
 mutate(
-    (data) => ({
-        ...data,
-        items: data.items.concat(backup),     // ← 关键：追加到数组末尾
-        backupCount: data.backupCount + 1
-    }),
+    (data) => ({ ...data, items: data.items.concat(backup), backupCount: data.backupCount + 1 }),
     false  // 不重新请求后端
 );
 ```
 
-**两种排序方向的对比**：
+> ✅ 事实：创建备份成功后，用 `concat()` 将新备份追加到**当前页**的 `items` 数组**末尾**，`false` 参数表示不触发后端重新验证。
 
-| 维度 | 前端本地插入 | 服务端默认排序 | 是否一致 |
-|------|-------------|---------------|---------|
-| 排序方向 | `concat()` 追加到**数组末尾** | 按 `id ASC` 新备份在**最后一页末尾** | ✅ 逻辑上一致 |
-| 页码映射 | 仅更新**当前页**缓存 | 新备份属于**最后一页** | ❌ 不一致 |
-| 用户感知 | 当前页立即看到新备份 | 必须翻到最后一页才能看到 | ❌ 不一致 |
+**4. SWR 分页缓存完全隔离**
 
-#### 7.11.3 新建备份落点判断的复杂性
+[getServerBackups.ts:21](file:///d:/fz/0508-3/solo-dogfeeding/code/206-panel/resources/scripts/api/swr/getServerBackups.ts#L21)：
 
-不能简单说"新建备份在第 1 页"或"在最后一页"，因为**取决于当前所在页码和前端本地状态**：
-
-```
-场景 1：用户当前在第 1 页（备份数 < 20，只有 1 页）
-  前端行为：items.concat(backup) → 新备份追加到第 1 页末尾 → 用户立即看到 ✅
-  服务端真实位置：第 1 页末尾（因为只有 1 页）→ 一致 ✅
-
-场景 2：用户当前在第 1 页（备份数 ≥ 20，有多页）
-  前端行为：items.concat(backup) → 新备份追加到第 1 页缓存末尾 → 用户"以为"在第 1 页 ⚠️
-  服务端真实位置：最后一页末尾 → 不一致 ❌
-  后果：SWR 下次刷新时（如切标签页），第 1 页重新拉取数据 → 新备份"消失"，必须翻到最后一页才看到
-
-场景 3：用户当前在第 2 页（备份数 ≥ 40）
-  前端行为：items.concat(backup) → 新备份追加到第 2 页缓存末尾 → 用户在第 2 页看到 ⚠️
-  服务端真实位置：最后一页（如第 5 页）→ 完全不一致 ❌
-  后果：SWR 刷新后第 2 页的新备份消失，用户困惑"我刚创建的备份去哪了"
-
-场景 4：用户当前在最后一页
-  前端行为：items.concat(backup) → 追加到最后一页末尾 → 用户立即看到 ✅
-  服务端真实位置：最后一页末尾 → 一致 ✅
+```typescript
+return useSWR<BackupResponse>(['server:backups', uuid, page], async () => { /* ... */ });
 ```
 
-**结论**：新建备份在前端列表中的**表现位置**取决于用户创建时所在的页码，而**服务端真实位置**永远在最后一页。两者仅在"当前在最后一页"或"只有 1 页"时一致。
+> ✅ 事实：SWR Key 包含 `page`，每页缓存独立。某一页 `mutate()` 不影响其他页。
 
-#### 7.11.4 并发创建时的本地状态错乱
+**5. 监听器按 BackupRow 生命周期注册/销毁**
 
-**问题**：短时间内连续创建多个备份时，前端本地状态与服务端状态会严重偏离。
+[BackupRow.tsx:24-48](file:///d:/fz/0508-3/solo-dogfeeding/code/206-panel/resources/scripts/components/server/backups/BackupRow.tsx#L24-L48) 中每个 BackupRow 组件挂载时调用 `useWebsocketEvent()`，卸载时自动移除。
+
+> ✅ 事实：只有当前渲染在 DOM 中的 BackupRow 才注册了 WebSocket 监听器，才能接收 `backup completed` 事件。
+
+#### 7.11.2 代码未定义的部分
+
+以下内容**代码中没有明确规定**，属于依赖外部环境或未定义行为：
+
+**1. 服务端默认排序方向未定义**
+
+SQL 标准规定：没有 `ORDER BY` 时，结果行的顺序是**不保证的**（implementation-defined）。
+
+- 代码中**没有** `orderBy('id')`、`orderByDesc('created_at')` 等任何排序语句
+- 代码中**没有**全局 Scope、模型 `boot` 方法中的默认排序
+- `backups` 表的主键是自增 `id`（见 [2020_04_03_230614_create_backups_table.php:31](file:///d:/fz/0508-3/solo-dogfeeding/code/206-panel/database/migrations/2020_04_03_230614_create_backups_table.php#L31)），但索引组织与实际输出顺序的对应关系取决于数据库引擎、执行计划、查询优化器选择等
+
+> ❌ 未定义：不能从代码中得出"备份按 id 升序"或"按 id 降序"的确定性结论。排序是数据库层面的行为，不是 Laravel 代码层面的行为。
+
+**2. 新建备份的服务端分页位置未定义**
+
+代码中没有任何地方计算或断言"新建备份属于第几页"。这是服务端排序方向未定义的直接推论。
+
+> ❌ 未定义：不能写死说"新建备份在第 1 页"或"在最后一页"，代码没有保证。
+
+**3. 新建备份的可见性时序未定义**
+
+从"创建成功"到"列表中出现"之间的延迟，代码没有任何契约或保证。
+
+> ❌ 未定义：不能断言"创建后立即可见"或"创建后 X 秒可见"。
+
+#### 7.11.3 条件推演（在特定前提下的讨论）
+
+以下分析**基于常见假设**（MySQL + InnoDB + 常规查询优化器行为），属于推演而非代码事实。
+
+**推演前提**：假设使用 MySQL InnoDB 引擎，且查询使用主键索引扫描（无其他索引可用时的常见情况），则结果集大概率按主键 `id` 升序返回。
+
+> ⚠️ 注意：这是经验性推断，不是代码保证。若数据库版本、配置、数据量、查询条件变化，排序可能改变。
+
+**推演 A：按 id 升序时的分页分布**
+
+在 `ORDER BY id ASC` 前提下：
 
 ```
-T0：第 1 页有 20 条备份（id=1~20），服务端共 100 条（5 页）
-T1：用户创建备份 A → POST 成功，返回 id=101
-   → mutate 本地插入：第 1 页变为 [1..20, 101]，共 21 条
-T2：1 秒后再创建备份 B → POST 成功，返回 id=102
-   → mutate 本地插入：第 1 页变为 [1..20, 101, 102]，共 22 条
-T3：用户切标签页触发 revalidateOnFocus
-   → SWR 重新请求第 1 页数据 → 服务端返回 [1..20]
-   → 前端第 1 页的 101、102 突然"消失"
-   → 用户必须翻到第 6 页才能看到 101、102
+第 1 页（page=1）：id 最小的 20 条 → 最旧的备份
+第 2 页（page=2）：id 次小的 20 条 → ...
+...
+第 N 页（page=N）：id 最大的若干条 → 最新的备份（在最后一页）
 ```
 
-**根本原因**：前端 `concat()` 追加新备份到当前页的假设（"新备份属于当前页"）与服务端真实分布（"新备份属于最后一页"）不匹配。
+**推演 B：前端本地插入与服务端排序的差异**
 
-#### 7.11.5 对失败告警显示时机的影响
+在按 id 升序的前提下：
 
-排序与分页位置的不一致进一步加剧了"失败告警延迟显示"问题：
+| 维度 | 前端本地插入（代码事实 ✅） | 服务端真实排序（推演 ⚠️） | 是否一致 |
+|------|--------------------------|------------------------|---------|
+| 列表方向 | `concat()` 追加到数组末尾 | id 升序，新的在末尾 | 方向上一致 |
+| 页码归属 | 永远属于**当前页**（因为 mutate 当前页缓存） | 属于**最后一页**（因为 id 最大） | ❌ 不一致 |
+| 用户感知 | 创建后在当前页立即看到 | 真实位置在最后一页 | ❌ 不一致 |
+
+**推演 C：四种页码场景下的表现差异**
+
+在"按 id 升序 + 有多页"的前提下，新建备份的可见性：
 
 ```
-用户在第 1 页创建备份（假设已有 50 条，共 3 页）
-  ↓
-前端本地插入到第 1 页末尾 → 用户看到 Spinner
-  ↓
-BackupRow 挂载 → 注册 `backup completed:{uuid}` 监听器 ✅
-  ↓
-Wings 执行备份失败（耗时 30 秒）
-  ↓
-T0+30s：Wings 回调 Panel + 广播 WS 事件
-  ↓
-第 1 页的监听器触发 → mutate 更新（但 Bug 导致 isSuccessful=true，不显示 Failed）
-  ↓
-T0+60s：用户切回标签页 → revalidateOnFocus 刷新第 1 页
-  ↓
-SWR 重新请求第 1 页 → 服务端返回 [1..20]（原第 1 页备份）
-  ↓
-新备份从第 1 页消失（它真实在第 3 页）
-  ↓
-用户困惑"备份不见了" → 翻到第 3 页
-  ↓
-第 3 页 BackupRow 批量挂载 → 重新拉取第 3 页数据
-  ↓
-此时才看到新备份 + 红色 Failed 标签
+场景 1：当前在第 1 页，且只有 1 页（备份数 < 20）
+  前端：当前页立即看到（concat 追加）
+  服务端：第 1 页末尾
+  → 一致 ✅
+
+场景 2：当前在第 1 页，但有多页（备份数 ≥ 20）
+  前端：第 1 页立即看到（concat 追加到第 1 页缓存）
+  服务端：真实在最后一页
+  → 不一致 ❌
+  → 后果：SWR 下次重新验证时，第 1 页数据刷新，新备份"消失"
+
+场景 3：当前在第 2 页（或任意中间页）
+  前端：第 2 页立即看到（concat 追加到第 2 页缓存）
+  服务端：真实在最后一页
+  → 不一致 ❌
+  → 后果：SWR 下次刷新后，第 2 页的新备份消失
+
+场景 4：当前在最后一页
+  前端：最后一页立即看到（concat 追加到最后一页缓存）
+  服务端：真实在最后一页
+  → 一致 ✅
 ```
 
-从备份失败到用户看到告警，额外增加了**"用户翻页发现备份消失 → 翻到最后一页"**的时间成本。
+**推演 D：为什么不能写死"第 1 页"或"最后一页"**
 
-#### 7.11.6 建议修复方向
+因为**两个独立的变量**共同决定用户看到的位置：
 
-1. **服务端显式排序**：在 `$server->backups()` 关系或查询中添加 `orderByDesc('id')`，使最新备份在第 1 页
-2. **前端本地插入位置修正**：创建备份后 `unshift()` 插入到数组开头而非 `concat()` 到末尾
-3. **乐观更新后立即拉取正确页码**：创建成功后根据 `backupCount` 计算所在页码并切换
-4. **跨页码 mutate**：创建备份时更新最后一页的 SWR 缓存，而非当前页
+| 变量 | 选项 | 影响 |
+|------|------|------|
+| 服务端排序方向 | 升序 / 降序 / 其他 | 决定新备份在**哪一页** |
+| 用户当前页码 | 第 1 页 / 中间页 / 最后一页 | 决定前端**在哪一页**插入 |
+
+两个变量交叉组合有 6 种以上情况，没有单一答案。代码只保证"前端在当前页末尾插入"，不保证"服务端排序方向"和"新备份页码"。
+
+**推演 E：对失败告警显示时机的放大效应**
+
+在按 id 升序的前提下，如果用户在非最后一页创建备份：
+
+```
+创建备份 → 本地插入当前页 → 显示 Spinner
+  ↓
+备份失败 → WS 事件到达 → 监听器触发
+  ↓
+（Bug 导致 isSuccessful=true，不显示 Failed）
+  ↓
+用户切回标签页 → revalidateOnFocus → 当前页重新拉取
+  ↓
+新备份从当前页消失（真实在最后一页）
+  ↓
+用户困惑 → 翻页查找 → 翻到最后一页
+  ↓
+最后一页 BackupRow 挂载 → 拉取数据 → 看到 Failed
+```
+
+比之前分析的基线延迟额外增加了**"发现消失 → 翻页查找"**的时间成本。
 
 ---
 
