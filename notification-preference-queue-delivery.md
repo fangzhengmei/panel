@@ -213,13 +213,13 @@ protected function save(): ActivityLog
 
 **入口 1：账户活动日志（所有服务器）**
 - 路由：`GET /api/client/account/activity`
-- 控制器：[ActivityLogController::index()](file:///d:/fz/0508-3/solo-dogfeeding/code/203-panel/app/Http/Controllers/Api/Client/ActivityLogController.php)
-- 查询逻辑：基于 actor 过滤，只返回当前用户作为执行者的活动
+- 控制器：[ActivityLogController::__invoke()](file:///d:/fz/0508-3/solo-dogfeeding/code/203-panel/app/Http/Controllers/Api/Client/ActivityLogController.php)
+- 查询逻辑：从 `$user-&gt;activity()` MorphToMany 关系开始，查询"当前用户作为 subject"的活动日志（不是作为 actor）
 - 分页参数：支持 `page`、`per_page`
 
 **入口 2：单个服务器的活动日志**
 - 路由：`GET /api/client/servers/{server}/activity`
-- 控制器：[Servers/ActivityLogController::index()](file:///d:/fz/0508-3/solo-dogfeeding/code/203-panel/app/Http/Controllers/Api/Client/Servers/ActivityLogController.php)
+- 控制器：[Servers/ActivityLogController::__invoke()](file:///d:/fz/0508-3/solo-dogfeeding/code/203-panel/app/Http/Controllers/Api/Client/Servers/ActivityLogController.php)
 - 查询逻辑：通过 `activity_log_subjects` 关联表过滤指定 server 的活动
 - 分页参数：同上
 
@@ -1142,9 +1142,9 @@ MAIL_MAILER=failover
      │                                     │                                 │    ↓
      │                                     │                                 │  GET /api/client/account/activity
      │                                     │                                 │    ↓
-     │                                     │  ActivityLogController           │
-     │                                     │    → forActor($user) 筛选       │
-     │                                     │    → paginate(10)               │
+     │                                     │  ActivityLogController::__invoke()│
+     │                                     │    → QueryBuilder::for($user-&gt;activity()) （MorphToMany 关系）       │
+     │                                     │    → paginate(min(per_page,25), 100) （默认25，最大100）               │
      │                                     │    → fractal transform          │
      │                                     │          ↓                       │
      │                                     │  JSON 响应 ←←←←←←←←←←←←←←←←←←←   │
