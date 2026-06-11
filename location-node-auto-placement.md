@@ -119,27 +119,60 @@ $results = $query->groupBy('nodes.id')
                 <= (nodes.disk * (1 + (nodes.disk_overallocate / 100)))', [$this->disk]);
 ```
 
-### 2.2 节点配置字段是否参与筛选（完整清单）
+### 2.2 节点筛选条件的完整清单：Node 模型字段 vs 服务器 limits 参数
 
-FindViableNodesService 是自动部署中**唯一的节点筛选关卡**，以下是所有 Node 字段的参与情况：
+自动部署的节点筛选阶段（FindViableNodesService）只读取 **Node 模型字段**做容量判断；服务器 limits 参数是「被创建服务器的资源配置」——只有其中部分字段会被用作筛选输入。需要严格区分：
 
-| Node 字段 | 是否参与自动部署筛选 | 备注 |
-|-----------|-------------------|------|
-| `public` | ✅ 参与 | `where('public', 1)`，私有节点直接排除 |
-| `location_id` | ✅ 参与 | `whereIn(location_id, ...)`，空数组时全位置 |
-| `memory` | ✅ 参与 | 容量上限计算 |
-| `disk` | ✅ 参与 | 容量上限计算 |
-| `memory_overallocate` | ✅ 参与 | 容量倍率计算（-1 时语义不一致，见 2.3） |
-| `disk_overallocate` | ✅ 参与 | 容量倍率计算 |
-| `maintenance_mode` | ❌ **不参与** | SQL 中无此条件，维护模式的节点仍可能被选中 |
-| `cpu` | ❌ **不参与** | 仅作为服务器参数写入创建时使用 |
-| `swap` | ❌ **不参与** | 仅作为服务器参数写入创建时使用 |
-| `io` | ❌ **不参与** | 仅作为服务器参数写入创建时使用 |
-| `threads` | ❌ **不参与** | 仅作为服务器参数写入创建时使用 |
-| `daemon_token` / `daemonListen` | ❌ 不参与 | 用于 Wings 通信，不参与筛选 |
-| `behind_proxy` / `scheme` / `fqdn` | ❌ 不参与 | 网络连接配置，不参与筛选 |
+#### 一、Node 模型（[Node.php](file:///d:/fz/0508-3/solo-dogfeeding/code/210-panel/app/Models/Node.php#L17-L44)）字段在筛选中的情况
 
-> **⚠️ 重要**：`maintenance_mode = true`（维护模式）的节点**仍然**可以被自动部署选中。面板中虽然有 `Node::isUnderMaintenance()` 方法，但 FindViableNodesService 中并未调用或过滤。创建成功后 Wings 是否拒绝启动服务器取决于 Wings 端实现，Panel 的自动放置层不会做维护模式拦截。
+FindViableNodesService 的 SQL 只操作 `nodes` 表与 `servers` 表的 JOIN：
+
+| Node 模型字段 | 是否参与自动部署筛选 | 参与方式 |
+|--------------|-------------------|---------|
+| `id` | 间接参与 | `GROUP BY nodes.id` |
+| `public` | ✅ 直接参与 | `WHERE nodes.public = 1`，私有节点直接排除 |
+| `location_id` | ✅ 直接参与 | `WHERE location_id IN (...)`，空数组时不过滤 |
+| `memory` | ✅ 直接参与 | HAVING 容量上限计算：`nodes.memory × (1 + overallocate/100)` |
+| `disk` | ✅ 直接参与 | HAVING 容量上限计算 |
+| `memory_overallocate` | ✅ 直接参与 | 容量倍率（-1 语义不一致，见 2.4） |
+| `disk_overallocate` | ✅ 直接参与 | 容量倍率 |
+| `maintenance_mode` | ❌ **不参与** | SQL 中无此条件 |
+| `name`, `description`, `fqdn`, `scheme`, `behind_proxy` | ❌ 不参与 | 展示 / 网络连接用，不影响筛选 |
+| `daemon_token_id`, `daemon_token`, `daemonListen`, `daemonSFTP`, `daemonBase`, `upload_size` | ❌ 不参与 | Wings 通信用，不影响筛选 |
+| `created_at`, `updated_at` | ❌ 不参与 | 时间戳 |
+
+#### 二、服务器 limits 参数（[Server.php](file:///d:/fz/0508-3/solo-dogfeeding/code/210-panel/app/Models/Server.php#L153-L176) 中 limits 字段）在筛选中的情况
+
+这些 limits 是单个服务器的资源限制，从 API 的 `limits.*` 传入 → `StoreServerRequest::validated()` 转换为扁平字段：
+
+| API 参数 | 转为 Server 字段 | 是否参与筛选 → 输入到 FVNS |
+|---------|----------------|--------------------------|
+| `limits.memory` | `memory` | ✅ `setMemory()` → HAVING 条件 `SUM(servers.memory) + ?` |
+| `limits.disk` | `disk` | ✅ `setDisk()` → HAVING 条件 `SUM(servers.disk) + ?` |
+| `limits.cpu` | `cpu` | ❌ 未输入 FVNS，仅写入 Server 记录 |
+| `limits.swap` | `swap` | ❌ 未输入 FVNS，仅写入 Server 记录 |
+| `limits.io` | `io` | ❌ 未输入 FVNS，仅写入 Server 记录 |
+| `limits.threads` | `threads` | ❌ 未输入 FVNS，仅写入 Server 记录 |
+| `oom_disabled` | `oom_disabled` | ❌ 未输入 FVNS，仅写入 Server 记录 |
+
+> **结论**：`cpu`、`swap`、`io`、`threads` 都是 Server 模型字段，完全不属于 Node 模型字段——因此自动部署筛选阶段（FindViableNodesService）自然无法也不应基于「节点的 cpu/io/threads 总容量」判断（Node 表没有这些总量字段）。筛选只能基于 Node 有的 `memory` / `disk` 两个容量维度。
+
+### 2.2.1 maintenance_mode 节点的实际行为（仅基于 Panel 仓库代码可证结论）
+
+`maintenance_mode` 在 Panel 仓库中被访问的位置共 6 处，与自动部署相关的只有第 1 处：
+
+1. **FindViableNodesService**（自动部署筛选）：**没有访问** `maintenance_mode`，维护模式节点仍然满足 `public=1 + 容量够` 的条件就能出现在候选列表中。
+2. **[Node::isUnderMaintenance()](file:///d:/fz/0508-3/solo-dogfeeding/code/210-panel/app/Models/Node.php#L196-L199)**：仅返回 `$this->maintenance_mode`，是 getter，没有副作用。
+3. **[Server::validateCurrentState()](file:///d:/fz/0508-3/solo-dogfeeding/code/210-panel/app/Models/Server.php#L390-L401)**：如果 node 维护模式，抛 ServerStateConflictException——但此方法**只在用户端操作**（启动/停止/发送命令等）被调用，**不在 ServerCreationService 创建流程里调用**。
+4. **[MaintenanceMiddleware](file:///d:/fz/0508-3/solo-dogfeeding/code/210-panel/app/Http/Middleware/MaintenanceMiddleware.php#L20-L31)**：用户访问服务器 Web UI 时返回 `errors.maintenance` 视图，与服务器创建无关。
+5. **[AuthenticateServerAccess](file:///d:/fz/0508-3/solo-dogfeeding/code/210-panel/app/Http/Middleware/Api/Client/Server/AuthenticateServerAccess.php#L55)**：客户端 API 访问时拦截维护模式节点的服务器，与创建流程无关。
+6. **[ServerTransformer::transform()](file:///d:/fz/0508-3/solo-dogfeeding/code/210-panel/app/Transformers/Api/Client/ServerTransformer.php#L53)**：向客户端返回 `is_node_under_maintenance` 布尔字段。
+
+**可直接证实的结论**：
+- 维护模式节点**可以**通过 FindViableNodesService 出现在候选列表中
+- 维护模式节点**可以**被 ServerCreationService 创建服务器（创建流程没有调用 validateCurrentState，没有 middleware 拦截）
+- 创建完成后，用户尝试访问该服务器的 Web UI 或客户端 API 操作时**会被拦截**
+- 关于 Wings 端是否「真的启动」容器：Panel 仓库中没有证据（Wings 行为不在本仓库），不应妄加推断
 
 ### 2.3 容量计算公式
 
@@ -268,9 +301,56 @@ AllocationRepository::getRandomAllocation()
     └─ 条件④：WHERE CONCAT(node_id, ip) NOT IN (dedicated_ip)
 ```
 
+#### 3.3.1 deploy.port_range 在请求层校验、服务层静默忽略的完整情况
+
+**请求层校验**（[StoreServerRequest::rules()](file:///d:/fz/0508-3/solo-dogfeeding/code/210-panel/app/Http/Requests/Api/Application/Servers/StoreServerRequest.php#L57-L63)）：
+```php
+'deploy.port_range' => 'array',
+'deploy.port_range.*' => 'string',  // 只校验是字符串，不校验内容格式
+```
+
+请求层只要求每个元素是字符串，具体内容是否有效**不检查**。
+
+**服务层处理**（[AllocationSelectionService::setPorts()](file:///d:/fz/0508-3/solo-dogfeeding/code/210-panel/app/Services/Deployment/AllocationSelectionService.php#L56-L78)）：
+```php
+$stored = [];
+foreach ($ports as $port) {
+    if (is_digit($port)) {
+        $stored[] = $port;                                    // ✅ 纯数字：接受
+    }
+    if (preg_match(AssignmentService::PORT_RANGE_REGEX, $port, $matches)) {
+        // PORT_RANGE_REGEX = '/^(\d{4,5})-(\d{4,5})$/'
+        if (abs($matches[2] - $matches[1]) > PORT_RANGE_LIMIT) {  // 1000
+            throw new DisplayException('too many ports');       // 🔴 超限：抛异常
+        }
+        $stored[] = [$matches[1], $matches[2]];                // ✅ 范围：接受
+    }
+    // ⚠️ 既不是纯数字，也不匹配范围正则 → 静默丢弃，不报错
+}
+```
+
+**静默忽略的具体情况**：
+
+| 传入 port_range 字符串值 | 处理结果 | 是否静默忽略 |
+|----------------------|---------|------------|
+| `"25565"`（纯数字，1-5 位） | 作为单端口存入 `$stored` | ✅ 正常处理 |
+| `"25565-25570"`（匹配范围正则：首尾都是 4-5 位数字） | 作为 `[25565, 25570]` 存入 `$stored` | ✅ 正常处理 |
+| `"25565-25700"`（范围 > 1000 端口） | 🔴 抛 DisplayException `exceptions.allocations.too_many_ports` | ❌ 明确报错 |
+| `"22"`（1-3 位的端口号，不满足范围正则） | `is_digit()` 接受 → 作为单端口存入 | ✅ 正常处理 |
+| `"abc"` / `"http"` / `"25565:25570"`（含字母 / 冒号 / 其他符号） | `is_digit` 为假 + 正则不匹配 → **跳过** | ⚠️ 静默丢弃 |
+| `"0-1023"`（1-3 位数字区间，正则要求 4-5 位） | 正则不匹配 → **跳过**（即使合法端口 1-1023 存在） | ⚠️ 静默丢弃 |
+| `""`（空字符串） | `is_digit` 为假 + 正则不匹配 → **跳过** | ⚠️ 静默丢弃 |
+| `"65536"`（超出 65535，但纯数字） | `is_digit` 接受 → **存入**（后续查询数据库无此端口 → 自然匹配不到） | ✅ 合法输入，但实际无效 |
+| `"25565-25565"`（单端口写成范围） | 正则匹配 → 作为范围 `[25565, 25565]` 存入，效果同单端口 | ✅ 等价正常处理 |
+| `" 25565 "`（含空格） | `is_digit` 为假 + 正则不匹配 → **跳过** | ⚠️ 静默丢弃 |
+
+**对自动放置结果的影响**：
+- 如果 port_range 数组中**所有**元素都被静默丢弃，`$stored` 为空 → `$ports` 参数最终是空数组 → `getRandomAllocation()` 中的 `if (!empty($ports))` 条件不成立 → **退化为不限定端口范围的「任意可用端口」随机分配**，和没传 port_range 行为一致。
+- 如果 port_range 数组中**部分**元素被丢弃、部分有效 → 只基于有效部分做过滤，可用端口池比预期小 → 提升 `NoViableAllocationException` 的概率。
+
 ### 3.4 为什么「预览通过后，最终仍可能 allocation 失败」
 
-有四重原因，按发生概率从高到低排列：
+有五重原因，按发生概率从高到低排列：
 
 **原因 ①：dedicated_ip / port_range 在预览阶段不检查（主要原因）**
 
@@ -279,19 +359,25 @@ AllocationRepository::getRandomAllocation()
 - 预览 API：只查 `memory/disk/location` → 显示有 3 个节点可用
 - 真实创建：到阶段②时，用了 `dedicated_ip` 和 `port_range` 过滤 → 发现没有 IP 能满足独占 / 25565 端口已占满 → `NoViableAllocationException`
 
-**原因 ②：竞争条件（Race Condition）**
+**原因 ②：port_range 格式错误被静默丢弃**
+
+如上一节所述，传入格式不合法的字符串会被 `setPorts()` 静默跳过：
+- 全被丢弃 → 退化为不限制端口 → 最终可能分配到完全不符合业务预期的端口
+- 部分被丢弃 → 实际可用范围更小 → 更容易失败
+
+**原因 ③：竞争条件（Race Condition）**
 
 预览与真实创建之间存在时间差（可能几秒到几分钟），期间其他部署请求可能：
 - 占满了原本可用的容量（其他请求也在这个节点开了新服）→ 阶段①失败
 - 占用了原本空闲的 Allocation → 阶段②失败
 
-**原因 ③：节点结果集分页截断**
+**原因 ④：节点结果集分页截断**
 
 预览 API 支持分页（默认 50 条/页），如果满足容量的节点很多且调用方只取了前 50 个，刚好满足端口条件的节点可能落在后续页未被展示。
 
-**原因 ④：整体只有部分节点满足两个阶段（交集为空）**
+**原因 ⑤：整体只有部分节点满足两个阶段（交集为空）**
 
-集合 A = {满足容量的节点}，集合 B = {满足端口/IP 的节点}。预览只显示 A ∪ (未做端口校验的全集)，真实创建要求属于 A ∩ B——交集可能为空，即使 A、B 各自都非空。
+集合 A = {满足容量的节点}，集合 B = {满足端口/IP 的节点}。预览只显示 A（阶段①结果本身），真实创建要求属于 A ∩ B——交集可能为空，即使 A、B 各自都非空。
 
 ---
 
