@@ -133,10 +133,10 @@ $this->daemonRepository->setServer($server)->restore($backup, $url ?? null, $tru
 | 用户认证（Session/Token） | — （隐含） | ✅ `auth:sanctum` | ✅ `auth:sanctum` |
 | 服务器访问授权 | —（隐含） | ✅ `AuthenticateServerAccess` | ✅ `AuthenticateServerAccess` |
 | 资源归属（backup 属于 server） | —（隐含） | ✅ `ResourceBelongsToServer` | ✅ `ResourceBelongsToServer` |
-| **备份完成状态** | ❌ `isSuccessful` 显示条件 | ★ **未校验**（代码中无 `is_successful` / `completed_at` 检查） | ✅ `!backup->is_successful && is_null(backup->completed_at)` → 拒绝 |
+| **备份完成状态** | ❌ `isSuccessful` 显示条件（仅成功的显示下载/恢复菜单） | ★ **完全未校验**（代码中无 `is_successful` / `completed_at` 检查，任何状态均可生成下载链接） | ★ **仅拒绝"进行中"**（`!is_successful && is_null(completed_at)` → 拒绝；失败但已完成的备份**允许恢复**） |
 | **具体权限** | ❌ `<Can action="backup.download">` | ✅ `backup.download`（`$user->can()`） | ✅ `backup.restore`（FormRequest `permission()`） |
 | 磁盘驱动类型合法 | — | ✅ 仅 s3 / wings | —（不校验，直接传 adapter 给 Wings） |
-| 服务器状态可操作 | — | ✅ `AuthenticateServerAccess.validateCurrentState()` | ✅ `server.status === null`（仅完全空闲状态允许） |
+| 服务器状态可操作 | — | ✅ `AuthenticateServerAccess.validateCurrentState()` | ✅ `server.status === null`（仅完全空闲状态允许，比 download 更严格） |
 
 ### 3.3 差异点说明：备份完成状态校验缺失
 
@@ -721,4 +721,5 @@ if ($server->node_id !== $node->id) {
 | 前端：备份右键菜单（下载按钮） | [BackupContextMenu.tsx](file:///d:/fz/0508-3/solo-dogfeeding/code/209-panel/resources/scripts/components/server/backups/BackupContextMenu.tsx) |
 | 前端：备份行（完成状态判断） | [BackupRow.tsx](file:///d:/fz/0508-3/solo-dogfeeding/code/209-panel/resources/scripts/components/server/backups/BackupRow.tsx) |
 | 前端：下载 URL API 封装 | [getBackupDownloadUrl.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/209-panel/resources/scripts/api/server/backups/getBackupDownloadUrl.ts) |
-| 前端：恢复 API 封装 | [backups/index.ts](file:///d:/fz/0508-
+| 前端：恢复 API 封装 | [backups/index.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/209-panel/resources/scripts/api/server/backups/index.ts) |
+| 前端：权限组件（Can） | [Can.tsx](file:///d:/fz/0508-3/solo-dogfeeding/code/209-panel/resources/scripts/components/elements/Can.tsx) |
