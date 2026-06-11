@@ -204,41 +204,58 @@ $this->validate($request, ['value' => $variable->rules]);
 
 ---
 
-## 5. 变量覆盖优先级（从低到高）
+## 5. 变量覆盖优先级：三种状态与真实回退条件
 
-这是运维最关心的"谁覆盖谁"问题。贯穿多个服务，统一使用同一个表达式：
+贯穿多个服务的核心表达式是：
 
 ```php
 $variable->server_value ?? $variable->default_value
 ```
 
-### 5.1 优先级总表
+但这句话**不能脱离 `$variable->server_value` 的三种状态**来理解。`??` 只对 `null` 生效，空字符串 `''` **不会**触发回退。结合创建流程、回填逻辑、保存逻辑的代码证据，三种状态的行为完全不同。
 
-| 优先级 | 来源 | 代码位置 | 说明 |
-|--------|------|----------|------|
-| 1（最低） | `egg_variables.default_value` | 模板定义 | Egg 自带默认，所有服务器共用 |
-| 2 | `server_variables.variable_value` | 服务器实例覆盖 | 每台服独立，在创建或修改启动参数时写入 |
-| 3 | Panel 内置环境映射（`STARTUP`、`P_SERVER_UUID` 等） | [EnvironmentService.php#L67-L72](file:///d:/fz/0508-3/solo-dogfeeding/code/202-panel/app/Services/Servers/EnvironmentService.php#L67-L72) | 固定键，如用 `server.startup`、`server.uuid` 等属性填充 |
-| 4 | 配置文件 `pterodactyl.environment_variables` | [EnvironmentService.php#L47-L52](file:///d:/fz/0508-3/solo-dogfeeding/code/202-panel/app/Services/Servers/EnvironmentService.php#L47-L52) | 从 `config/pterodactyl.php` 读取，支持闭包或 object_get 路径 |
-| 5（最高） | 运行时动态注册 | [EnvironmentService.php#L55-L57](file:///d:/fz/0508-3/solo-dogfeeding/code/202-panel/app/Services/Servers/EnvironmentService.php#L55-L57) | 通过 `EnvironmentService::setEnvironmentKey()` 注入的闭包 |
+### 5.1 先破后立：服务器创建后，实例层已经为所有 Egg 变量写了行
 
-**运维常见"被重置"根因**：
-- 当 `server_variables` 中没有对应记录（即管理员/用户未在该服上显式设置），代码走 `??` 右边，取 `default_value`
-- 若管理员在 Egg 模板层面修改了 `default_value`，所有未显式覆盖该变量的服务器下次启动都会感知到新默认值 → 表现为"被重置"
-- 变量同步/重建时，如果 `server_variables` 行丢失（如导入导出流程问题），也会退回 Egg 默认值
+[ServerCreationService.php#L76-L78](file:///d:/fz/0508-3/solo-dogfeeding/code/202-panel/app/Services/Servers/ServerCreationService.php#L76-L78) 创建服务器时以**管理员身份**调用 `VariableValidatorService`：
 
-### 5.2 服务器创建时的变量写入
-
-[ServerCreationService.php#L76-L78](file:///d:/fz/0508-3/solo-dogfeeding/code/202-panel/app/Services/Servers/ServerCreationService.php#L76-L78) 创建服务器时以管理员身份调用：
 ```php
 $eggVariableData = $this->validatorService
     ->setUserLevel(User::USER_LEVEL_ADMIN)
     ->handle(Arr::get($data, 'egg_id'), Arr::get($data, 'environment', []));
 ```
 
-随后 [storeEggVariables()](file:///d:/fz/0508-3/solo-dogfeeding/code/202-panel/app/Services/Servers/ServerCreationService.php#L188-L201) 把校验结果批量 `insert` 进 `server_variables`，若用户未传某个变量，`value` 为 `null`，入库存 `''` 空字符串。
+VariableValidatorService 的行为（[VariableValidatorService.php#L28-L58](file:///d:/fz/0508-3/solo-dogfeeding/code/202-panel/app/Services/Servers/VariableValidatorService.php#L28-L58)）：
+- 管理员身份不加 `user_editable/user_viewable` 过滤，**把 Egg 的全部 EggVariable 都查出来**（无论是否标记为用户可见/可编辑）
+- 对每一个 EggVariable 生成 collection 条目，`value = $fields[$item->env_variable] ?? null`（用户没传就是 `null`）
 
-### 5.3 变量修改时的写入
+随后 [storeEggVariables()](file:///d:/fz/0508-3/solo-dogfeeding/code/202-panel/app/Services/Servers/ServerCreationService.php#L188-L201)：
+
+```php
+foreach ($variables as $result) {
+    $records[] = [
+        'server_id' => $server->id,
+        'variable_id' => $result->id,
+        'variable_value' => $result->value ?? '',  // null → '' 入库
+    ];
+}
+$this->serverVariableRepository->insert($records);
+```
+
+**结论 A：服务器创建完成那一刻，`server_variables` 表已经为 Egg 中**每一个** EggVariable 都插了一行。不存在"没显式设置就没有行"这种情况。** 没传值的变量值是 `''`（空字符串），不是 `null`。
+
+### 5.2 三种数据库状态与 `??` 的真实行为
+
+理解了创建流程，就只有**三种**可能状态：
+
+| # | 状态 | `server_value`（LEFT JOIN 出来的） | `$server_value ?? $default_value` 结果 | 何时会发生 |
+|---|------|-------------------------------------|---------------------------------------|------------|
+| ① | **有记录，值非空**（如 `'1.20.1'`） | `'1.20.1'` | `'1.20.1'` | 用户或管理员在创建时或之后填了具体值并保存 |
+| ② | **有记录，值是空字符串 `''`** | `''` | `''`（**不回退**，因为 `'' !== null`，`??` 不触发） | 创建时没传值但被 storeEggVariables 插了空行；或管理员/用户把值清空后保存 |
+| ③ | **完全无记录**（LEFT JOIN 找不到） | `null` | `$default_value`（**回退到 Egg 默认**） | 只有一种：服务器创建之后 Egg 模板又**新增了**变量（新的 EggVariable，老服务器创建时它还不存在） |
+
+**这是整篇文档最重要的表**：状态②和状态③在"没设置值"这个语义上很像，但 PHP `??` 的行为完全不同，直接决定 Egg 默认值的改动是否会影响运行时。
+
+### 5.3 变量修改（StartupModificationService）时的写入
 
 [StartupModificationService.php#L39-L47](file:///d:/fz/0508-3/solo-dogfeeding/code/202-panel/app/Services/Servers/StartupModificationService.php#L39-L47)
 
@@ -251,7 +268,92 @@ foreach ($results as $result) {
 }
 ```
 
-用 `updateOrCreate`：存在则更新，不存在则插入。
+用 `updateOrCreate`，意味着：
+- 处于状态②的变量（原本是空串）：有匹配行 → 更新为表单当前值。如果用户什么也没改，表单提交的就是之前回填的值，见下一节。
+- 处于状态③的变量（Egg 新增、还没记录）：无匹配行 → **新插入一行**，值为表单中该 input 的值。保存之后这台服务器对该变量就**从③退不回 Egg 默认了**。
+
+### 5.4 界面回填逻辑：后台 vs 客户端 —— "显示默认"不等于"实际会回退"
+
+**后台启动页（Blade + jQuery）：**
+
+[ServerViewController.php#L71-L87](file:///d:/fz/0508-3/solo-dogfeeding/code/202-panel/app/Http/Controllers/Admin/Servers/ServerViewController.php#L71-L87) 向 JS 注入 `Pterodactyl.server_variables`：
+
+```php
+$variables = $this->environmentService->handle($server);
+$this->plainInject(['server_variables' => $variables]);
+```
+
+EnvironmentService 的 Step 1 就已经用 `server_value ?? default_value` 跑过一次，所以注入的是"运行时会使用的最终值"（不是原始 DB 值）。
+
+[startup.blade.php#L151-L170](file:///d:/fz/0508-3/solo-dogfeeding/code/202-panel/resources/views/admin/servers/view/startup.blade.php#L151-L170) 回填：
+
+```js
+$.each(_.get(objectChain, 'variables', []), function (i, item) {
+    var setValue = _.get(Pterodactyl.server_variables, item.env_variable, item.default_value);
+    $('#egg_variable_' + item.env_variable).val(setValue);
+});
+```
+
+三种状态在后台 Input 里显示的值：
+
+| 状态 | EnvironmentService 产出 `Pterodactyl.server_variables[env]` | Input 显示 | 含义 |
+|------|--------------------------------------------------------------|------------|------|
+| ① 非空值 | 非空字符串原值 | 原值 | 直观正确 |
+| ② 空串记录 | `'' ?? default_value` → **仍是 `''`**（`??` 不触发） | 空（用户看到一个空白输入框） | ❗ 这里显示空，**不**是显示 default，因为 `??` 没生效。但实际运行时也确实用 `''`，所以显示和运行一致 |
+| ③ 无记录（Egg 新增） | `null ?? default_value` → **Egg default** | Egg 当前的 `default_value` | ✅ 显示 default，运行时也用 default，一致 |
+
+**用户控制台前端（React）：**
+
+[VariableBox.tsx#L114-L123](file:///d:/fz/0508-3/solo-dogfeeding/code/202-panel/resources/scripts/components/server/startup/VariableBox.tsx#L114-L123)：
+
+```tsx
+<Input
+    defaultValue={variable.serverValue ?? ''}
+    placeholder={variable.defaultValue}
+/>
+```
+
+后端通过 [EggVariableTransformer.php#L23-L31](file:///d:/fz/0508-3/solo-dogfeeding/code/202-panel/app/Transformers/Api/Client/EggVariableTransformer.php#L23-L31) 传出**原始**的 `server_value` 和 `default_value`，前端自己处理：
+
+| 状态 | `variable.serverValue` | Input 显示 | placeholder（灰色提示） | 含义 |
+|------|------------------------|------------|-------------------------|------|
+| ① 非空值 | 非空字符串 | 原值 | Egg default | 直观正确 |
+| ② 空串记录 | `''`（JS 里不是 null） | **空字符串**（显示一个空框） | Egg default | ❗ 运行时用 `''`，但 placeholder 会"假装"显示 default。**这是唯一一处界面会"显示默认值"但运行时并不会回退的情况**，用户极易被误导：灰色提示的 default 是假的，实际启动用的是空串 |
+| ③ 无记录（Egg 新增） | `null` → `null ?? ''` = `''` | **空框** | Egg default | 运行时用的是 Egg default，但前端展示成了空框。显示与实际不一致 |
+
+**前后端对比的关键结论：**
+
+- **后台启动页**：对状态②显示空、对状态③显示 default —— 与实际运行时的行为一致
+- **用户控制台**：对状态②显示空框但 placeholder 显示 default（**placeholder 不是真实值**），对状态③也显示空框 placeholder 显示 default（但实际运行时真的会用 default）—— 两种状态在用户界面长得一样，实际行为天差地别
+
+### 5.5 真正的优先级总表（含状态分支）
+
+对 Egg 自定义环境变量（env_variable 不与内置 key 冲突）：
+
+```
+运行时会生效的值
+  ├─ 如果 server_variables 有该 variable_id 记录（状态①②，服务器创建时就有的变量都是这种）
+  │    ├─ variable_value 非空  →  用它            ←── 优先级最高（用户/管理员明确设置）
+  │    └─ variable_value = ''  →  用 ''（空串）   ←── 注意：不会回退 default！
+  └─ 如果 server_variables 无该 variable_id 记录（状态③，仅 Egg 事后新增的变量）
+       每次启动动态取 egg_variables.default_value  ←── Egg 改 default 会直接影响（未保存前）
+            │
+            ▼
+  之后更高优先级对**同名 key** 的覆盖（EnvironmentService 内部同 key put）：
+    3. Panel 内置环境映射（STARTUP、P_SERVER_UUID 等）
+    4. 配置文件 pterodactyl.environment_variables
+    5. 运行时 EnvironmentService::setEnvironmentKey() 动态闭包（最高）
+```
+
+### 5.6 "被重置"的五种真实场景
+
+| 现象 | 数据库状态 | 根因 |
+|------|------------|------|
+| 创建时没填的变量，界面永远显示空框，Egg 改了 default 也没反应 | ②（空串记录） | 因为创建时已经插入了 `variable_value=''` 行，`??` 永远不触发回退。这不是"被重置"，是**一直就是空串** |
+| Egg 新增了一个变量，老服重启后值突然变了 | ③（无记录） | 状态③每次启动都去读 Egg 的最新 default，Egg 改了就"跟着走" → 这才是真正的**无感知动态变化**来源 |
+| Egg 新增了一个变量，老服一直用 default，某管理员打开启动页点了一次"保存"（什么都没改），然后 Egg 再改 default 就失效了 | ③ → 保存后变成 ① | 保存时 updateOrCreate 把当时看到的 default（后台 Input 里显示的就是 EnvironmentService 回退后的 default）固化进了 server_variables。从此以后它就是"有记录"的了，再也不会回退 |
+| 用户说在控制台看到某变量是 `latest`（灰色 placeholder），实际启动却用空串 | ②（空串记录） | 前端 VariableBox 里 placeholder 显示的是 default_value，但 defaultValue 属性绑定的是 `serverValue ?? ''`。这是界面误导，运行时用的是 `''` |
+| 某变量一直工作正常，某次后台保存启动页后变成空串 | ②（之前是 ① 被改成空串） | 后端 StartupModificationService 中，VariableValidatorService 把 Egg 全部变量都收出来，updateOrCreate 会把表单提交的**所有变量**都写库。如果后台 Input 显示空（状态②），管理员保存时就会把其他变量原封不动地重新 update——如果管理员在页面上碰巧清了某个 input 再保存，这个变化会落库 |
 
 ---
 
